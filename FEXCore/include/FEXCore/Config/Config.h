@@ -31,16 +31,6 @@ namespace Handler {
     }
     return "0";
   }
-  static inline std::optional<fextl::string> CacheObjectCodeHandler(std::string_view Value) {
-    if (Value == "none") {
-      return "0";
-    } else if (Value == "read") {
-      return "1";
-    } else if (Value == "write") {
-      return "2";
-    }
-    return "0";
-  }
 } // namespace Handler
 
 enum ConfigOption {
