@@ -678,6 +678,7 @@ def print_ir_allocator_helpers():
     # Generate helpers with operands
     for op in IROps:
         if op.Name != "Last":
+            output_file.write("\t///\n".join(["\t/// {}\n" .format(comment) for comment in op.Desc]))
             output_file.write("\tIRPair<IROp_{}> _{}(" .format(op.Name, op.Name))
 
             # Output SSA args first
@@ -751,6 +752,7 @@ def print_ir_allocator_helpers():
 
             # Now do the OrderedNode * version if necessary
             if op.SSAArgNum:
+                output_file.write("\t///\n".join(["\t/// {}\n" .format(comment) for comment in op.Desc]))
                 output_file.write("\tIRPair<IROp_{}> _{}(" .format(op.Name, op.Name))
 
                 for i, arg in enumerate(op.Arguments):
