@@ -27,6 +27,42 @@
 #include <xxhash.h>
 
 namespace FEXCore::IR {
+enum class VectorCompareType {
+  // SSE comparisons.
+  EQ_OQ = 0,
+  LT_OS = 1,
+  LE_OS = 2,
+  UNORD_Q = 3,
+  NEQ_UQ = 4,
+  NLT_US = 5,
+  NLE_US = 6,
+  ORD_Q = 7,
+  // AVX-only comparisons.
+  EQ_UQ = 8,
+  NGE_US = 9,
+  NGT_US = 10,
+  FALSE_OQ = 11,
+  NEQ_OQ = 12,
+  GE_OS = 13,
+  GT_OS = 14,
+  TRUE_UQ = 15,
+  EQ_OS = 16,
+  LT_OQ = 17,
+  LE_OQ = 18,
+  UNORD_S = 19,
+  NEQ_US = 20,
+  NLT_UQ = 21,
+  NLE_UQ = 22,
+  ORD_S = 23,
+  EQ_US = 24,
+  NGE_UQ = 25,
+  NGT_UQ = 26,
+  FALSE_OS = 27,
+  NEQ_OS = 28,
+  GE_OQ = 29,
+  GT_OQ = 30,
+  TRUE_US = 31,
+};
 
 enum class MemoryAccessType {
   // Choose TSO or Non-TSO depending on access type
