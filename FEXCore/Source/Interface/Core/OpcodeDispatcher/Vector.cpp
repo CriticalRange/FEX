@@ -620,7 +620,7 @@ Ref OpDispatchBuilder::InsertScalarFCMPOpImpl(OpSize Size, IR::OpSize OpDstSize,
     // If either of the sources are unordered, then returns true.
     Ref Src1_U = _VFCMPEQ(Size, ElementSize, Src1, Src1);
     Ref Src2_U = _VFCMPEQ(Size, ElementSize, Src2, Src2);
-    auto Ordered = _VAnd(ElementSize, ElementSize, Src1_U, Src2_U);
+    auto Ordered = _VAnd(Size, ElementSize, Src1_U, Src2_U);
 
     Ref Compare_Ordered = _VFCMPEQ(Size, ElementSize, Src1, Src2);
     Ref Result = _VOrn(Size, ElementSize, Compare_Ordered, Ordered);
@@ -2508,8 +2508,8 @@ Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1
   case VectorCompareType::ORD_S: return _VFCMPORD(Size, ElementSize, Src1, Src2);
   case VectorCompareType::NGT_UQ:
   case VectorCompareType::NGT_US: {
-    Ref Result = _VFCMPLT(ElementSize, ElementSize, Src2, Src1);
-    return _VNot(ElementSize, ElementSize, Result);
+    Ref Result = _VFCMPLT(Size, ElementSize, Src2, Src1);
+    return _VNot(Size, ElementSize, Result);
   }
   case VectorCompareType::NGE_UQ:
   case VectorCompareType::NGE_US: {
@@ -2525,7 +2525,7 @@ Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1
     // If either of the sources are unordered, then returns true.
     Ref Src1_U = _VFCMPEQ(Size, ElementSize, Src1, Src1);
     Ref Src2_U = _VFCMPEQ(Size, ElementSize, Src2, Src2);
-    auto Ordered = _VAnd(ElementSize, ElementSize, Src1_U, Src2_U);
+    auto Ordered = _VAnd(Size, ElementSize, Src1_U, Src2_U);
 
     Ref Compare_Ordered = _VFCMPEQ(Size, ElementSize, Src1, Src2);
     return _VOrn(Size, ElementSize, Compare_Ordered, Ordered);
@@ -2541,9 +2541,9 @@ Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1
     return _VAnd(Size, ElementSize, Result, Src2_U);
   }
   case VectorCompareType::FALSE_OQ:
-  case VectorCompareType::FALSE_OS: return LoadZeroVector(OpSize::i128Bit);
+  case VectorCompareType::FALSE_OS: return LoadZeroVector(Size);
   case VectorCompareType::TRUE_UQ:
-  case VectorCompareType::TRUE_US: _VectorImm(OpSize::i128Bit, OpSize::i8Bit, -1, 0);
+  case VectorCompareType::TRUE_US: return _VectorImm(Size, OpSize::i8Bit, -1, 0);
   }
   FEX_UNREACHABLE;
 }
