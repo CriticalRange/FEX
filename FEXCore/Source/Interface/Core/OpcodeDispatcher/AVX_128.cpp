@@ -672,10 +672,10 @@ void OpDispatchBuilder::AVX128_VFCMP(OpcodeArgs, IR::OpSize ElementSize) {
 
   struct {
     FEXCore::X86Tables::DecodedOp Op;
-    uint8_t CompType {};
+    uint32_t CompType {};
   } Capture {
     .Op = Op,
-    .CompType = CompType,
+    .CompType = CompType & 0b11111u,
   };
 
   AVX128_VectorBinaryImpl(Op, OpSizeFromSrc(Op), ElementSize, [this, &Capture](IR::OpSize _ElementSize, Ref Src1, Ref Src2) {
@@ -701,7 +701,7 @@ void OpDispatchBuilder::AVX128_InsertScalarFCMP(OpcodeArgs, IR::OpSize ElementSi
   const uint8_t CompType = Op->Src[2].Literal();
 
   RefPair Result {};
-  Result.Low = InsertScalarFCMPOpImpl(OpSize::i128Bit, OpSize::i128Bit, ElementSize, Src1.Low, Src2.Low, CompType, false);
+  Result.Low = InsertScalarFCMPOpImpl(OpSize::i128Bit, OpSize::i128Bit, ElementSize, Src1.Low, Src2.Low, CompType & 0b11111, false);
   Result.High = LoadZeroVector(OpSize::i128Bit);
   AVX128_StoreResult_WithOpSize(Op, Op->Dest, Result);
 }

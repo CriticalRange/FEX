@@ -1117,6 +1117,29 @@ DEF_OP(VAddP) {
   }
 }
 
+DEF_OP(VOrn) {
+  const auto Op = IROp->C<IR::IROp_VOrn>();
+  const auto OpSize = IROp->Size;
+
+  const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+  const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
+  LOGMAN_THROW_A_FMT(!Is256Bit || HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
+
+  const auto Dst = GetVReg(Node);
+  const auto Vector1 = GetVReg(Op->Vector1);
+  const auto Vector2 = GetVReg(Op->Vector2);
+
+  if (HostSupportsSVE256 && Is256Bit) {
+    const auto Pred = PRED_TMP_32B.Merging();
+    not_(ARMEmitter::SubRegSize::i8Bit, VTMP1.Z(), Pred, Vector2.Z());
+    orr(Dst.Z(), Vector1.Z(), VTMP1.Z());
+  } else if (Is128Bit) {
+    orn(Dst.Q(), Vector1.Q(), Vector2.Q());
+  } else {
+    orn(Dst.D(), Vector1.D(), Vector2.D());
+  }
+}
+
 DEF_OP(VFAddV) {
   const auto Op = IROp->C<IR::IROp_VFAddV>();
   const auto OpSize = IROp->Size;

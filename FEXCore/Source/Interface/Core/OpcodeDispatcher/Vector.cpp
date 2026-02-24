@@ -562,31 +562,90 @@ template void OpDispatchBuilder::AVXInsertScalarRound<OpSize::i64Bit>(OpcodeArgs
 
 Ref OpDispatchBuilder::InsertScalarFCMPOpImpl(OpSize Size, IR::OpSize OpDstSize, IR::OpSize ElementSize, Ref Src1, Ref Src2,
                                               uint8_t CompType, bool ZeroUpperBits) {
-  switch (CompType & 7) {
-  case 0x0: // EQ
-    return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::EQ, ZeroUpperBits);
-  case 0x1: // LT, GT(Swapped operand)
-    return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::LT, ZeroUpperBits);
-  case 0x2: // LE, GE(Swapped operand)
-    return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::LE, ZeroUpperBits);
-  case 0x3: // Unordered
-    return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::UNO, ZeroUpperBits);
-  case 0x4: // NEQ
-    return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::NEQ, ZeroUpperBits);
-  case 0x5: { // NLT, NGT(Swapped operand)
+  switch (static_cast<VectorCompareType>(CompType)) {
+  case VectorCompareType::EQ_OQ:
+  case VectorCompareType::EQ_OS: return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::EQ, ZeroUpperBits);
+  case VectorCompareType::LT_OS: // GT(Swapped operand)
+  case VectorCompareType::LT_OQ: return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::LT, ZeroUpperBits);
+  case VectorCompareType::LE_OS: // GE(Swapped operand)
+  case VectorCompareType::LE_OQ: return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::LE, ZeroUpperBits);
+  case VectorCompareType::UNORD_Q:
+  case VectorCompareType::UNORD_S: return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::UNO, ZeroUpperBits);
+  case VectorCompareType::NEQ_UQ:
+  case VectorCompareType::NEQ_US: return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::NEQ, ZeroUpperBits);
+  case VectorCompareType::NLT_US: // NGT(Swapped operand)
+  case VectorCompareType::NLT_UQ: {
     Ref Result = _VFCMPLT(ElementSize, ElementSize, Src1, Src2);
     Result = _VNot(ElementSize, ElementSize, Result);
     // Insert the lower bits
     return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
   }
-  case 0x6: { // NLE, NGE(Swapped operand)
+  case VectorCompareType::NLE_US: // NGE(Swapped operand)
+  case VectorCompareType::NLE_UQ: {
     Ref Result = _VFCMPLE(ElementSize, ElementSize, Src1, Src2);
     Result = _VNot(ElementSize, ElementSize, Result);
     // Insert the lower bits
     return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
   }
-  case 0x7: // Ordered
-    return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::ORD, ZeroUpperBits);
+  case VectorCompareType::ORD_Q:
+  case VectorCompareType::ORD_S: return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::ORD, ZeroUpperBits);
+  case VectorCompareType::NGT_UQ:
+  case VectorCompareType::NGT_US: {
+    Ref Result = _VFCMPLT(ElementSize, ElementSize, Src2, Src1);
+    Result = _VNot(ElementSize, ElementSize, Result);
+    // Insert the lower bits
+    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
+  }
+  case VectorCompareType::NGE_UQ:
+  case VectorCompareType::NGE_US: {
+    Ref Result = _VFCMPLE(ElementSize, ElementSize, Src2, Src1);
+    Result = _VNot(ElementSize, ElementSize, Result);
+    // Insert the lower bits
+    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
+  }
+  case VectorCompareType::GT_OQ:
+  case VectorCompareType::GT_OS: {
+    Ref Result = _VFCMPLT(ElementSize, ElementSize, Src2, Src1);
+    // Insert the lower bits
+    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
+  }
+  case VectorCompareType::GE_OQ:
+  case VectorCompareType::GE_OS: {
+    Ref Result = _VFCMPLE(ElementSize, ElementSize, Src2, Src1);
+    // Insert the lower bits
+    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
+  }
+  case VectorCompareType::EQ_UQ:
+  case VectorCompareType::EQ_US: {
+    // If either of the sources are unordered, then returns true.
+    Ref Src1_U = _VFCMPEQ(Size, ElementSize, Src1, Src1);
+    Ref Src2_U = _VFCMPEQ(Size, ElementSize, Src2, Src2);
+    auto Ordered = _VAnd(ElementSize, ElementSize, Src1_U, Src2_U);
+
+    Ref Compare_Ordered = _VFCMPEQ(Size, ElementSize, Src1, Src2);
+    Ref Result = _VOrn(Size, ElementSize, Compare_Ordered, Ordered);
+
+    // Insert the lower bits
+    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
+  }
+  case VectorCompareType::NEQ_OQ:
+  case VectorCompareType::NEQ_OS: {
+    // If either of the sources are unordered, then returns false.
+    Ref Src1_U = _VFCMPEQ(Size, ElementSize, Src1, Src1);
+    Ref Src2_U = _VFCMPEQ(Size, ElementSize, Src2, Src2);
+
+    Ref Compare_Ordered = _VFCMPEQ(Size, ElementSize, Src1, Src2);
+    Ref Result = _VAndn(Size, ElementSize, Src1_U, Compare_Ordered);
+    Result = _VAnd(Size, ElementSize, Result, Src2_U);
+
+    // Insert the lower bits
+    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, Result);
+  }
+  case VectorCompareType::FALSE_OQ:
+  case VectorCompareType::FALSE_OS: return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, LoadZeroVector(OpSize::i128Bit));
+  case VectorCompareType::TRUE_UQ:
+  case VectorCompareType::TRUE_US:
+    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, _VectorImm(OpSize::i128Bit, OpSize::i8Bit, -1, 0));
   }
   FEX_UNREACHABLE;
 }
@@ -600,7 +659,7 @@ void OpDispatchBuilder::InsertScalarFCMPOp(OpcodeArgs) {
   Ref Src1 = LoadSourceFPR_WithOpSize(Op, Op->Dest, DstSize, Op->Flags);
   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags, {.AllowUpperGarbage = true});
 
-  Ref Result = InsertScalarFCMPOpImpl(DstSize, OpSizeFromDst(Op), ElementSize, Src1, Src2, CompType, false);
+  Ref Result = InsertScalarFCMPOpImpl(DstSize, OpSizeFromDst(Op), ElementSize, Src1, Src2, CompType & 0b111, false);
   StoreResultFPR_WithOpSize(Op, Op->Dest, Result, DstSize);
 }
 
@@ -619,7 +678,7 @@ void OpDispatchBuilder::AVXInsertScalarFCMPOp(OpcodeArgs) {
   Ref Src1 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], DstSize, Op->Flags);
   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[1], SrcSize, Op->Flags, {.AllowUpperGarbage = true});
 
-  Ref Result = InsertScalarFCMPOpImpl(DstSize, OpSizeFromDst(Op), ElementSize, Src1, Src2, CompType, true);
+  Ref Result = InsertScalarFCMPOpImpl(DstSize, OpSizeFromDst(Op), ElementSize, Src1, Src2, CompType & 0b11111, true);
   StoreResultFPR_WithOpSize(Op, Op->Dest, Result, DstSize);
 }
 
@@ -2424,26 +2483,67 @@ void OpDispatchBuilder::MOVBetweenGPR_FPR(OpcodeArgs, VectorOpType VectorType) {
 }
 
 Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType) {
-  Ref Result {};
-  switch (CompType & 0x7) {
-  case 0x0: // EQ
-    return _VFCMPEQ(Size, ElementSize, Src1, Src2);
-  case 0x1: // LT, GT(Swapped operand)
-    return _VFCMPLT(Size, ElementSize, Src1, Src2);
-  case 0x2: // LE, GE(Swapped operand)
-    return _VFCMPLE(Size, ElementSize, Src1, Src2);
-  case 0x3: // Unordered
-    return _VFCMPUNO(Size, ElementSize, Src1, Src2);
-  case 0x4: // NEQ
-    return _VFCMPNEQ(Size, ElementSize, Src1, Src2);
-  case 0x5: // NLT, NGT(Swapped operand)
-    Result = _VFCMPLT(Size, ElementSize, Src1, Src2);
+  switch (static_cast<VectorCompareType>(CompType)) {
+  case VectorCompareType::EQ_OQ:
+  case VectorCompareType::EQ_OS: return _VFCMPEQ(Size, ElementSize, Src1, Src2);
+  case VectorCompareType::LT_OS: // GT(Swapped operand)
+  case VectorCompareType::LT_OQ: return _VFCMPLT(Size, ElementSize, Src1, Src2);
+  case VectorCompareType::LE_OS: // GE(Swapped operand)
+  case VectorCompareType::LE_OQ: return _VFCMPLE(Size, ElementSize, Src1, Src2);
+  case VectorCompareType::UNORD_Q:
+  case VectorCompareType::UNORD_S: return _VFCMPUNO(Size, ElementSize, Src1, Src2);
+  case VectorCompareType::NEQ_UQ:
+  case VectorCompareType::NEQ_US: return _VFCMPNEQ(Size, ElementSize, Src1, Src2);
+  case VectorCompareType::NLT_US: // NGT(Swapped operand)
+  case VectorCompareType::NLT_UQ: {
+    Ref Result = _VFCMPLT(Size, ElementSize, Src1, Src2);
     return _VNot(Size, ElementSize, Result);
-  case 0x6: // NLE, NGE(Swapped operand)
-    Result = _VFCMPLE(Size, ElementSize, Src1, Src2);
+  }
+  case VectorCompareType::NLE_US: // NGE(Swapped operand)
+  case VectorCompareType::NLE_UQ: {
+    Ref Result = _VFCMPLE(Size, ElementSize, Src1, Src2);
     return _VNot(Size, ElementSize, Result);
-  case 0x7: // Ordered
-    return _VFCMPORD(Size, ElementSize, Src1, Src2);
+  }
+  case VectorCompareType::ORD_Q:
+  case VectorCompareType::ORD_S: return _VFCMPORD(Size, ElementSize, Src1, Src2);
+  case VectorCompareType::NGT_UQ:
+  case VectorCompareType::NGT_US: {
+    Ref Result = _VFCMPLT(ElementSize, ElementSize, Src2, Src1);
+    return _VNot(ElementSize, ElementSize, Result);
+  }
+  case VectorCompareType::NGE_UQ:
+  case VectorCompareType::NGE_US: {
+    Ref Result = _VFCMPLE(Size, ElementSize, Src2, Src1);
+    return _VNot(Size, ElementSize, Result);
+  }
+  case VectorCompareType::GT_OQ:
+  case VectorCompareType::GT_OS: return _VFCMPLT(Size, ElementSize, Src2, Src1);
+  case VectorCompareType::GE_OQ:
+  case VectorCompareType::GE_OS: return _VFCMPLE(Size, ElementSize, Src2, Src1);
+  case VectorCompareType::EQ_UQ:
+  case VectorCompareType::EQ_US: {
+    // If either of the sources are unordered, then returns true.
+    Ref Src1_U = _VFCMPEQ(Size, ElementSize, Src1, Src1);
+    Ref Src2_U = _VFCMPEQ(Size, ElementSize, Src2, Src2);
+    auto Ordered = _VAnd(ElementSize, ElementSize, Src1_U, Src2_U);
+
+    Ref Compare_Ordered = _VFCMPEQ(Size, ElementSize, Src1, Src2);
+    return _VOrn(Size, ElementSize, Compare_Ordered, Ordered);
+  }
+  case VectorCompareType::NEQ_OQ:
+  case VectorCompareType::NEQ_OS: {
+    // If either of the sources are unordered, then returns false.
+    Ref Src1_U = _VFCMPEQ(Size, ElementSize, Src1, Src1);
+    Ref Src2_U = _VFCMPEQ(Size, ElementSize, Src2, Src2);
+
+    Ref Compare_Ordered = _VFCMPEQ(Size, ElementSize, Src1, Src2);
+    Ref Result = _VAndn(Size, ElementSize, Src1_U, Compare_Ordered);
+    return _VAnd(Size, ElementSize, Result, Src2_U);
+  }
+  case VectorCompareType::FALSE_OQ:
+  case VectorCompareType::FALSE_OS: return LoadZeroVector(OpSize::i128Bit);
+  case VectorCompareType::TRUE_UQ:
+  case VectorCompareType::TRUE_US: _VectorImm(OpSize::i128Bit, OpSize::i8Bit, -1, 0);
   }
   FEX_UNREACHABLE;
 }
@@ -2459,7 +2559,7 @@ void OpDispatchBuilder::VFCMPOp(OpcodeArgs) {
   Ref Dest = LoadSourceFPR_WithOpSize(Op, Op->Dest, DstSize, Op->Flags);
   const uint8_t CompType = Op->Src[1].Data.Literal.Value;
 
-  Ref Result = VFCMPOpImpl(OpSizeFromSrc(Op), ElementSize, Dest, Src, CompType);
+  Ref Result = VFCMPOpImpl(OpSizeFromSrc(Op), ElementSize, Dest, Src, CompType & 0b111);
 
   StoreResultFPR(Op, Result);
 }
@@ -2477,7 +2577,7 @@ void OpDispatchBuilder::AVXVFCMPOp(OpcodeArgs) {
 
   Ref Src1 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], DstSize, Op->Flags);
   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[1], SrcSize, Op->Flags);
-  Ref Result = VFCMPOpImpl(OpSizeFromSrc(Op), ElementSize, Src1, Src2, CompType);
+  Ref Result = VFCMPOpImpl(OpSizeFromSrc(Op), ElementSize, Src1, Src2, CompType & 0b11111);
 
   StoreResultFPR(Op, Result);
 }
