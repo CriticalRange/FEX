@@ -2543,7 +2543,7 @@ Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1
   case VectorCompareType::FALSE_OQ:
   case VectorCompareType::FALSE_OS: return LoadZeroVector(OpSize::i128Bit);
   case VectorCompareType::TRUE_UQ:
-  case VectorCompareType::TRUE_US: _VectorImm(OpSize::i128Bit, OpSize::i8Bit, -1, 0);
+  case VectorCompareType::TRUE_US: return _VectorImm(OpSize::i128Bit, OpSize::i8Bit, -1, 0);
   }
   FEX_UNREACHABLE;
 }
