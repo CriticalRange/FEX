@@ -2508,8 +2508,8 @@ Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1
   case VectorCompareType::ORD_S: return _VFCMPORD(Size, ElementSize, Src1, Src2);
   case VectorCompareType::NGT_UQ:
   case VectorCompareType::NGT_US: {
-    Ref Result = _VFCMPLT(ElementSize, ElementSize, Src2, Src1);
-    return _VNot(ElementSize, ElementSize, Result);
+    Ref Result = _VFCMPLT(Size, ElementSize, Src2, Src1);
+    return _VNot(Size, ElementSize, Result);
   }
   case VectorCompareType::NGE_UQ:
   case VectorCompareType::NGE_US: {
