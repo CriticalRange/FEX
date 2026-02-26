@@ -17,7 +17,7 @@ using namespace IR;
 // All OPDReg versions need it
 #define OPDReg(op, reg) ((1 << 15) | ((op - 0xD8) << 8) | (reg << 3))
 #define OPD(op, modrmop) (((op - 0xD8) << 8) | modrmop)
-constexpr std::array<DispatchTableEntry, 136> X87F64OpTable = {{
+constexpr std::array<DispatchTableEntry, 138> X87F64OpTable = {{
   {OPDReg(0xD8, 0) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FADDF64, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
 
   {OPDReg(0xD8, 1) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FMULF64, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
@@ -219,6 +219,7 @@ constexpr std::array<DispatchTableEntry, 136> X87F64OpTable = {{
   {OPDReg(0xDD, 7) | 0x00, 8, &OpDispatchBuilder::X87FNSTSW},
 
   {OPD(0xDD, 0xC0), 8, &OpDispatchBuilder::X87FFREE},
+  {OPD(0xDD, 0xC8), 8, &OpDispatchBuilder::FXCH},
   {OPD(0xDD, 0xD0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>}, // register-register from regular X87
   {OPD(0xDD, 0xD8), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>}, //^
 
@@ -279,6 +280,7 @@ constexpr std::array<DispatchTableEntry, 136> X87F64OpTable = {{
   // XXX: This should also set the x87 tag bits to empty
   // We don't support this currently, so just pop the stack
   {OPD(0xDF, 0xC0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, true>},
+  {OPD(0xDF, 0xC8), 8, &OpDispatchBuilder::FXCH},
 
   {OPD(0xDF, 0xE0), 8, &OpDispatchBuilder::X87FNSTSW},
   {OPD(0xDF, 0xE8), 8,
@@ -287,7 +289,7 @@ constexpr std::array<DispatchTableEntry, 136> X87F64OpTable = {{
    &OpDispatchBuilder::Bind<&OpDispatchBuilder::FCOMIF64, OpSize::f80Bit, false, OpDispatchBuilder::FCOMIFlags::FLAGS_RFLAGS, false>},
 }};
 
-constexpr std::array<DispatchTableEntry, 136> X87F80OpTable = {{
+constexpr std::array<DispatchTableEntry, 138> X87F80OpTable = {{
   {OPDReg(0xD8, 0) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FADD, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
 
   {OPDReg(0xD8, 1) | 0x00, 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FMUL, OpSize::i32Bit, false, OpDispatchBuilder::OpResult::RES_ST0>},
@@ -482,6 +484,7 @@ constexpr std::array<DispatchTableEntry, 136> X87F80OpTable = {{
   {OPDReg(0xDD, 7) | 0x00, 8, &OpDispatchBuilder::X87FNSTSW},
 
   {OPD(0xDD, 0xC0), 8, &OpDispatchBuilder::X87FFREE},
+  {OPD(0xDD, 0xC8), 8, &OpDispatchBuilder::FXCH},
   {OPD(0xDD, 0xD0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>},
   {OPD(0xDD, 0xD8), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>},
 
@@ -536,6 +539,7 @@ constexpr std::array<DispatchTableEntry, 136> X87F80OpTable = {{
   // XXX: This should also set the x87 tag bits to empty
   // We don't support this currently, so just pop the stack
   {OPD(0xDF, 0xC0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, true>},
+  {OPD(0xDF, 0xC8), 8, &OpDispatchBuilder::FXCH},
 
   {OPD(0xDF, 0xE0), 8, &OpDispatchBuilder::X87FNSTSW},
   {OPD(0xDF, 0xE8), 8,
@@ -720,7 +724,7 @@ auto GenerateX87TableLambda = [](const auto DispatchTable) consteval {
       //  / 0
       {OPD(0xDD, 0xC0), 8, X86InstInfo{"FFREE", TYPE_X87, FLAGS_NONE, 0}},
       //  / 1
-      {OPD(0xDD, 0xC8), 8, X86InstInfo{"", TYPE_INVALID, FLAGS_NONE, 0}},
+      {OPD(0xDD, 0xC8), 8, X86InstInfo{"FXCH",  TYPE_X87, FLAGS_NONE, 0}},
       //  / 2
       {OPD(0xDD, 0xD0), 8, X86InstInfo{"FST", TYPE_INST, FLAGS_SF_MOD_DST, 0}},
       //  / 3
@@ -780,7 +784,7 @@ auto GenerateX87TableLambda = [](const auto DispatchTable) consteval {
       //  Almost all x86 CPUs implement this, and it is expected to be around
       {OPD(0xDF, 0xC0), 8, X86InstInfo{"FFREEP",  TYPE_X87, FLAGS_POP, 0}},
       //  / 1
-      {OPD(0xDF, 0xC8), 8, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE, 0}},
+      {OPD(0xDF, 0xC8), 8, X86InstInfo{"FXCH",    TYPE_X87, FLAGS_NONE, 0}},
       //  / 2
       {OPD(0xDF, 0xD0), 8, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE, 0}},
       //  / 3
