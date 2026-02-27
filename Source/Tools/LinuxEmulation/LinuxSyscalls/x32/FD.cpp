@@ -988,5 +988,10 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
       uint64_t Result = ::vmsplice(fd, Host_iovec.data(), nr_segs, flags);
       SYSCALL_ERRNO();
     });
+
+  REGISTER_SYSCALL_IMPL_X32(ftruncate, [](FEXCore::Core::CpuStateFrame* Frame, int fd, compat_off_t length) -> uint64_t {
+    uint64_t Result = ::syscall(SYSCALL_DEF(ftruncate), fd, static_cast<int64_t>(length));
+    SYSCALL_ERRNO();
+  });
 }
 } // namespace FEX::HLE::x32
