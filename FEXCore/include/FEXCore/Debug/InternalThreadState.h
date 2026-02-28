@@ -5,6 +5,9 @@
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Utils/LongJump.h>
+#if defined(__ANDROID__)
+#include <FEXCore/Utils/ForkableMutexes.h>
+#endif
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/vector.h>
 
@@ -104,7 +107,11 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
 
   std::shared_ptr<FEXCore::CompileService> CompileService;
 
+#if defined(__ANDROID__)
+  FEXCore::ForkableSharedMutex ObjectCacheRefCounter {};
+#else
   std::shared_mutex ObjectCacheRefCounter {};
+#endif
 
   // This pointer is owned by the frontend.
   FEXCore::SHMStats::ThreadStats* ThreadStats {};
