@@ -1,11 +1,14 @@
 #include <common/GeneratorInterface.h>
 
+#include <cstdint>
 #include <EGL/egl.h>
 
 template<auto>
 struct fex_gen_config {
   unsigned version = 1;
 };
+
+EGLSurface FEX_eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, uint64_t win, const EGLint* attrib_list);
 
 // Function, parameter index, parameter type [optional]
 template<auto, int, typename = void>
@@ -36,7 +39,7 @@ struct fex_gen_config<eglGetError> {};
 template<>
 struct fex_gen_config<eglCreateContext> {};
 template<>
-struct fex_gen_config<eglCreateWindowSurface> {};
+struct fex_gen_config<FEX_eglCreateWindowSurface> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<eglGetCurrentContext> {};
 template<>

@@ -3,6 +3,18 @@
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
 
+#ifdef BUILD_ANDROID
+#include <GL/gl.h>
+#include <GL/glext.h>
+
+#undef GL_ARB_viewport_array
+#include "glcorearb.h"
+#include "android_gl_proc_list.h"
+
+extern "C" using __GLXextFuncPtr = void (*)(void);
+extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
+extern "C" void FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length);
+#else
 #include <GL/glx.h>
 #include <GL/glxext.h>
 #include <GL/gl.h>
@@ -10,6 +22,8 @@
 
 #undef GL_ARB_viewport_array
 #include "glcorearb.h"
+#include "android_gl_proc_list.h"
+#endif
 
 #include <type_traits>
 
@@ -43,6 +57,10 @@ struct fex_gen_type {};
 template<>
 struct fex_gen_type<void> : fexgen::opaque_type {};
 
+#ifdef BUILD_ANDROID
+template<>
+struct fex_gen_type<std::remove_pointer_t<GLsync>> : fexgen::opaque_type {};
+#else
 template<>
 struct fex_gen_type<std::remove_pointer_t<GLXContext>> : fexgen::opaque_type {};
 // NOTE: The data layout of this is almost the same between 64-bit and 32-bit,
@@ -68,6 +86,7 @@ template<>
 struct fex_gen_type<XVisualInfo> : fexgen::emit_layout_wrappers {};
 template<>
 struct fex_gen_type<Visual> : fexgen::opaque_type {}; // Used in XVisualInfo; treat as opaque
+#endif
 
 // Symbols queryable through glXGetProcAddr
 namespace internal {
@@ -78,6 +97,15 @@ struct fex_gen_config : fexgen::generate_guest_symtable, fexgen::indirect_guest_
 template<auto, int, typename = void>
 struct fex_gen_param {};
 
+#ifdef BUILD_ANDROID
+#define FEX_ANDROID_GL_CONFIG(name) \
+template<> \
+struct fex_gen_config<name> {};
+template<>
+struct fex_gen_config<FEX_glShaderSource> : fexgen::custom_host_impl {};
+FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN(FEX_ANDROID_GL_CONFIG)
+#undef FEX_ANDROID_GL_CONFIG
+#else
 template<>
 struct fex_gen_config<glXQueryCurrentRendererStringMESA> {};
 template<>
@@ -6524,5 +6552,6 @@ struct fex_gen_config<glXCushionSGI> {};
 // TODO: 32-bit support
 template<>
 struct fex_gen_config<glXGetTransparentIndexSUN> {};
+#endif
 #endif
 } // namespace internal

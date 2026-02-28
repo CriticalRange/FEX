@@ -793,6 +793,21 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     // This follows how these libraries get loaded in a non-emulated environment,
     // Either by directly linking to the library or a loader (In OpenGL or Vulkan) putting everything in the global namespace.
     file << "  fexldr_ptr_" << libname << "_so = dlopen(\"" << library_filename << "\", RTLD_GLOBAL | RTLD_LAZY);\n";
+    if (libname == "libGL" || libname == "libEGL" || libname == "libSDL3") {
+      file << "#ifdef BUILD_ANDROID\n";
+      file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
+      file << "    fexldr_ptr_" << libname << "_so = dlopen(\"" << libfilename << ".so\", RTLD_GLOBAL | RTLD_LAZY);\n";
+      file << "  }\n";
+      if (libname == "libSDL3") {
+        file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
+        file << "    fexldr_ptr_" << libname << "_so = dlopen(\"libSDL3-host.so\", RTLD_GLOBAL | RTLD_LAZY | RTLD_NOLOAD);\n";
+        file << "  }\n";
+      }
+      file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
+      file << "    fexldr_ptr_" << libname << "_so = reinterpret_cast<void*>(uintptr_t {1});\n";
+      file << "  }\n";
+      file << "#endif\n";
+    }
 
     file << "  if (!fexldr_ptr_" << libname << "_so) { return false; }\n\n";
     for (auto& import : thunked_api) {

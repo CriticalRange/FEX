@@ -111,7 +111,7 @@ void RegisterTime(FEX::HLE::SyscallHandler* Handler) {
       const struct timespec req64 = *req;
       Result = ::nanosleep(&req64, rem64_ptr);
     } else {
-      Result = ::nanosleep(nullptr, rem64_ptr);
+      Result = ::syscall(SYS_nanosleep, nullptr, rem64_ptr);
     }
 
     if (rem) {

@@ -41,7 +41,34 @@ const std::unordered_map<std::string_view, uintptr_t /* guest function address *
 });
 
 extern "C" {
+#ifdef BUILD_ANDROID
+void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length) {
+  fexfn_pack_FEX_glShaderSource(shader, count, reinterpret_cast<uintptr_t>(string), length);
+}
+
+void glShaderSourceARB(GLhandleARB shader, GLsizei count, const GLcharARB* const* string, const GLint* length) {
+  fexfn_pack_FEX_glShaderSource(shader, count, reinterpret_cast<uintptr_t>(string), length);
+}
+#endif
+
 voidFunc* glXGetProcAddress(const GLubyte* procname) {
+#ifdef BUILD_ANDROID
+  std::string_view procname_s {reinterpret_cast<const char*>(procname)};
+  if (procname_s == "glXGetProcAddress" || procname_s == "glXGetProcAddressARB") {
+    return reinterpret_cast<voidFunc*>(glXGetProcAddress);
+  }
+  if (procname_s == "glShaderSource" || procname_s == "glShaderSourceARB") {
+    return reinterpret_cast<voidFunc*>(glShaderSource);
+  }
+
+  auto TargetFuncIt = HostPtrInvokers.find(procname_s);
+  if (TargetFuncIt == HostPtrInvokers.end()) {
+    std::fprintf(stderr, "glXGetProcAddress: not found %s\n", procname);
+    return nullptr;
+  }
+
+  return reinterpret_cast<voidFunc*>(TargetFuncIt->second);
+#else
   auto Ret = fexfn_pack_glXGetProcAddress(procname);
   if (!Ret) {
     return nullptr;
@@ -67,6 +94,7 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
 
   LinkAddressToFunction((uintptr_t)Ret, TargetFuncIt->second);
   return Ret;
+#endif
 }
 
 voidFunc* glXGetProcAddressARB(const GLubyte* procname) {
@@ -80,14 +108,18 @@ static void* malloc_wrapper(size_t size) {
 }
 
 static void OnInit() {
+#ifndef BUILD_ANDROID
   fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);
   fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
   fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
   fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+#endif
 }
 
+#ifndef BUILD_ANDROID
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11
 // symbol here prevents the linker from optimizing away the unused dependency
 auto implicit_libx11_dependency = XSetErrorHandler;
+#endif
 
 LOAD_LIB_INIT(libGL, OnInit)

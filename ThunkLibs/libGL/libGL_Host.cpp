@@ -7,6 +7,7 @@ $end_info$
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
 
 #define GL_GLEXT_PROTOTYPES 1
@@ -14,15 +15,76 @@ $end_info$
 
 #include "glcorearb.h"
 
+#ifdef BUILD_ANDROID
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
+#else
 #include <GL/glx.h>
 #include <GL/glxext.h>
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <xcb/xcb.h>
+#endif
 
 #include "common/Host.h"
+#ifndef BUILD_ANDROID
 #include "common/X11Manager.h"
+#endif
 
+#ifdef BUILD_ANDROID
+struct _XDisplay {};
+using Display = _XDisplay;
+using guest_size_t = size_t;
+struct Visual;
+using VisualID = unsigned long;
+
+struct __GLXFBConfigRec {};
+struct __GLXcontextRec {};
+struct GLXHyperpipeNetworkSGIX {
+  char Placeholder {};
+};
+struct GLXHyperpipeConfigSGIX {
+  char Placeholder {};
+};
+
+struct XVisualInfo {
+  Visual* visual;
+  VisualID visualid;
+  int screen;
+  int depth;
+  int c_class;
+  unsigned long red_mask;
+  unsigned long green_mask;
+  unsigned long blue_mask;
+  int colormap_size;
+  int bits_per_rgb;
+};
+
+using Bool = int;
+using XID = unsigned long;
+using Window = XID;
+using Font = XID;
+using Pixmap = XID;
+using Colormap = XID;
+using GLXDrawable = XID;
+using GLXPixmap = XID;
+using GLXPbuffer = XID;
+using GLXPbufferSGIX = XID;
+using GLXWindow = XID;
+using GLXVideoCaptureDeviceNV = XID;
+using GLXVideoDeviceNV = XID;
+using GLXContextID = XID;
+using GLXContext = __GLXcontextRec*;
+using GLXFBConfig = __GLXFBConfigRec*;
+using GLXFBConfigSGIX = __GLXFBConfigRec*;
+using __GLXextFuncPtr = void (*)();
+using GLhandleARB = unsigned int;
+using GLcharARB = char;
+using GLvdpauSurfaceNV = GLintptr;
+#endif
+
+#ifndef BUILD_ANDROID
 template<>
 struct host_layout<_XDisplay*> {
   _XDisplay* data;
@@ -34,9 +96,11 @@ struct host_layout<_XDisplay*> {
 };
 
 static X11Manager x11_manager;
+#endif
 
 static void* (*GuestMalloc)(guest_size_t) = nullptr;
 
+#ifndef BUILD_ANDROID
 host_layout<_XDisplay*>::host_layout(guest_layout<_XDisplay*>& guest)
   : guest_display(guest.force_get_host_pointer()) {
   data = x11_manager.GuestToHostDisplay(guest_display);
@@ -49,11 +113,34 @@ host_layout<_XDisplay*>::~host_layout() {
 
 // Functions returning _XDisplay* should be handled explicitly via ptr_passthrough
 guest_layout<_XDisplay*> to_guest(host_layout<_XDisplay*>) = delete;
+#endif
 
-static void fexfn_impl_libGL_GL_SetGuestMalloc(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
-  MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &GuestMalloc);
+static void* AndroidGuestMallocFallback(guest_size_t size) {
+  return std::malloc(size);
 }
 
+static void fexfn_impl_libGL_GL_SetGuestMalloc(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
+#ifdef BUILD_ANDROID
+  std::fprintf(stderr, "[libGL-host] GL_SetGuestMalloc target=0x%llx unpacker=0x%llx\n",
+               (unsigned long long)GuestTarget, (unsigned long long)GuestUnpacker);
+  (void)GuestTarget;
+  (void)GuestUnpacker;
+  GuestMalloc = &AndroidGuestMallocFallback;
+#else
+  MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &GuestMalloc);
+#endif
+}
+
+#ifdef BUILD_ANDROID
+static void fexfn_impl_libGL_GL_SetGuestXGetVisualInfo(uintptr_t, uintptr_t) {
+}
+
+static void fexfn_impl_libGL_GL_SetGuestXSync(uintptr_t, uintptr_t) {
+}
+
+static void fexfn_impl_libGL_GL_SetGuestXDisplayString(uintptr_t, uintptr_t) {
+}
+#else
 static void fexfn_impl_libGL_GL_SetGuestXGetVisualInfo(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXGetVisualInfo);
 }
@@ -65,12 +152,29 @@ static void fexfn_impl_libGL_GL_SetGuestXSync(uintptr_t GuestTarget, uintptr_t G
 static void fexfn_impl_libGL_GL_SetGuestXDisplayString(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXDisplayString);
 }
+#endif
 
 #include "thunkgen_host_libGL.inl"
 
-auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
-  using VoidFn = void (*)();
+static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length) {
+  ::glShaderSource(shader, count, reinterpret_cast<const GLchar* const*>(strings), length);
+}
+
+auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr {
+  using VoidFn = __GLXextFuncPtr;
   std::string_view name_sv {reinterpret_cast<const char*>(name)};
+#ifdef BUILD_ANDROID
+  if (name_sv == "glShaderSource" || name_sv == "glShaderSourceARB") {
+    return reinterpret_cast<VoidFn>(fexfn_impl_libGL_FEX_glShaderSource);
+  }
+
+  auto* android_name = reinterpret_cast<const char*>(name);
+  if (auto egl_proc = reinterpret_cast<VoidFn>(eglGetProcAddress(android_name)); egl_proc) {
+    return egl_proc;
+  }
+
+  return reinterpret_cast<VoidFn>(dlsym(RTLD_DEFAULT, android_name));
+#else
   if (name_sv == "glCompileShaderIncludeARB") {
     return (VoidFn)fexfn_impl_libGL_glCompileShaderIncludeARB;
   } else if (name_sv == "glCreateShaderProgramv") {
@@ -104,9 +208,9 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
   } else if (name_sv == "glGetVertexArrayPointervEXT") {
     return (VoidFn)fexfn_impl_libGL_glGetVertexArrayPointervEXT;
   } else if (name_sv == "glShaderSource") {
-    return (VoidFn)fexfn_impl_libGL_glShaderSource;
+    return (VoidFn)fexfn_impl_libGL_FEX_glShaderSource;
   } else if (name_sv == "glShaderSourceARB") {
-    return (VoidFn)fexfn_impl_libGL_glShaderSourceARB;
+    return (VoidFn)fexfn_impl_libGL_FEX_glShaderSource;
 #ifdef IS_32BIT_THUNK
   } else if (name_sv == "glBindBuffersRange") {
     return (VoidFn)fexfn_impl_libGL_glBindBuffersRange;
@@ -151,11 +255,12 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> void (*)() {
 #endif
   }
   return (VoidFn)glXGetProcAddress((const GLubyte*)name);
+#endif
 }
 
 // TODO: unsigned int *glXEnumerateVideoDevicesNV (Display *dpy, int screen, int *nelements);
 
-
+#ifndef BUILD_ANDROID
 void fexfn_impl_libGL_glCompileShaderIncludeARB(GLuint a_0, GLsizei Count, guest_layout<const GLchar* const*> a_2, const GLint* a_3) {
 #ifndef IS_32BIT_THUNK
   auto sources = a_2.force_get_host_pointer();
@@ -287,7 +392,9 @@ void fexfn_impl_libGL_glShaderSourceARB(GLuint a_0, GLsizei count, guest_layout<
 #endif
   return fexldr_ptr_libGL_glShaderSourceARB(a_0, count, sources, a_3);
 }
+#endif
 
+#ifndef BUILD_ANDROID
 // Relocate data to guest heap so it can be called with XFree.
 // The memory at the given host location will be de-allocated.
 template<typename T>
@@ -421,6 +528,122 @@ int fexfn_impl_libGL_glXGetConfig(Display* Display, guest_layout<XVisualInfo*> I
 guest_layout<XVisualInfo*> fexfn_impl_libGL_glXGetVisualFromFBConfig(Display* Display, GLXFBConfig Config) {
   return MapToGuestVisualInfo(Display, fexldr_ptr_libGL_glXGetVisualFromFBConfig(Display, Config));
 }
+#else
+namespace {
+guest_layout<GLXFBConfig*> MakeGuestFBConfigArray(int* NumItems) {
+  if (NumItems) {
+    *NumItems = 1;
+  }
+  if (!GuestMalloc) {
+    return guest_layout<GLXFBConfig*> {.data = 0};
+  }
+
+  std::fprintf(stderr, "[libGL-host] MakeGuestFBConfigArray GuestMalloc=%p\n", reinterpret_cast<void*>(GuestMalloc));
+  auto* guest_configs = reinterpret_cast<guest_layout<GLXFBConfig>*>(GuestMalloc(sizeof(guest_layout<GLXFBConfig>)));
+  guest_configs[0].data = 1;
+  guest_layout<GLXFBConfig*> ret;
+  ret.data = reinterpret_cast<uintptr_t>(guest_configs);
+  return ret;
+}
+
+guest_layout<GLXFBConfigSGIX*> MakeGuestFBConfigArraySGIX(int* NumItems) {
+  if (NumItems) {
+    *NumItems = 1;
+  }
+  if (!GuestMalloc) {
+    return guest_layout<GLXFBConfigSGIX*> {.data = 0};
+  }
+
+  auto* guest_configs = reinterpret_cast<guest_layout<GLXFBConfigSGIX>*>(GuestMalloc(sizeof(guest_layout<GLXFBConfigSGIX>)));
+  guest_configs[0].data = 1;
+  guest_layout<GLXFBConfigSGIX*> ret;
+  ret.data = reinterpret_cast<uintptr_t>(guest_configs);
+  return ret;
+}
+
+guest_layout<XVisualInfo*> MakeGuestVisualInfo() {
+  if (!GuestMalloc) {
+    return guest_layout<XVisualInfo*> {.data = 0};
+  }
+
+  XVisualInfo host_info {
+    .visual = reinterpret_cast<Visual*>(uintptr_t {1}),
+    .visualid = 1,
+    .screen = 0,
+    .depth = 24,
+    .c_class = 4,
+    .red_mask = 0x00ff0000UL,
+    .green_mask = 0x0000ff00UL,
+    .blue_mask = 0x000000ffUL,
+    .colormap_size = 256,
+    .bits_per_rgb = 8,
+  };
+
+  auto* guest_info = reinterpret_cast<XVisualInfo*>(GuestMalloc(sizeof(XVisualInfo)));
+  *guest_info = host_info;
+
+  guest_layout<XVisualInfo*> ret;
+  ret.data = reinterpret_cast<uintptr_t>(guest_info);
+  return ret;
+}
+} // namespace
+
+guest_layout<GLXFBConfig*> fexfn_impl_libGL_glXChooseFBConfig(Display*, int, const int*, int* NumItems) {
+  return MakeGuestFBConfigArray(NumItems);
+}
+
+guest_layout<GLXFBConfigSGIX*> fexfn_impl_libGL_glXChooseFBConfigSGIX(Display*, int, int*, int* NumItems) {
+  return MakeGuestFBConfigArraySGIX(NumItems);
+}
+
+guest_layout<_XDisplay*> fexfn_impl_libGL_glXGetCurrentDisplay() {
+  return guest_layout<_XDisplay*> {.data = 0};
+}
+
+guest_layout<_XDisplay*> fexfn_impl_libGL_glXGetCurrentDisplayEXT() {
+  return guest_layout<_XDisplay*> {.data = 0};
+}
+
+guest_layout<GLXFBConfig*> fexfn_impl_libGL_glXGetFBConfigs(Display*, int, int* NumItems) {
+  return MakeGuestFBConfigArray(NumItems);
+}
+
+GLXFBConfigSGIX fexfn_impl_libGL_glXGetFBConfigFromVisualSGIX(Display*, guest_layout<XVisualInfo*>) {
+  return reinterpret_cast<GLXFBConfigSGIX>(uintptr_t {1});
+}
+
+guest_layout<XVisualInfo*> fexfn_impl_libGL_glXGetVisualFromFBConfigSGIX(Display*, GLXFBConfigSGIX) {
+  return MakeGuestVisualInfo();
+}
+
+guest_layout<XVisualInfo*> fexfn_impl_libGL_glXChooseVisual(Display*, int, int*) {
+  return MakeGuestVisualInfo();
+}
+
+GLXContext fexfn_impl_libGL_glXCreateContext(Display*, guest_layout<XVisualInfo*>, GLXContext, Bool) {
+  auto context = eglGetCurrentContext();
+  return context != EGL_NO_CONTEXT ? reinterpret_cast<GLXContext>(context) : reinterpret_cast<GLXContext>(uintptr_t {1});
+}
+
+GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmap(Display*, guest_layout<XVisualInfo*>, Pixmap Pixmap) {
+  return static_cast<GLXPixmap>(Pixmap != 0 ? Pixmap : 1);
+}
+
+GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmapMESA(Display*, guest_layout<XVisualInfo*>, Pixmap Pixmap, Colormap) {
+  return static_cast<GLXPixmap>(Pixmap != 0 ? Pixmap : 1);
+}
+
+int fexfn_impl_libGL_glXGetConfig(Display*, guest_layout<XVisualInfo*>, int, int* Value) {
+  if (Value) {
+    *Value = 0;
+  }
+  return 0;
+}
+
+guest_layout<XVisualInfo*> fexfn_impl_libGL_glXGetVisualFromFBConfig(Display*, GLXFBConfig) {
+  return MakeGuestVisualInfo();
+}
+#endif
 
 #ifdef IS_32BIT_THUNK
 void fexfn_impl_libGL_glBindBuffersRange(GLenum a_0, GLuint a_1, GLsizei Count, const GLuint* a_3, guest_layout<const int*> Offsets,

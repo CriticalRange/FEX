@@ -189,7 +189,15 @@ void* memalign(size_t align, size_t s) {
   return ::memalign(align, s);
 }
 void* valloc(size_t size) {
+#if defined(__BIONIC__)
+  auto page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  if (page_size == 0) {
+    page_size = 4096;
+  }
+  return ::memalign(page_size, size);
+#else
   return ::valloc(size);
+#endif
 }
 int posix_memalign(void** r, size_t a, size_t s) {
   return ::posix_memalign(r, a, s);

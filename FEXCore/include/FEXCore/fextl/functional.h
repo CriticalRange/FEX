@@ -43,21 +43,23 @@ public:
       // First, relocate argument to a location returned from FEX's allocators
       using Fnoref = std::remove_reference_t<F>;
       storage = Alloc(alignof(Fnoref), sizeof(Fnoref));
-      auto moved_lambda = new (storage) Fnoref {std::move(f)};
+      new (storage) Fnoref {std::move(f)};
 
-      // Second, wrap the relocated argument in a single-capture lambda
-      auto wrapped_lambda = [moved_lambda](Args... args) {
-        return (*moved_lambda)(std::forward<Args>(args)...);
+      // Second, keep a direct invocation trampoline instead of routing through
+      // std::function assignment. Android libc++ may reject the noexcept path.
+      // TODO: Replace this compatibility path with std::move_only_function (or
+      // equivalent) once the NDK exposes a suitable implementation.
+      internal_invoke = [](const move_only_function* self, Args&&... args) -> R {
+        auto* fn = reinterpret_cast<Fnoref*>(self->storage);
+        if constexpr (std::is_void_v<R>) {
+          (*fn)(std::forward<Args>(args)...);
+          return;
+        } else {
+          return (*fn)(std::forward<Args>(args)...);
+        }
       };
 
-      // Third, assign the result to std::function, ensuring it's indeed
-      // allocation-free by checking for nothrow-constructibility
-      static_assert(noexcept(internal = std::move(wrapped_lambda)), "This implementation of std::function "
-                                                                    "does not support implementing "
-                                                                    "fextl::move_only_function");
-      internal = std::move(wrapped_lambda);
-
-      // Finally, if a destructor must be called, generate a pointer to its destructor
+      // Finally, if a destructor must be called, generate a pointer to it.
       if constexpr (!std::is_trivially_destructible_v<Fnoref>) {
         internal_destructor = [](move_only_function* self) {
           reinterpret_cast<Fnoref*>(self->storage)->~Fnoref();
@@ -74,32 +76,53 @@ public:
   }
 
   move_only_function& operator=(move_only_function&& other) noexcept {
-    if (!other && internal_destructor) {
-      this->~move_only_function();
+    if (this == &other) {
+      return *this;
     }
+    reset();
     internal = std::exchange(other.internal, nullptr);
+    internal_invoke = std::exchange(other.internal_invoke, nullptr);
     internal_destructor = std::exchange(other.internal_destructor, nullptr);
     storage = std::exchange(other.storage, nullptr);
     return *this;
   }
 
   ~move_only_function() {
-    if (internal_destructor) {
-      internal_destructor(this);
-    }
-    Dealloc(storage);
+    reset();
   }
 
   R operator()(Args... args) const {
+    if (internal_invoke) {
+      if constexpr (std::is_void_v<R>) {
+        internal_invoke(this, std::forward<Args>(args)...);
+        return;
+      } else {
+        return internal_invoke(this, std::forward<Args>(args)...);
+      }
+    }
     return internal(std::forward<Args>(args)...);
   }
 
   explicit operator bool() const noexcept {
-    return (bool)internal;
+    return internal_invoke != nullptr || static_cast<bool>(internal);
   }
 
 private:
+  void reset() noexcept {
+    if (internal_destructor) {
+      internal_destructor(this);
+      internal_destructor = nullptr;
+    }
+    if (storage) {
+      Dealloc(storage);
+      storage = nullptr;
+    }
+    internal_invoke = nullptr;
+    internal = nullptr;
+  }
+
   std::function<R(Args...)> internal;
+  R (*internal_invoke)(const move_only_function*, Args&&...) = nullptr;
   void (*internal_destructor)(move_only_function*) = nullptr;
   void* storage = nullptr;
 };

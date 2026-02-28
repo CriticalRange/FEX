@@ -10,14 +10,22 @@
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/fextl/fmt.h>
+#include <FEXCore/fextl/string.h>
 
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <git_version.h>
 
 namespace FEX::HLE {
+
+namespace {
+static fextl::string GetStatsSHMName() {
+  return fextl::fmt::format("fex-{}-stats", ::getpid());
+}
+} // namespace
 
 ThreadManager::StatAlloc::StatAlloc() {
   Initialize();
@@ -29,14 +37,25 @@ void ThreadManager::StatAlloc::Initialize() {
     return;
   }
 
-  int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_CREAT | O_TRUNC | O_RDWR, USER_PERMS);
-  if (fd == -1) {
+  if (StatFD != -1) {
+    close(StatFD);
+    StatFD = -1;
+  }
+
+  auto StatsSHMName = GetStatsSHMName();
+#if defined(__ANDROID__) || defined(BUILD_ANDROID) || defined(ENABLE_ANDROID)
+  StatFD = memfd_create(StatsSHMName.c_str(), MFD_CLOEXEC);
+#else
+  StatFD = shm_open(StatsSHMName.c_str(), O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG | S_IRWXO);
+#endif
+  if (StatFD == -1) {
     return;
   }
+
   CurrentSize = sysconf(_SC_PAGESIZE);
   CurrentSize = CurrentSize > 0 ? CurrentSize : FEXCore::Utils::FEX_PAGE_SIZE;
 
-  if (ftruncate(fd, CurrentSize) == -1) {
+  if (ftruncate(StatFD, CurrentSize) == -1) {
     LogMan::Msg::EFmt("[StatAlloc] ftruncate failed");
     goto err;
   }
@@ -57,7 +76,7 @@ void ThreadManager::StatAlloc::Initialize() {
 
   // Allocate a small working shared space for now, grow as necessary.
   {
-    auto SharedBase = FEXCore::Allocator::mmap(Base, CurrentSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    auto SharedBase = FEXCore::Allocator::mmap(Base, CurrentSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, StatFD, 0);
     if (SharedBase == MAP_FAILED) {
       LogMan::Msg::EFmt("[StatAlloc] mmap shm failed");
       FEXCore::Allocator::munmap(Base, MAX_STATS_SIZE);
@@ -66,8 +85,13 @@ void ThreadManager::StatAlloc::Initialize() {
     }
   }
 
+  return;
+
 err:
-  close(fd);
+  if (StatFD != -1) {
+    close(StatFD);
+    StatFD = -1;
+  }
 }
 
 uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
@@ -78,28 +102,23 @@ uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
   }
   NewSize = std::min(MAX_STATS_SIZE, NewSize);
 
-  // When allocating more slots, open the fd without O_TRUNC | O_CREAT.
-  int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_RDWR, USER_PERMS);
-  if (fd == -1) {
+  if (StatFD == -1) {
     return CurrentSize;
   }
 
-  if (ftruncate(fd, NewSize) == -1) {
+  if (ftruncate(StatFD, NewSize) == -1) {
     LogMan::Msg::EFmt("[StatAlloc] ftruncate more failed");
-
-    goto err;
+    return CurrentSize;
   }
 
   {
-    auto SharedBase = FEXCore::Allocator::mmap(Base, NewSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    auto SharedBase = FEXCore::Allocator::mmap(Base, NewSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, StatFD, 0);
     if (SharedBase == MAP_FAILED) {
       LogMan::Msg::EFmt("[StatAlloc] allocate more mmap shm failed");
-      goto err;
+      return CurrentSize;
     }
   }
 
-err:
-  close(fd);
   return NewSize;
 }
 
@@ -118,7 +137,13 @@ void ThreadManager::StatAlloc::DeallocateSlot(FEXCore::SHMStats::ThreadStats* Al
 }
 
 void ThreadManager::StatAlloc::CleanupForExit() {
-  shm_unlink(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str());
+  if (StatFD != -1) {
+    close(StatFD);
+    StatFD = -1;
+  }
+#if !defined(__ANDROID__) && !defined(BUILD_ANDROID) && !defined(ENABLE_ANDROID)
+  shm_unlink(GetStatsSHMName().c_str());
+#endif
 }
 
 void ThreadManager::StatAlloc::LockBeforeFork() {
@@ -140,10 +165,14 @@ void ThreadManager::StatAlloc::UnlockAfterFork(FEXCore::Core::InternalThreadStat
 
   StatMutex.StealAndDropActiveLocks();
 
-  // shm_memory ownership is retained by the parent process, so the child must replace it with its own one.
+  // Stats mapping ownership is retained by the parent process, so the child must replace it with its own one.
   // Otherwise this process will keep reporting in the original parent thread's stats region.
   FEXCore::Allocator::munmap(Base, MAX_STATS_SIZE);
   Base = nullptr;
+  if (StatFD != -1) {
+    close(StatFD);
+    StatFD = -1;
+  }
   CurrentSize = 0;
   Head = nullptr;
   Stats = nullptr;

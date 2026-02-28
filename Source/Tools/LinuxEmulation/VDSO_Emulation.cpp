@@ -667,7 +667,7 @@ void LoadGuestVDSOSymbols(char* VDSOBase) {
     for (size_t i = 0; i < NumSymbols; ++i) {
       uint64_t offset = SymTableHeader->sh_offset + i * SymTableHeader->sh_entsize;
       auto Symbol = reinterpret_cast<const ELFSymbolType*>(VDSOBase + offset);
-      if (ELF32_ST_VISIBILITY(Symbol->st_other) != STV_HIDDEN && Symbol->st_value != 0) {
+      if ((Symbol->st_other & 0x3) != STV_HIDDEN && Symbol->st_value != 0) {
         const char* Name = &StrTab[Symbol->st_name];
         if (Name[0] != '\0') {
           if (strcmp(Name, "__kernel_sigreturn") == 0) {

@@ -57,6 +57,25 @@ static FEX::HLE::ThreadStateObject* GetThreadFromAltStack(const stack_t& alt_sta
   return ThreadObject;
 }
 
+static uint64_t GetSignalMaskWord0(const ucontext_t* context) {
+  uint64_t Mask {};
+  for (int Signal = 1; Signal <= SignalDelegator::MAX_SIGNALS; ++Signal) {
+    if (sigismember(&context->uc_sigmask, Signal) == 1) {
+      Mask |= 1ULL << (Signal - 1);
+    }
+  }
+  return Mask;
+}
+
+static void SetSignalMaskWord0(ucontext_t* context, uint64_t Mask) {
+  sigemptyset(&context->uc_sigmask);
+  for (int Signal = 1; Signal <= SignalDelegator::MAX_SIGNALS; ++Signal) {
+    if (Mask & (1ULL << (Signal - 1))) {
+      sigaddset(&context->uc_sigmask, Signal);
+    }
+  }
+}
+
 static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
   ucontext_t* _context = (ucontext_t*)UContext;
   auto ThreadObject = GetThreadFromAltStack(_context->uc_stack);
@@ -617,7 +636,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       Signal = Top.Signal;
       SigInfo = Top.Info;
       // sig mask has been updated at the defer time, recover the original mask
-      memcpy(&_context->uc_sigmask, &Top.SigMask, sizeof(uint64_t));
+      SetSignalMaskWord0(_context, Top.SigMask);
       ThreadObject->SignalInfo.DeferredSignalFrames.pop_back();
 
       // Until we re-protect the page to PROT_NONE, FEX will now *permanently* defer signals and /not/ check them.
@@ -652,14 +671,14 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
     ThreadObject->SignalInfo.DeferredSignalFrames.emplace_back(ThreadStateObject::DeferredSignalState {
       .Info = SigInfo,
       .Signal = Signal,
-      .SigMask = _context->uc_sigmask.__val[0],
+      .SigMask = GetSignalMaskWord0(_context),
     });
 
     uint64_t NewMask = GetNewSigMask(Signal);
 
     // Update our host signal mask so we don't hit race conditions with signals
     // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
-    memcpy(&_context->uc_sigmask, &NewMask, sizeof(uint64_t));
+    SetSignalMaskWord0(_context, NewMask);
 
     // Now update the faulting page permissions so it will fault on write.
     mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
@@ -697,7 +716,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
 
       // Update our host signal mask so we don't hit race conditions with signals
       // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
-      memcpy(&_context->uc_sigmask, &NewMask, sizeof(uint64_t));
+      SetSignalMaskWord0(_context, NewMask);
 
       // We handled this signal, continue running
       return;

@@ -10,6 +10,10 @@ if (ENABLE_CLANG_THUNKS)
   add_link_options(${LD_OVERRIDE})
 endif()
 
+if (NOT GENERATOR_EXE)
+  set(GENERATOR_EXE thunkgen)
+endif()
+
 # Syntax: generate(libxyz libxyz-interface.cpp)
 # This defines two targets and a custom command:
 # - custom command: Main build step that runs the thunk generator on the given interface definition
@@ -26,6 +30,9 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
   # This is not evaluated directly, hence directories added after return are still picked up
   set(prop "$<TARGET_PROPERTY:${NAME}-${GUEST_BITNESS}-deps,INTERFACE_INCLUDE_DIRECTORIES>")
   set(compile_prop "$<TARGET_PROPERTY:${NAME}-${GUEST_BITNESS}-deps,INTERFACE_COMPILE_DEFINITIONS>")
+  if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    list(APPEND compile_prop BUILD_ANDROID=1 ENABLE_ANDROID=1)
+  endif()
   if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     list(APPEND compile_prop ARCHITECTURE_x86_64=1)
   elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
@@ -50,8 +57,8 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${SOURCE_FILE}"
-    DEPENDS thunkgen
-    COMMAND thunkgen "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
+    DEPENDS "${GENERATOR_EXE}"
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -104,8 +111,17 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   #generate(libfex_malloc)
   #add_host_lib(fex_malloc ${GUEST_BITNESS})
 
-  generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(asound ${GUEST_BITNESS})
+  if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    generate(libSDL3 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_interface.cpp ${GUEST_BITNESS})
+    target_include_directories(libSDL3-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/../third_party/SDL3/include)
+    add_host_lib(SDL3 ${GUEST_BITNESS})
+    target_link_libraries(SDL3-host-${GUEST_BITNESS} PRIVATE EGL)
+    target_link_libraries(SDL3-host-${GUEST_BITNESS} PRIVATE android)
+    target_link_libraries(SDL3-host-${GUEST_BITNESS} PRIVATE log)
+  else()
+    generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
+    add_host_lib(asound ${GUEST_BITNESS})
+  endif()
 
   # disabled for now, headers are platform specific
   # find_package(SDL2 REQUIRED)
@@ -113,35 +129,55 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   # add_host_lib(SDL2 ${GUEST_BITNESS})
   # target_include_directories(SDL2-host PRIVATE ${SDL2_INCLUDE_DIRS})
 
-  generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
-  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
-  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
-  add_host_lib(drm ${GUEST_BITNESS})
+  if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+    generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
+    target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
+    target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
+    add_host_lib(drm ${GUEST_BITNESS})
+  endif()
+
+  generate(libc ${CMAKE_CURRENT_SOURCE_DIR}/../libc/libc_interface.cpp ${GUEST_BITNESS})
+  target_compile_definitions(libc-${GUEST_BITNESS}-deps INTERFACE _GNU_SOURCE _LARGEFILE64_SOURCE _FILE_OFFSET_BITS=64)
+  add_host_lib(c ${GUEST_BITNESS})
 endforeach()
 
-set(BITNESS_LIST "32;64")
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+  set(BITNESS_LIST "64")
+else()
+  set(BITNESS_LIST "32;64")
+endif()
 foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   if (BUILD_FEX_LINUX_TESTS)
     generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp ${GUEST_BITNESS})
     add_host_lib(fex_thunk_test ${GUEST_BITNESS})
   endif()
 
-  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
-  target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
-  add_host_lib(vulkan ${GUEST_BITNESS})
+  if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+    generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
+    target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+    add_host_lib(vulkan ${GUEST_BITNESS})
 
-  generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(wayland-client ${GUEST_BITNESS})
-  target_include_directories(libwayland-client-${GUEST_BITNESS}-deps INTERFACE /usr/include/wayland)
+    generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp ${GUEST_BITNESS})
+    add_host_lib(wayland-client ${GUEST_BITNESS})
+    target_include_directories(libwayland-client-${GUEST_BITNESS}-deps INTERFACE /usr/include/wayland)
+  endif()
 
   generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp ${GUEST_BITNESS})
   add_host_lib(EGL ${GUEST_BITNESS})
+  if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    target_link_libraries(EGL-host-${GUEST_BITNESS} PRIVATE EGL)
+  endif()
 
   generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp ${GUEST_BITNESS})
   add_host_lib(GL ${GUEST_BITNESS})
-
-  find_package(OpenGL REQUIRED)
-  target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE OpenGL::GL)
+  if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE EGL)
+    target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE GLESv3)
+    target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE log)
+  else()
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE OpenGL::GL)
+  endif()
 endforeach()
 
 if (BUILD_FEX_LINUX_TESTS)

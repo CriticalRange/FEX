@@ -28,9 +28,12 @@ $end_info$
 #include <cstdint>
 #include <mutex>
 #include <optional>
-#include <sys/stat.h>
 
+#if defined(__ANDROID__) || defined(BUILD_ANDROID) || defined(ENABLE_ANDROID) || defined(ARCHITECTURE_arm64) || defined(__aarch64__)
+#include <signal.h>
+#else
 #include <bits/types/sigset_t.h>
+#endif
 #include <linux/seccomp.h>
 
 namespace FEX::HLE {
@@ -159,7 +162,7 @@ public:
     FEX_CONFIG_OPT(ProfileStats, PROFILESTATS);
     FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
 
-    constexpr static int USER_PERMS = S_IRWXU | S_IRWXG | S_IRWXO;
+    int StatFD {-1};
     FEXCore::ForkableUniqueMutex StatMutex;
   };
 

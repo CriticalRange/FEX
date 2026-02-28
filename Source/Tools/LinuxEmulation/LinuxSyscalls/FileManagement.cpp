@@ -658,6 +658,10 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
+#if defined(__ANDROID__)
+      // TODO(Android): Re-enable openat2 + RESOLVE_IN_ROOT when app seccomp policy allows syscall 437.
+      fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
+#else
       FEX::HLE::open_how how = {
         .flags = (uint64_t)flags,
         .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this
@@ -670,6 +674,7 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
         // just punt and do the access without RESOLVE_IN_ROOT.
         fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
       }
+#endif
     }
 
     // Open through RootFS failed (probably nonexistent), so open directly.
@@ -912,6 +917,10 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1) {
+#if defined(__ANDROID__)
+      // TODO(Android): Re-enable openat2 + RESOLVE_IN_ROOT when app seccomp policy allows syscall 437.
+      fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
+#else
       FEX::HLE::open_how how = {
         .flags = (uint64_t)flags,
         .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this,
@@ -923,6 +932,7 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
         // just punt and do the access without RESOLVE_IN_ROOT.
         fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
       }
+#endif
     }
 
     // Open through RootFS failed (probably nonexistent), so open directly.
@@ -941,12 +951,27 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
 uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_how* how, size_t usize) {
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  const int open_flags = static_cast<int>(how->flags);
+#if defined(__ANDROID__)
+  (void)usize;
+#endif
 
   int32_t fd = -1;
 
-  if (!ShouldSkipOpenInEmu(how->flags)) {
+  if (!ShouldSkipOpenInEmu(open_flags)) {
     FDPathTmpData TmpFilename;
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
+#if defined(__ANDROID__)
+    // TODO(Android): Re-enable openat2 + RESOLVE_IN_ROOT when app seccomp policy allows syscall 437.
+    if (Path.FD != -1) {
+      fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, open_flags, how->mode);
+    }
+
+    // Open through RootFS failed (probably nonexistent), so open directly.
+    if (fd == -1) {
+      fd = ::syscall(SYSCALL_DEF(openat), dirfs, SelfPath, open_flags, how->mode);
+    }
+#else
     if (Path.FD != -1 && !(how->resolve & RESOLVE_IN_ROOT)) {
       // AT_FDCWD means it's a thunk and not via RootFS
       if (Path.FD != AT_FDCWD) {
@@ -965,10 +990,15 @@ uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_ho
     if (fd == -1) {
       fd = ::syscall(SYSCALL_DEF(openat2), dirfs, SelfPath, how, usize);
     }
+#endif
 
     ReplaceEmuFd(fd, how->flags, how->mode);
   } else {
+#if defined(__ANDROID__)
+    fd = ::syscall(SYSCALL_DEF(openat), dirfs, SelfPath, open_flags, how->mode);
+#else
     fd = ::syscall(SYSCALL_DEF(openat2), dirfs, SelfPath, how, usize);
+#endif
   }
 
   return fd;

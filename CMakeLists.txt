@@ -40,6 +40,7 @@ option(BUILD_STEAM_SUPPORT "Enable Steam integration" FALSE)
 set(X86_32_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_32.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting i686")
 set(X86_64_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_64.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting x86_64")
 set(X86_DEV_ROOTFS "/" CACHE FILEPATH "Path to the sysroot used for cross-compiling for i686 and x86_64")
+set(GENERATOR_EXE "" CACHE FILEPATH "Path to an externally built thunk generator executable")
 set(DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(HOSTLIBS_DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 
@@ -53,7 +54,7 @@ if (NOT HOSTLIBS_DATA_DIRECTORY)
 endif()
 
 ## Platform Checks ##
-# Only 64-bit Linux and Windows are supported
+# Only 64-bit Linux, Android, and Windows are supported
 
 # NB: SIZEOF_VOID_P is in bytes, not bits
 # On 32-bit systems this is set to 4
@@ -61,10 +62,14 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Unsupported pointer size ${CMAKE_SIZEOF_VOID_P}."
     " FEX only supports 64-bit (8-byte pointer) systems."
     " If you believe this is in error, file an issue.")
-elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android"))
   message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
-    " FEX only supports Linux and Windows."
+    " FEX only supports Linux, Android, and Windows."
     " If you believe this is in error, file an issue.")
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+  add_compile_definitions(BUILD_ANDROID=1 ENABLE_ANDROID=1 ANDROID_BUILD=1)
 endif()
 
 ## Compiler Checks ##
@@ -234,7 +239,11 @@ check_cxx_source_compiles(
   return program_invocation_name == nullptr;
   }"
   HAS_PROGRAM_INVOCATION_NAME)
-add_compile_definitions("HAS_PROGRAM_INVOCATION_NAME=${HAS_PROGRAM_INVOCATION_NAME}")
+if (HAS_PROGRAM_INVOCATION_NAME)
+  add_compile_definitions("HAS_PROGRAM_INVOCATION_NAME=1")
+else()
+  add_compile_definitions("HAS_PROGRAM_INVOCATION_NAME=0")
+endif()
 
 if (ENABLE_VIXL_SIMULATOR)
   # We can run the simulator on both x86-64 or AArch64 hosts
@@ -259,7 +268,11 @@ if (ENABLE_COMPILE_TIME_TRACE)
   link_libraries(-ftime-trace)
 endif()
 
-set(PTHREAD_LIB pthread)
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+  set(PTHREAD_LIB "")
+else()
+  set(PTHREAD_LIB pthread)
+endif()
 
 if (USE_LINKER)
   message(STATUS "Overriding linker to: ${USE_LINKER}")
@@ -607,7 +620,28 @@ endif()
 
 if (BUILD_THUNKS)
   set(FEX_PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR})
-  add_subdirectory(ThunkLibs/Generator)
+  set(THUNKGEN_EXTERNAL_ARG "")
+  set(FEX_THUNKGEN_DEPENDS "")
+
+  if (NOT GENERATOR_EXE AND CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(DEFAULT_THUNKGEN_EXE "${CMAKE_BINARY_DIR}/../upstream-fex-thunks/Bin/thunkgen")
+    if (EXISTS "${DEFAULT_THUNKGEN_EXE}")
+      set(GENERATOR_EXE "${DEFAULT_THUNKGEN_EXE}" CACHE FILEPATH "Path to an externally built thunk generator executable" FORCE)
+    endif()
+  endif()
+
+  if (GENERATOR_EXE)
+    if (NOT EXISTS "${GENERATOR_EXE}")
+      message(FATAL_ERROR "Configured GENERATOR_EXE does not exist: ${GENERATOR_EXE}")
+    endif()
+    message(STATUS "Using external thunk generator: ${GENERATOR_EXE}")
+    set(THUNKGEN_EXTERNAL_ARG "${GENERATOR_EXE}")
+  else()
+    add_subdirectory(ThunkLibs/Generator)
+    set(GENERATOR_EXE thunkgen)
+    set(THUNKGEN_EXTERNAL_ARG "$<TARGET_FILE:thunkgen>")
+    list(APPEND FEX_THUNKGEN_DEPENDS thunkgen)
+  endif()
 
   # Thunk targets for both host libraries and IDE integration
   add_subdirectory(ThunkLibs/HostLibs)
@@ -629,11 +663,11 @@ if (BUILD_THUNKS)
       "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_64_TOOLCHAIN_FILE}"
       "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
       "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
-      "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
+      "-DGENERATOR_EXE=${THUNKGEN_EXTERNAL_ARG}"
       "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
-    DEPENDS thunkgen)
+    DEPENDS ${FEX_THUNKGEN_DEPENDS})
 
   ExternalProject_Add(guest-libs-32
     PREFIX guest-libs-32
@@ -647,11 +681,11 @@ if (BUILD_THUNKS)
       "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
       "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
       "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
-      "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
+      "-DGENERATOR_EXE=${THUNKGEN_EXTERNAL_ARG}"
       "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
-    DEPENDS thunkgen)
+    DEPENDS ${FEX_THUNKGEN_DEPENDS})
 
   install(
     CODE "message(\"-- Installing: guest-libs\")"

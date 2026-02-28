@@ -282,6 +282,10 @@ AddObject(${PROJECT_NAME}_object)
 AddLibrary(${PROJECT_NAME} STATIC)
 AddLibrary(${PROJECT_NAME}_shared SHARED)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+  target_link_libraries(${PROJECT_NAME}_shared PRIVATE FEXCore_Base)
+endif()
+
 if (NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
   install(TARGETS ${PROJECT_NAME}_shared LIBRARY
     DESTINATION ${CMAKE_INSTALL_LIBDIR}

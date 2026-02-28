@@ -12,7 +12,10 @@ $end_info$
 
 #include <FEXCore/IR/IR.h>
 
+#include <linux/futex.h>
+#include <linux/mempolicy.h>
 #include <stdint.h>
+#include <cstring>
 #include <sys/epoll.h>
 
 namespace FEX::HLE {
@@ -211,6 +214,70 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
 }
 #endif
 
+#ifdef ANDROID_BUILD
+namespace {
+thread_local int AndroidGuestMempolicyMode {MPOL_DEFAULT};
+thread_local uint64_t AndroidGuestMempolicyNodemask {};
+
+static size_t AndroidNodeMaskByteCount(unsigned long maxnode) {
+  return maxnode == 0 ? 0 : ((maxnode + 7) / 8);
+}
+
+static bool AndroidMempolicyModeIsValid(int mode) {
+  const int BaseMode = mode & ~MPOL_MODE_FLAGS;
+  return BaseMode >= MPOL_DEFAULT && BaseMode < MPOL_MAX;
+}
+
+static uint64_t AndroidReadNodeMask(const unsigned long* nodemask, unsigned long maxnode, uint64_t* out_mask) {
+  if (nodemask == nullptr) {
+    if (maxnode != 0) {
+      return -EINVAL;
+    }
+
+    if (out_mask != nullptr) {
+      *out_mask = 0;
+    }
+    return 0;
+  }
+
+  const size_t MaskBytes = AndroidNodeMaskByteCount(maxnode);
+  if (MaskBytes == 0) {
+    return -EINVAL;
+  }
+
+  FaultSafeUserMemAccess::VerifyIsReadable(nodemask, MaskBytes);
+
+  uint64_t GuestMask {};
+  const size_t CopyBytes = MaskBytes < sizeof(GuestMask) ? MaskBytes : sizeof(GuestMask);
+  std::memcpy(&GuestMask, nodemask, CopyBytes);
+
+  if (out_mask != nullptr) {
+    *out_mask = GuestMask;
+  }
+
+  return 0;
+}
+
+static uint64_t AndroidWriteNodeMask(unsigned long* nodemask, unsigned long maxnode, uint64_t mask) {
+  if (nodemask == nullptr) {
+    return maxnode == 0 ? 0 : -EINVAL;
+  }
+
+  const size_t MaskBytes = AndroidNodeMaskByteCount(maxnode);
+  if (MaskBytes == 0) {
+    return -EINVAL;
+  }
+
+  FaultSafeUserMemAccess::VerifyIsWritable(nodemask, MaskBytes);
+  std::memset(nodemask, 0, MaskBytes);
+
+  const size_t CopyBytes = MaskBytes < sizeof(mask) ? MaskBytes : sizeof(mask);
+  std::memcpy(nodemask, &mask, CopyBytes);
+  return 0;
+}
+} // namespace
+#endif
+
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
   REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
@@ -306,9 +373,62 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(timer_getoverrun, SyscallPassthrough1<SYSCALL_DEF(timer_getoverrun)>);
   REGISTER_SYSCALL_IMPL(timer_delete, SyscallPassthrough1<SYSCALL_DEF(timer_delete)>);
   REGISTER_SYSCALL_IMPL(tgkill, SyscallPassthrough3<SYSCALL_DEF(tgkill)>);
+#ifdef ANDROID_BUILD
+  // Android app seccomp filters deny NUMA policy syscalls. Emulate minimally to avoid SIGSYS.
+  REGISTER_SYSCALL_IMPL(mbind, []([[maybe_unused]] FEXCore::Core::CpuStateFrame* Frame, [[maybe_unused]] void* start, [[maybe_unused]] unsigned long len,
+                                  int mode, const unsigned long* nodemask, unsigned long maxnode, unsigned flags) -> uint64_t {
+    if (!AndroidMempolicyModeIsValid(mode) || (flags & ~MPOL_MF_VALID) != 0) {
+      return -EINVAL;
+    }
+
+    return AndroidReadNodeMask(nodemask, maxnode, nullptr);
+  });
+
+  REGISTER_SYSCALL_IMPL(set_mempolicy,
+                        []([[maybe_unused]] FEXCore::Core::CpuStateFrame* Frame, int mode, const unsigned long* nodemask,
+                           unsigned long maxnode) -> uint64_t {
+                          if (!AndroidMempolicyModeIsValid(mode)) {
+                            return -EINVAL;
+                          }
+
+                          uint64_t GuestNodemask {};
+                          const uint64_t Result = AndroidReadNodeMask(nodemask, maxnode, &GuestNodemask);
+                          if (Result != 0) {
+                            return Result;
+                          }
+
+                          AndroidGuestMempolicyMode = mode & ~MPOL_MODE_FLAGS;
+                          AndroidGuestMempolicyNodemask = GuestNodemask;
+                          return 0;
+                        });
+
+  REGISTER_SYSCALL_IMPL(get_mempolicy,
+                        []([[maybe_unused]] FEXCore::Core::CpuStateFrame* Frame, int* mode, unsigned long* nodemask, unsigned long maxnode,
+                           unsigned long addr, unsigned long flags) -> uint64_t {
+                          if (flags == MPOL_F_MEMS_ALLOWED) {
+                            if (mode != nullptr || addr != 0) {
+                              return -EINVAL;
+                            }
+
+                            return AndroidWriteNodeMask(nodemask, maxnode, 1);
+                          }
+
+                          if (flags != 0 || addr != 0) {
+                            return -EINVAL;
+                          }
+
+                          if (mode != nullptr) {
+                            FaultSafeUserMemAccess::VerifyIsWritable(mode, sizeof(*mode));
+                            *mode = AndroidGuestMempolicyMode;
+                          }
+
+                          return AndroidWriteNodeMask(nodemask, maxnode, AndroidGuestMempolicyNodemask);
+                        });
+#else
   REGISTER_SYSCALL_IMPL(mbind, SyscallPassthrough6<SYSCALL_DEF(mbind)>);
   REGISTER_SYSCALL_IMPL(set_mempolicy, SyscallPassthrough3<SYSCALL_DEF(set_mempolicy)>);
   REGISTER_SYSCALL_IMPL(get_mempolicy, SyscallPassthrough5<SYSCALL_DEF(get_mempolicy)>);
+#endif
   REGISTER_SYSCALL_IMPL(mq_unlink, SyscallPassthrough1<SYSCALL_DEF(mq_unlink)>);
   REGISTER_SYSCALL_IMPL(add_key, SyscallPassthrough5<SYSCALL_DEF(add_key)>);
   REGISTER_SYSCALL_IMPL(request_key, SyscallPassthrough4<SYSCALL_DEF(request_key)>);
@@ -469,8 +589,32 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(waitid, SyscallPassthrough5<SYSCALL_DEF(waitid)>);
     REGISTER_SYSCALL_IMPL_X64(pselect6, SyscallPassthrough6<SYSCALL_DEF(pselect6)>);
     REGISTER_SYSCALL_IMPL_X64(ppoll, SyscallPassthrough5<SYSCALL_DEF(ppoll)>);
+#ifdef ANDROID_BUILD
+    // Android app seccomp blocks host set/get_robust_list; keep robust_list pointer in thread-local state.
+    REGISTER_SYSCALL_IMPL_X64(set_robust_list, [](FEXCore::Core::CpuStateFrame* Frame, struct robust_list_head* head, size_t len) -> uint64_t {
+      if (len != sizeof(struct robust_list_head)) {
+        return -EINVAL;
+      }
+
+      auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+      ThreadObject->ThreadInfo.robust_list_head = reinterpret_cast<uint64_t>(head);
+      return 0;
+    });
+
+    REGISTER_SYSCALL_IMPL_X64(
+      get_robust_list, [](FEXCore::Core::CpuStateFrame* Frame, [[maybe_unused]] int pid, struct robust_list_head** head, size_t* len_ptr) -> uint64_t {
+        FaultSafeUserMemAccess::VerifyIsWritable(head, sizeof(*head));
+        FaultSafeUserMemAccess::VerifyIsWritable(len_ptr, sizeof(*len_ptr));
+
+        auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+        *head = reinterpret_cast<struct robust_list_head*>(ThreadObject->ThreadInfo.robust_list_head);
+        *len_ptr = sizeof(struct robust_list_head);
+        return 0;
+      });
+#else
     REGISTER_SYSCALL_IMPL_X64(set_robust_list, SyscallPassthrough2<SYSCALL_DEF(set_robust_list)>);
     REGISTER_SYSCALL_IMPL_X64(get_robust_list, SyscallPassthrough3<SYSCALL_DEF(get_robust_list)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(sync_file_range, SyscallPassthrough4<SYSCALL_DEF(sync_file_range)>);
     REGISTER_SYSCALL_IMPL_X64(vmsplice, SyscallPassthrough4<SYSCALL_DEF(vmsplice)>);
     REGISTER_SYSCALL_IMPL_X64(utimensat, SyscallPassthrough4<SYSCALL_DEF(utimensat)>);
