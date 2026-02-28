@@ -10,7 +10,9 @@
 #include "VDSO_Emulation.h"
 #include "Linux/Utils/ELFParser.h"
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Utils/MathUtils.h>
@@ -57,8 +59,9 @@ class ELFCodeLoader final : public FEX::CodeLoader {
   // Can't be used for ET_EXEC ELF files because they can have large virtual mapping holes.
   static size_t CalculateDYNELFSize(const fextl::vector<Elf64_Phdr>& headers) {
     bool had_pt_load = false;
-    size_t min_map_address = ~0ULL;
-    size_t max_map_address = 0;
+    using MapAddr = uint64_t;
+    MapAddr min_map_address = std::numeric_limits<MapAddr>::max();
+    MapAddr max_map_address = 0;
     for (const auto& it : headers) {
       if (it.p_type != PT_LOAD) {
         // Skip everything but PT_LOAD.
@@ -66,8 +69,11 @@ class ELFCodeLoader final : public FEX::CodeLoader {
       }
 
       had_pt_load = true;
-      min_map_address = std::min(min_map_address, PAGE_START(it.p_vaddr));
-      max_map_address = std::max(max_map_address, it.p_vaddr + it.p_memsz);
+      const MapAddr SegmentStart = static_cast<MapAddr>(PAGE_START(it.p_vaddr));
+      const MapAddr SegmentEnd = static_cast<MapAddr>(it.p_vaddr) + static_cast<MapAddr>(it.p_memsz);
+
+      min_map_address = std::min(min_map_address, SegmentStart);
+      max_map_address = std::max(max_map_address, SegmentEnd);
     }
 
     if (!had_pt_load) {
@@ -75,7 +81,7 @@ class ELFCodeLoader final : public FEX::CodeLoader {
       return 0;
     }
 
-    return FEXCore::AlignUp(max_map_address - min_map_address, FEXCore::Utils::FEX_PAGE_SIZE);
+    return static_cast<size_t>(FEXCore::AlignUp(max_map_address - min_map_address, FEXCore::Utils::FEX_PAGE_SIZE));
   }
 
   bool MapFile(const ELFParser& file, uintptr_t Base, const Elf64_Phdr& Header, int prot, int flags,
@@ -411,7 +417,13 @@ public:
 
     // Set the process personality here
     // Also, what about ADDR_LIMIT_3GB & co ?
-    uint32_t Personality = personality(~0ULL);
+    constexpr unsigned int PersonaQuery = ~0U;
+    int QueriedPersona = personality(PersonaQuery);
+    if (QueriedPersona == -1) {
+      LogMan::Msg::EFmt("Querying personality failed");
+      return false;
+    }
+    uint32_t Personality = static_cast<uint32_t>(QueriedPersona);
     Personality |= ExecuteAll ? READ_IMPLIES_EXEC : 0;
     if (-1 == personality(Personality)) {
       LogMan::Msg::EFmt("Setting personality failed");
