@@ -11,6 +11,7 @@
 #include "Linux/Utils/ELFParser.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -39,6 +40,18 @@
 #define PAGE_START(x) ((x) & ~(uintptr_t)(4095))
 #define PAGE_OFFSET(x) ((x) & 4095)
 #define PAGE_ALIGN(x) (((x) + 4095) & ~(uintptr_t)(4095))
+
+static inline void ELFLoaderStageTrace(const char* Message) {
+  std::fprintf(stderr, "[FEXELFLoader] %s\n", Message);
+  std::fflush(stderr);
+}
+
+template<typename... Args>
+static inline void ELFLoaderStageTraceFmt(fmt::format_string<Args...> Format, Args&&... args) {
+  const auto Message = fmt::format(Format, std::forward<Args>(args)...);
+  std::fprintf(stderr, "[FEXELFLoader] %s\n", Message.c_str());
+  std::fflush(stderr);
+}
 
 class ELFCodeLoader final : public FEX::CodeLoader {
   ELFParser MainElf {};
@@ -82,6 +95,36 @@ class ELFCodeLoader final : public FEX::CodeLoader {
     }
 
     return static_cast<size_t>(FEXCore::AlignUp(max_map_address - min_map_address, FEXCore::Utils::FEX_PAGE_SIZE));
+  }
+
+  static uintptr_t CalculateImageBase(const ELFParser& Elf, uintptr_t LoadBase) {
+    uintptr_t BaseAdjustment = std::numeric_limits<uintptr_t>::max();
+
+    for (const auto& Header : Elf.phdrs) {
+      if (Header.p_type != PT_LOAD) {
+        continue;
+      }
+
+      const auto SegmentBase = static_cast<uintptr_t>(PAGE_START(Header.p_vaddr));
+      const auto FileBase = static_cast<uintptr_t>(PAGE_START(Header.p_offset));
+      BaseAdjustment = std::min(BaseAdjustment, SegmentBase - FileBase);
+    }
+
+    if (BaseAdjustment == std::numeric_limits<uintptr_t>::max()) {
+      return LoadBase;
+    }
+
+    return LoadBase + BaseAdjustment;
+  }
+
+  static uintptr_t CalculateProgramHeaderAddress(const ELFParser& Elf, uintptr_t ImageBase) {
+    for (const auto& Header : Elf.phdrs) {
+      if (Header.p_type == PT_PHDR) {
+        return ImageBase + Header.p_vaddr;
+      }
+    }
+
+    return ImageBase + Elf.ehdr.e_phoff;
   }
 
   bool MapFile(const ELFParser& file, uintptr_t Base, const Elf64_Phdr& Header, int prot, int flags,
@@ -135,6 +178,7 @@ class ELFCodeLoader final : public FEX::CodeLoader {
 
   std::optional<uintptr_t> LoadElfFile(ELFParser& Elf, uintptr_t* BrkBase, FEX::HLE::SyscallMmapInterface* const Handler,
                                        FEXCore::Core::InternalThreadState* Thread, uint64_t LoadHint = 0) {
+    ELFLoaderStageTraceFmt("LoadElfFile: enter fd={} type={} hint=0x{:x}", Elf.fd, Elf.ehdr.e_type, LoadHint);
 
     uintptr_t LoadBase = 0;
     uintptr_t BrkLoadBase = 0;
@@ -144,11 +188,14 @@ class ELFCodeLoader final : public FEX::CodeLoader {
     if (DynELF) {
       // Allocate a base address plus BRK padding.
       auto TotalSize = CalculateDYNELFSize(Elf.phdrs) + (BrkBase ? BRK_SIZE : 0);
+      ELFLoaderStageTraceFmt("LoadElfFile: dyn reserve size=0x{:x} hint=0x{:x}", TotalSize, LoadHint);
       LoadBase =
         (uintptr_t)Handler->GuestMmap(Thread, reinterpret_cast<void*>(LoadHint), TotalSize, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
       if (FEX::HLE::HasSyscallError(LoadBase)) {
+        ELFLoaderStageTraceFmt("LoadElfFile: dyn reserve failed errno={}", errno);
         return {};
       }
+      ELFLoaderStageTraceFmt("LoadElfFile: dyn reserve base=0x{:x}", LoadBase);
 
       // fprintf(stderr, "elf %d: %lx-%lx\n", Elf.fd, LoadBase, LoadBase + TotalSize);
       if (BrkBase) {
@@ -163,10 +210,14 @@ class ELFCodeLoader final : public FEX::CodeLoader {
 
       int MapProt = MapFlags(Header);
       int MapType = MAP_PRIVATE | MAP_DENYWRITE | MAP_FIXED;
+      ELFLoaderStageTraceFmt("LoadElfFile: map PT_LOAD vaddr=0x{:x} offset=0x{:x} filesz=0x{:x} memsz=0x{:x} prot=0x{:x} base=0x{:x}",
+                             Header.p_vaddr, Header.p_offset, Header.p_filesz, Header.p_memsz, MapProt, LoadBase);
 
       if (!MapFile(Elf, LoadBase, Header, MapProt, MapType, Handler, Thread)) {
+        ELFLoaderStageTrace("LoadElfFile: map PT_LOAD failed");
         return {};
       }
+      ELFLoaderStageTrace("LoadElfFile: map PT_LOAD ok");
 
       if (Header.p_memsz > Header.p_filesz) {
         // clear bss
@@ -180,11 +231,14 @@ class ELFCodeLoader final : public FEX::CodeLoader {
         }
 
         if (BSSPageStart != BSSPageEnd) {
+          ELFLoaderStageTraceFmt("LoadElfFile: map BSS start=0x{:x} size=0x{:x} prot=0x{:x}", BSSPageStart, BSSPageEnd - BSSPageStart, MapProt);
           auto bss = Handler->GuestMmap(Thread, (void*)BSSPageStart, BSSPageEnd - BSSPageStart, MapProt, MapType | MAP_ANONYMOUS, -1, 0);
           if (FEX::HLE::HasSyscallError(bss)) {
             LogMan::Msg::EFmt("Failed to allocate BSS @ {}, {}\n", fmt::ptr(bss), errno);
+            ELFLoaderStageTraceFmt("LoadElfFile: map BSS failed errno={}", errno);
             return {};
           }
+          ELFLoaderStageTraceFmt("LoadElfFile: map BSS ok addr={}", fmt::ptr(bss));
         }
       }
 
@@ -201,11 +255,15 @@ class ELFCodeLoader final : public FEX::CodeLoader {
 
     if (NeedsLateBRKMap) {
       // Map the BRK after ELF if possible.
+      ELFLoaderStageTraceFmt("LoadElfFile: reserve late BRK hint=0x{:x} size=0x{:x}", BrkLoadBase, BRK_SIZE);
       BrkLoadBase =
         (uintptr_t)Handler->GuestMmap(Thread, reinterpret_cast<void*>(BrkLoadBase), BRK_SIZE, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
       if (FEX::HLE::HasSyscallError(BrkLoadBase)) {
         // This isn't a catastrophic failure. This just means the BRK conflicted with the ELF.
         BrkLoadBase = 0;
+        ELFLoaderStageTrace("LoadElfFile: reserve late BRK conflicted");
+      } else {
+        ELFLoaderStageTraceFmt("LoadElfFile: reserve late BRK ok base=0x{:x}", BrkLoadBase);
       }
     }
 
@@ -213,6 +271,7 @@ class ELFCodeLoader final : public FEX::CodeLoader {
       *BrkBase = BrkLoadBase;
     }
 
+    ELFLoaderStageTraceFmt("LoadElfFile: exit load_base=0x{:x} brk_base=0x{:x}", LoadBase, BrkLoadBase);
     return LoadBase;
   }
 
@@ -397,6 +456,7 @@ public:
   }
 
   bool MapMemory(FEX::HLE::SyscallMmapInterface* const Handler, FEXCore::Core::InternalThreadState* Thread) {
+    ELFLoaderStageTrace("MapMemory: enter");
     for (const auto& Header : MainElf.phdrs) {
       if (Header.p_type == PT_GNU_STACK) {
         HasStackHeader = true;
@@ -435,6 +495,7 @@ public:
       auto ThreadObject = static_cast<FEX::HLE::ThreadStateObject*>(Thread->FrontendPtr);
       ThreadObject->persona = Personality;
     }
+    ELFLoaderStageTraceFmt("MapMemory: personality=0x{:x} execute_all={}", Personality, ExecuteAll);
 
     // What about ASLR and such ?
     // ADDR_LIMIT_3GB STACK -> 0xc0000000 else -> 0xFFFFe000
@@ -485,20 +546,45 @@ public:
     auto PageSize = sysconf(_SC_PAGESIZE);
     PageSize = PageSize > 0 ? PageSize : FEXCore::Utils::FEX_PAGE_SIZE;
 
+    int StackReserveErrno {};
+    uint64_t StackReserveAttempts {};
     do {
       // Allocate the base of the full 128MB stack range.
       StackPointerBase = Handler->GuestMmap(Thread, reinterpret_cast<void*>(StackHint), FULL_STACK_SIZE, PROT_NONE,
                                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+      StackReserveErrno = errno;
+      ++StackReserveAttempts;
       // Scan-downward until we fit.
       StackHint -= PageSize;
+#ifdef BUILD_ANDROID
+      // Android doesn't need Wine-preloader-compatible stack placement.
+      // Fall back after a bounded probe count if the fixed layout never fits.
+      if (FEX::HLE::HasSyscallError(StackPointerBase) && StackReserveAttempts >= 256) {
+        break;
+      }
+#endif
     } while (FEX::HLE::HasSyscallError(StackPointerBase) && static_cast<int64_t>(StackHint) > 0);
 
+#ifdef BUILD_ANDROID
     if (FEX::HLE::HasSyscallError(StackPointerBase)) {
+      ELFLoaderStageTraceFmt("MapMemory: fixed stack reserve failed after {} attempts errno={}, falling back to kernel-chosen address",
+                             StackReserveAttempts, StackReserveErrno);
+      StackPointerBase = Handler->GuestMmap(Thread, nullptr, FULL_STACK_SIZE, PROT_NONE,
+                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE, -1, 0);
+      StackReserveErrno = errno;
+    }
+#endif
+
+    if (FEX::HLE::HasSyscallError(StackPointerBase)) {
+      ELFLoaderStageTraceFmt("MapMemory: reserve stack failed attempts={} errno={}", StackReserveAttempts, StackReserveErrno);
       LogMan::Msg::EFmt("Allocating stack failed");
       return false;
     }
+    ELFLoaderStageTraceFmt("MapMemory: reserve stack ok base={} attempts={}", fmt::ptr(StackPointerBase), StackReserveAttempts);
 
     // Allocate with permissions the 8MB of regular stack size.
+    ELFLoaderStageTraceFmt("MapMemory: commit stack addr=0x{:x} size=0x{:x}", reinterpret_cast<uint64_t>(StackPointerBase) + FULL_STACK_SIZE - StackSize(),
+                           StackSize());
     StackPointer = reinterpret_cast<uintptr_t>(Handler->GuestMmap(
       Thread, reinterpret_cast<void*>(reinterpret_cast<uint64_t>(StackPointerBase) + FULL_STACK_SIZE - StackSize()), StackSize(),
       PROT_READ | PROT_WRITE | (ExecutableStack ? PROT_EXEC : 0), MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_GROWSDOWN, -1, 0));
@@ -507,6 +593,7 @@ public:
       LogMan::Msg::EFmt("Allocating stack failed");
       return false;
     }
+    ELFLoaderStageTraceFmt("MapMemory: commit stack ok rsp_base=0x{:x}", StackPointer);
 
     // Load the interpreter ELF first.
     // This allows the top-down allocation of the kernel to put this at the top of the VA space.
@@ -547,14 +634,16 @@ public:
 
     if (!MainElf.InterpreterElf.empty()) {
       uint64_t InterpLoadBase = 0;
+      ELFLoaderStageTrace("MapMemory: before interpreter load");
       if (auto elf = LoadElfFile(InterpElf, nullptr, Handler, Thread)) {
         InterpLoadBase = *elf;
       } else {
         LogMan::Msg::EFmt("Failed to load interpreter elf file");
         return false;
       }
+      ELFLoaderStageTraceFmt("MapMemory: after interpreter load base=0x{:x}", InterpLoadBase);
 
-      InterpeterElfBase = InterpLoadBase + InterpElf.phdrs.front().p_vaddr - InterpElf.phdrs.front().p_offset;
+      InterpeterElfBase = CalculateImageBase(InterpElf, InterpLoadBase);
       Entrypoint = InterpLoadBase + InterpElf.ehdr.e_entry;
 
       // If the ELF has an interpreter and is dynamic then we should provide a address hint for loading.
@@ -608,28 +697,32 @@ public:
 
     uintptr_t LoadBase = 0;
 
+    ELFLoaderStageTraceFmt("MapMemory: before main ELF load hint=0x{:x}", ELFLoadHint);
     if (auto elf = LoadElfFile(MainElf, &BrkStart, Handler, Thread, ELFLoadHint)) {
       LoadBase = *elf;
       if (MainElf.ehdr.e_type == ET_DYN) {
-        BaseOffset = LoadBase;
+        BaseOffset = CalculateImageBase(MainElf, LoadBase);
       }
     } else {
       LogMan::Msg::EFmt("Failed to load elf file");
       return false;
     }
+    ELFLoaderStageTraceFmt("MapMemory: after main ELF load base=0x{:x} brk_start=0x{:x}", LoadBase, BrkStart);
 
     if (BrkStart) {
       // BRK usually comes directly after where the ELF is loaded.
       // If a value was returned then we have mapped the entire `BRK_SIZE` and need to change protections.
+      ELFLoaderStageTraceFmt("MapMemory: commit BRK base=0x{:x} size=0x{:x}", BrkStart, BRK_SIZE);
       BrkStart =
         (uint64_t)Handler->GuestMmap(Thread, (void*)BrkStart, BRK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
       if (FEX::HLE::HasSyscallError(BrkStart)) {
         LogMan::Msg::EFmt("Failed to allocate BRK @ {:x}, {}\n", BrkStart, errno);
         return false;
       }
+      ELFLoaderStageTraceFmt("MapMemory: commit BRK ok base=0x{:x}", BrkStart);
     }
 
-    MainElfBase = LoadBase + MainElf.phdrs.front().p_vaddr - MainElf.phdrs.front().p_offset;
+    MainElfBase = CalculateImageBase(MainElf, LoadBase);
     MainElfEntrypoint = LoadBase + MainElf.ehdr.e_entry;
 
     if (MainElf.InterpreterElf.empty()) {
@@ -683,14 +776,22 @@ public:
       AuxVariables.emplace_back(auxv_t {33, reinterpret_cast<uint64_t>(VDSOBase)}); // AT_SYSINFO_EHDR - Address of the start of VDSO
     }
 
-    AuxVariables.emplace_back(auxv_t {3, MainElfBase + MainElf.ehdr.e_phoff}); // Program header
+    const auto ProgramHeaderAddress = CalculateProgramHeaderAddress(MainElf, MainElfBase);
+    AuxVariables.emplace_back(auxv_t {3, ProgramHeaderAddress});               // AT_PHDR - Program header
     AuxVariables.emplace_back(auxv_t {7, InterpeterElfBase});                  // AT_BASE - Interpreter address
     AuxVariables.emplace_back(auxv_t {9, MainElfEntrypoint});                  // AT_ENTRY
 
+    ELFLoaderStageTraceFmt(
+      "MapMemory: auxv image_base=0x{:x} at_phdr=0x{:x} at_base=0x{:x} at_entry=0x{:x} phnum={}",
+      MainElfBase, ProgramHeaderAddress, InterpeterElfBase, MainElfEntrypoint, MainElf.phdrs.size());
+
     AuxVariables.emplace_back(auxv_t {0, 0}); // Null ender
 
+    ELFLoaderStageTrace("MapMemory: before SetupStack");
     SetupStack();
+    ELFLoaderStageTraceFmt("MapMemory: after SetupStack rsp=0x{:x} rip=0x{:x}", StackPointer, Entrypoint);
 
+    ELFLoaderStageTrace("MapMemory: exit");
     return true;
   }
 

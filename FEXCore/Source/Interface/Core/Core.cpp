@@ -78,6 +78,15 @@ $end_info$
 #include <xxhash.h>
 
 namespace FEXCore::Context {
+static void InitCoreStageTrace(const char* Msg) {
+  if (!Msg) {
+    return;
+  }
+
+  write(STDERR_FILENO, Msg, strlen(Msg));
+  write(STDERR_FILENO, "\n", 1);
+}
+
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
@@ -342,11 +351,19 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
 }
 
 bool ContextImpl::InitCore() {
+  InitCoreStageTrace("[FEXCore::Context] InitCore: enter");
   // Initialize the CPU core signal handlers & DispatcherConfig
+  InitCoreStageTrace("[FEXCore::Context] InitCore: before Dispatcher::Create");
   Dispatcher = FEXCore::CPU::Dispatcher::Create(this);
+  InitCoreStageTrace("[FEXCore::Context] InitCore: after Dispatcher::Create");
 
   // Set up the SignalDelegator config since core is initialized.
-  SignalDelegation->SetConfig(Dispatcher->MakeSignalDelegatorConfig());
+  InitCoreStageTrace("[FEXCore::Context] InitCore: before MakeSignalDelegatorConfig");
+  auto DispatcherConfig = Dispatcher->MakeSignalDelegatorConfig();
+  InitCoreStageTrace("[FEXCore::Context] InitCore: after MakeSignalDelegatorConfig");
+  InitCoreStageTrace("[FEXCore::Context] InitCore: before SignalDelegation->SetConfig");
+  SignalDelegation->SetConfig(DispatcherConfig);
+  InitCoreStageTrace("[FEXCore::Context] InitCore: after SignalDelegation->SetConfig");
 
 #if defined(_WIN32) && !defined(ARCHITECTURE_arm64ec)
   // WOW64 always needs the interrupt fault check to be enabled.
@@ -358,6 +375,7 @@ bool ContextImpl::InitCore() {
     Config.NeedsPendingInterruptFaultCheck = true;
   }
 
+  InitCoreStageTrace("[FEXCore::Context] InitCore: exit");
   return true;
 }
 

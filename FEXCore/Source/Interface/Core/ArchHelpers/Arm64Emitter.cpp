@@ -20,10 +20,20 @@
 #endif
 
 #include <array>
+#include <cstring>
 #include <tuple>
+#include <unistd.h>
 #include <utility>
 
 namespace FEXCore::CPU {
+static void Arm64EmitterStageTrace(const char* Msg) {
+  if (!Msg) {
+    return;
+  }
+
+  write(STDERR_FILENO, Msg, strlen(Msg));
+  write(STDERR_FILENO, "\n", 1);
+}
 
 // LLVM's preserve_all doc, this is used throughout this file and reproduced
 // here for reference:
@@ -584,8 +594,16 @@ void Arm64Emitter::PushCalleeSavedRegisters() {
     {ARMEmitter::XReg::x29, ARMEmitter::XReg::x30},
   }};
 
+  size_t PairIndex = 0;
   for (auto& RegPair : CalleeSaved) {
+    if (PairIndex == 0) {
+      Arm64EmitterStageTrace("[FEXCore::Arm64Emitter] PushCalleeSavedRegisters: before first stp");
+    }
     stp<ARMEmitter::IndexType::PRE>(RegPair.first, RegPair.second, ARMEmitter::Reg::rsp, -16);
+    if (PairIndex == 0) {
+      Arm64EmitterStageTrace("[FEXCore::Arm64Emitter] PushCalleeSavedRegisters: after first stp");
+    }
+    ++PairIndex;
   }
 
   // Additionally we need to store the lower 64bits of v8-v15
@@ -597,10 +615,12 @@ void Arm64Emitter::PushCalleeSavedRegisters() {
   }};
 
   uint32_t VectorSaveSize = sizeof(uint64_t) * 8;
+  Arm64EmitterStageTrace("[FEXCore::Arm64Emitter] PushCalleeSavedRegisters: before vector save prologue");
   sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, VectorSaveSize);
   // SP supporting move
   // We just saved x19 so it is safe
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r19, ARMEmitter::Reg::rsp, 0);
+  Arm64EmitterStageTrace("[FEXCore::Arm64Emitter] PushCalleeSavedRegisters: after vector save prologue");
 
   for (auto& RegQuad : FPRs) {
     st4(ARMEmitter::SubRegSize::i64Bit, std::get<0>(RegQuad), std::get<1>(RegQuad), std::get<2>(RegQuad), std::get<3>(RegQuad), 0,

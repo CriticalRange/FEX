@@ -27,8 +27,19 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <cstdio>
+#include <new>
+#include <unistd.h>
 
 namespace FEXCore::CPU {
+static void DispatcherStageTrace(const char* Msg) {
+  if (!Msg) {
+    return;
+  }
+
+  write(STDERR_FILENO, Msg, strlen(Msg));
+  write(STDERR_FILENO, "\n", 1);
+}
 
 static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuStateFrame* Frame) {
   CTX->SyscallHandler->SleepThread(CTX, Frame);
@@ -39,9 +50,26 @@ constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
 Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
   : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
   , CTX {ctx} {
+  char Line[160];
+  const int Len = snprintf(Line, sizeof(Line),
+    "[FEXCore::Dispatcher] ctor: buffer=%p size=%zu",
+    reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
+  if (Len > 0) {
+    const size_t WriteLen = static_cast<size_t>(Len) < sizeof(Line) ? static_cast<size_t>(Len) : sizeof(Line) - 1;
+    write(STDERR_FILENO, Line, WriteLen);
+    write(STDERR_FILENO, "\n", 1);
+  }
+  DispatcherStageTrace("[FEXCore::Dispatcher] ctor: before buffer write probe");
+  auto* BufferBase = reinterpret_cast<uint8_t*>(GetBufferBase());
+  const uint8_t OriginalByte = BufferBase[0];
+  BufferBase[0] = OriginalByte;
+  DispatcherStageTrace("[FEXCore::Dispatcher] ctor: after buffer write probe");
+  DispatcherStageTrace("[FEXCore::Dispatcher] ctor: before EmitDispatcher");
   EmitDispatcher();
+  DispatcherStageTrace("[FEXCore::Dispatcher] ctor: after EmitDispatcher");
 
   FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
+  DispatcherStageTrace("[FEXCore::Dispatcher] ctor: after VirtualName");
 }
 
 Dispatcher::~Dispatcher() {
@@ -52,6 +80,26 @@ Dispatcher::~Dispatcher() {
 }
 
 void Dispatcher::EmitDispatcher() {
+  DispatcherStageTrace("[FEXCore::Dispatcher] EmitDispatcher: enter");
+  {
+    char Line[192];
+    const int Len = snprintf(Line, sizeof(Line),
+      "[FEXCore::Dispatcher] EmitDispatcher: cursor=%p buffer=%p offset=%zu",
+      GetCursorAddress<void*>(), reinterpret_cast<void*>(GetBufferBase()), GetCursorOffset());
+    if (Len > 0) {
+      const size_t WriteLen = static_cast<size_t>(Len) < sizeof(Line) ? static_cast<size_t>(Len) : sizeof(Line) - 1;
+      write(STDERR_FILENO, Line, WriteLen);
+      write(STDERR_FILENO, "\n", 1);
+    }
+  }
+  DispatcherStageTrace("[FEXCore::Dispatcher] EmitDispatcher: before manual nop probe");
+  auto* Cursor = GetCursorAddress<uint8_t*>();
+  Cursor[0] = 0x1F;
+  Cursor[1] = 0x20;
+  Cursor[2] = 0x03;
+  Cursor[3] = 0xD5;
+  CursorIncrement(4);
+  DispatcherStageTrace("[FEXCore::Dispatcher] EmitDispatcher: after manual nop probe");
   // Don't modify TMP3 since it contains our RIP once the block doesn't exist
   auto RipReg = TMP3;
 #ifdef VIXL_DISASSEMBLER
@@ -74,7 +122,9 @@ void Dispatcher::EmitDispatcher() {
   ARMEmitter::ForwardLabel l_CompileSingleStep;
 
   // Push all the register we need to save
+  DispatcherStageTrace("[FEXCore::Dispatcher] EmitDispatcher: before PushCalleeSavedRegisters");
   PushCalleeSavedRegisters();
+  DispatcherStageTrace("[FEXCore::Dispatcher] EmitDispatcher: after PushCalleeSavedRegisters");
 
   // Push our memory base to the correct register
   // Move our thread pointer to the correct register
@@ -1343,7 +1393,28 @@ SignalDelegatorConfig Dispatcher::MakeSignalDelegatorConfig() const {
 }
 
 fextl::unique_ptr<Dispatcher> Dispatcher::Create(FEXCore::Context::ContextImpl* CTX) {
-  return fextl::make_unique<Dispatcher>(CTX);
+  DispatcherStageTrace("[FEXCore::Dispatcher] Create: enter");
+  DispatcherStageTrace("[FEXCore::Dispatcher] Create: before alloc");
+  void* Storage = FEXCore::Allocator::aligned_alloc(alignof(Dispatcher), sizeof(Dispatcher));
+  if (!Storage) {
+    DispatcherStageTrace("[FEXCore::Dispatcher] Create: alloc failed");
+    return {};
+  }
+
+  char Line[160];
+  const int Len = snprintf(Line, sizeof(Line),
+    "[FEXCore::Dispatcher] Create: after alloc storage=%p size=%zu align=%zu",
+    Storage, sizeof(Dispatcher), alignof(Dispatcher));
+  if (Len > 0) {
+    const size_t WriteLen = static_cast<size_t>(Len) < sizeof(Line) ? static_cast<size_t>(Len) : sizeof(Line) - 1;
+    write(STDERR_FILENO, Line, WriteLen);
+    write(STDERR_FILENO, "\n", 1);
+  }
+
+  DispatcherStageTrace("[FEXCore::Dispatcher] Create: before placement new");
+  auto* Result = ::new (Storage) Dispatcher(CTX);
+  DispatcherStageTrace("[FEXCore::Dispatcher] Create: after placement new");
+  return fextl::unique_ptr<Dispatcher>(Result);
 }
 
 } // namespace FEXCore::CPU

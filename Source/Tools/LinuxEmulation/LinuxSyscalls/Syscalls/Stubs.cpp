@@ -30,7 +30,10 @@ void RegisterStubs(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(restart_syscall, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { SYSCALL_STUB(restart_syscall); });
 
   REGISTER_SYSCALL_IMPL(rseq, [](FEXCore::Core::CpuStateFrame* Frame, struct rseq* rseq, uint32_t rseq_len, int flags, uint32_t sig) -> uint64_t {
-    // We don't support this
+    static std::atomic<bool> loggedUnsupported {false};
+    if (!loggedUnsupported.exchange(true, std::memory_order_acq_rel)) {
+      LogMan::Msg::IFmt("rseq: returning -ENOSYS in guest path; Android app seccomp blocks host rseq forwarding");
+    }
     return -ENOSYS;
   });
 }

@@ -8,7 +8,16 @@ $end_info$
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <cstdint>
+#include <mutex>
+#include <sstream>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
@@ -19,6 +28,11 @@ $end_info$
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES3/gl3ext.h>
+#ifdef HYMOBILE_ENABLE_RUNTIME_SHADER_TRANSLATOR
+#include <shaderc/shaderc.hpp>
+#include <spirv_glsl.hpp>
+#include <sys/stat.h>
+#endif
 #else
 #include <GL/glx.h>
 #include <GL/glxext.h>
@@ -99,6 +113,539 @@ static X11Manager x11_manager;
 #endif
 
 static void* (*GuestMalloc)(guest_size_t) = nullptr;
+namespace {
+constexpr uint64_t kThunkGLXGetProcAddress = 0x4C4942474C0001ULL;
+constexpr uint64_t kThunkGLXCreateContext = 0x4C4942474C0002ULL;
+constexpr uint64_t kThunkGLGuestMalloc = 0x4C4942474C0003ULL;
+
+#if defined(BUILD_ANDROID) && defined(HYMOBILE_ENABLE_RUNTIME_SHADER_TRANSLATOR)
+std::mutex ShaderSourceCacheMutex;
+std::unordered_map<size_t, std::string> ShaderSourceCache;
+std::atomic<uint32_t> ShaderTranspileLogBudget {256};
+std::once_flag ShaderDumpDirInitOnce;
+bool ShaderDumpDirsReady {false};
+
+constexpr const char* ShaderDumpRootDir = "/sdcard/HyMobile.Android/shaders";
+constexpr const char* ShaderDumpOriginalDir = "/sdcard/HyMobile.Android/shaders/original";
+constexpr const char* ShaderDumpTranslatedDir = "/sdcard/HyMobile.Android/shaders/translated";
+
+bool ConsumeShaderTranspileLogBudget() {
+  uint32_t remaining = ShaderTranspileLogBudget.load(std::memory_order_acquire);
+  while (remaining > 0 &&
+         !ShaderTranspileLogBudget.compare_exchange_weak(
+             remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  return remaining > 0;
+}
+
+void LogShaderTranspileEvent(const char* event, GLenum shader_type, const char* detail = nullptr) {
+  if (!ConsumeShaderTranspileLogBudget()) {
+    return;
+  }
+
+  std::fprintf(stderr, "[libGL-host] shader-transpile %s type=0x%x%s%s\n",
+               event ? event : "unknown",
+               static_cast<unsigned>(shader_type),
+               detail ? " detail=" : "",
+               detail ? detail : "");
+}
+
+shaderc_shader_kind ShaderKindFromGLType(GLenum shader_type) {
+  switch (shader_type) {
+    case GL_VERTEX_SHADER:
+      return shaderc_vertex_shader;
+    case GL_FRAGMENT_SHADER:
+      return shaderc_fragment_shader;
+    case GL_GEOMETRY_SHADER:
+      return shaderc_geometry_shader;
+    case GL_TESS_CONTROL_SHADER:
+      return shaderc_tess_control_shader;
+    case GL_TESS_EVALUATION_SHADER:
+      return shaderc_tess_evaluation_shader;
+    case GL_COMPUTE_SHADER:
+      return shaderc_compute_shader;
+    default:
+      return shaderc_glsl_infer_from_source;
+  }
+}
+
+const char* ShaderTypeTag(GLenum shader_type) {
+  switch (shader_type) {
+    case GL_VERTEX_SHADER:
+      return "vert";
+    case GL_FRAGMENT_SHADER:
+      return "frag";
+    case GL_GEOMETRY_SHADER:
+      return "geom";
+    case GL_TESS_CONTROL_SHADER:
+      return "tesc";
+    case GL_TESS_EVALUATION_SHADER:
+      return "tese";
+    case GL_COMPUTE_SHADER:
+      return "comp";
+    default:
+      return "unknown";
+  }
+}
+
+bool EnsureDirectoryExists(const char* path) {
+  if (!path || !*path) {
+    return false;
+  }
+
+  if (::mkdir(path, 0775) == 0) {
+    return true;
+  }
+
+  return errno == EEXIST;
+}
+
+bool EnsureShaderDumpDirectories() {
+  std::call_once(ShaderDumpDirInitOnce, []() {
+    ShaderDumpDirsReady =
+        EnsureDirectoryExists(ShaderDumpRootDir) &&
+        EnsureDirectoryExists(ShaderDumpOriginalDir) &&
+        EnsureDirectoryExists(ShaderDumpTranslatedDir);
+  });
+
+  return ShaderDumpDirsReady;
+}
+
+void DumpShaderDebugText(bool original_dir, GLenum shader_type, size_t cache_key, const char* suffix, std::string_view text) {
+  if (!suffix || !*suffix || text.empty()) {
+    return;
+  }
+
+  if (!EnsureShaderDumpDirectories()) {
+    return;
+  }
+
+  const char* dir = original_dir ? ShaderDumpOriginalDir : ShaderDumpTranslatedDir;
+  const char* tag = ShaderTypeTag(shader_type);
+
+  char path[512] {};
+  std::snprintf(path, sizeof(path), "%s/%016zx_%s_%s", dir, cache_key, tag, suffix);
+
+  if (FILE* f = std::fopen(path, "wb")) {
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+  }
+}
+
+std::string FlattenShaderSource(GLsizei count, const GLchar* const* strings, const GLint* lengths) {
+  if (!strings || count <= 0) {
+    return {};
+  }
+
+  size_t total_size = 0;
+  for (GLsizei i = 0; i < count; ++i) {
+    const char* chunk = reinterpret_cast<const char*>(strings[i]);
+    if (!chunk) {
+      continue;
+    }
+
+    if (lengths && lengths[i] >= 0) {
+      total_size += static_cast<size_t>(lengths[i]);
+    } else {
+      total_size += std::strlen(chunk);
+    }
+  }
+
+  std::string result;
+  result.reserve(total_size);
+  for (GLsizei i = 0; i < count; ++i) {
+    const char* chunk = reinterpret_cast<const char*>(strings[i]);
+    if (!chunk) {
+      continue;
+    }
+
+    if (lengths && lengths[i] >= 0) {
+      result.append(chunk, static_cast<size_t>(lengths[i]));
+    } else {
+      result.append(chunk);
+    }
+  }
+  return result;
+}
+
+bool IsAlreadyESSL(std::string_view source) {
+  const auto version_pos = source.find("#version");
+  if (version_pos == std::string_view::npos) {
+    return false;
+  }
+
+  const auto line_end = source.find('\n', version_pos);
+  const auto version_line = source.substr(version_pos, line_end == std::string_view::npos ? source.size() - version_pos
+                                                                                           : line_end - version_pos);
+  return version_line.find(" es") != std::string_view::npos;
+}
+
+bool ParseGLSLVersionNumber(std::string_view version_line, int* out_version) {
+  if (!out_version) {
+    return false;
+  }
+
+  const auto version_pos = version_line.find("#version");
+  if (version_pos == std::string_view::npos) {
+    return false;
+  }
+
+  size_t cursor = version_pos + std::string_view {"#version"}.size();
+  while (cursor < version_line.size() && std::isspace(static_cast<unsigned char>(version_line[cursor]))) {
+    ++cursor;
+  }
+
+  size_t digits_begin = cursor;
+  while (cursor < version_line.size() && std::isdigit(static_cast<unsigned char>(version_line[cursor]))) {
+    ++cursor;
+  }
+
+  if (digits_begin == cursor) {
+    return false;
+  }
+
+  int version = 0;
+  for (size_t i = digits_begin; i < cursor; ++i) {
+    version = (version * 10) + (version_line[i] - '0');
+  }
+
+  *out_version = version;
+  return true;
+}
+
+std::string NormalizeVersionToES(std::string_view source) {
+  if (source.empty()) {
+    return {};
+  }
+
+  constexpr std::string_view target_version {"#version 320 es"};
+
+  const auto version_pos = source.find("#version");
+  if (version_pos == std::string_view::npos) {
+    std::string normalized;
+    normalized.reserve(target_version.size() + 1 + source.size());
+    normalized.append(target_version);
+    normalized.push_back('\n');
+    normalized.append(source);
+    return normalized;
+  }
+
+  const auto line_end = source.find('\n', version_pos);
+  const auto current_version_line =
+      source.substr(version_pos, line_end == std::string_view::npos ? source.size() - version_pos : line_end - version_pos);
+
+  int version_number = 0;
+  if (!ParseGLSLVersionNumber(current_version_line, &version_number) || version_number <= 320) {
+    return std::string {source};
+  }
+
+  std::string normalized;
+  normalized.reserve(source.size() + 16);
+  normalized.append(source.substr(0, version_pos));
+  normalized.append(target_version);
+  if (line_end != std::string_view::npos) {
+    normalized.append(source.substr(line_end));
+  } else {
+    normalized.push_back('\n');
+  }
+
+  return normalized;
+}
+
+std::string TrimASCII(std::string_view text) {
+  size_t begin = 0;
+  size_t end = text.size();
+  while (begin < end && std::isspace(static_cast<unsigned char>(text[begin]))) {
+    ++begin;
+  }
+  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+    --end;
+  }
+  return std::string {text.substr(begin, end - begin)};
+}
+
+std::string LTrimASCII(std::string_view text) {
+  size_t begin = 0;
+  while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin]))) {
+    ++begin;
+  }
+  return std::string {text.substr(begin)};
+}
+
+bool StartsWithASCII(std::string_view text, std::string_view prefix) {
+  return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+bool IsWordBoundary(char c) {
+  const unsigned char uc = static_cast<unsigned char>(c);
+  return !(std::isalnum(uc) || c == '_');
+}
+
+bool ContainsWordASCII(std::string_view text, std::string_view word) {
+  if (word.empty() || text.size() < word.size()) {
+    return false;
+  }
+
+  size_t pos = text.find(word);
+  while (pos != std::string_view::npos) {
+    const bool left_ok = pos == 0 || IsWordBoundary(text[pos - 1]);
+    const size_t right_index = pos + word.size();
+    const bool right_ok = right_index >= text.size() || IsWordBoundary(text[right_index]);
+    if (left_ok && right_ok) {
+      return true;
+    }
+    pos = text.find(word, pos + 1);
+  }
+
+  return false;
+}
+
+std::string StripLocationQualifierFromLayoutLine(std::string_view line) {
+  const auto layout_pos = line.find("layout(");
+  if (layout_pos == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto layout_close = line.find(')', layout_pos + 7);
+  if (layout_close == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto layout_inner = line.substr(layout_pos + 7, layout_close - (layout_pos + 7));
+  std::vector<std::string> kept_qualifiers;
+  size_t cursor = 0;
+  while (cursor < layout_inner.size()) {
+    const auto comma = layout_inner.find(',', cursor);
+    const auto token = layout_inner.substr(cursor, comma == std::string_view::npos ? layout_inner.size() - cursor : comma - cursor);
+    const std::string trimmed = TrimASCII(token);
+    if (!trimmed.empty() && !StartsWithASCII(trimmed, "location")) {
+      kept_qualifiers.emplace_back(trimmed);
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    cursor = comma + 1;
+  }
+
+  std::string rewritten;
+  rewritten.reserve(line.size());
+  rewritten.append(line.substr(0, layout_pos));
+  if (!kept_qualifiers.empty()) {
+    rewritten.append("layout(");
+    for (size_t i = 0; i < kept_qualifiers.size(); ++i) {
+      if (i != 0) {
+        rewritten.append(", ");
+      }
+      rewritten.append(kept_qualifiers[i]);
+    }
+    rewritten.push_back(')');
+    rewritten.append(line.substr(layout_close + 1));
+  } else {
+    rewritten.append(LTrimASCII(line.substr(layout_close + 1)));
+  }
+
+  return rewritten;
+}
+
+std::string StripUniformLocationQualifier(std::string_view line) {
+  const auto uniform_pos = line.find("uniform");
+  if (uniform_pos == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto semicolon_pos = line.find(';', uniform_pos);
+  if (semicolon_pos == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto layout_pos = line.find("layout(");
+  if (layout_pos == std::string_view::npos || layout_pos > uniform_pos) {
+    return std::string {line};
+  }
+
+  const auto layout_close = line.find(')', layout_pos + 7);
+  if (layout_close == std::string_view::npos || layout_close > uniform_pos) {
+    return std::string {line};
+  }
+
+  return StripLocationQualifierFromLayoutLine(line);
+}
+
+std::string StripUniformBindingQualifier(std::string_view line) {
+  const auto uniform_pos = line.find("uniform");
+  if (uniform_pos == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto semicolon_pos = line.find(';', uniform_pos);
+  if (semicolon_pos == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto layout_pos = line.find("layout(");
+  if (layout_pos == std::string_view::npos || layout_pos > uniform_pos) {
+    return std::string {line};
+  }
+
+  const auto layout_close = line.find(')', layout_pos + 7);
+  if (layout_close == std::string_view::npos || layout_close > uniform_pos) {
+    return std::string {line};
+  }
+
+  const auto layout_inner = line.substr(layout_pos + 7, layout_close - (layout_pos + 7));
+  if (layout_inner.find("binding") == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  std::string rewritten;
+  rewritten.reserve(line.size());
+  rewritten.append(line.substr(0, layout_pos));
+  rewritten.append(LTrimASCII(line.substr(layout_close + 1)));
+  return rewritten;
+}
+
+std::string StripUniformInitializer(std::string_view line) {
+  const auto uniform_pos = line.find("uniform");
+  if (uniform_pos == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto semicolon_pos = line.find(';', uniform_pos);
+  if (semicolon_pos == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const auto equals_pos = line.find('=', uniform_pos);
+  if (equals_pos == std::string_view::npos || equals_pos > semicolon_pos) {
+    return std::string {line};
+  }
+
+  std::string rewritten;
+  rewritten.reserve(line.size());
+  rewritten.append(line.substr(0, equals_pos));
+  rewritten.push_back(';');
+  if (semicolon_pos + 1 < line.size()) {
+    rewritten.append(line.substr(semicolon_pos + 1));
+  }
+  return rewritten;
+}
+
+std::string StripInterfaceLocationQualifier(std::string_view line, GLenum shader_type) {
+  if (line.find("layout(") == std::string_view::npos || line.find(';') == std::string_view::npos) {
+    return std::string {line};
+  }
+
+  if (line.find("uniform") != std::string_view::npos) {
+    return std::string {line};
+  }
+
+  const bool has_in = ContainsWordASCII(line, "in");
+  const bool has_out = ContainsWordASCII(line, "out");
+  if (!has_in && !has_out) {
+    return std::string {line};
+  }
+
+  // Keep fragment color attachment mappings. Strip only stage interface varying locations.
+  if (shader_type == GL_FRAGMENT_SHADER && has_out && !has_in) {
+    return std::string {line};
+  }
+
+  return StripLocationQualifierFromLayoutLine(line);
+}
+
+std::string SanitizeTranslatedESSL(std::string_view source, GLenum shader_type) {
+  std::string output;
+  output.reserve(source.size());
+
+  size_t cursor = 0;
+  while (cursor < source.size()) {
+    const auto line_end = source.find('\n', cursor);
+    const bool has_newline = line_end != std::string_view::npos;
+    const auto line = source.substr(cursor, has_newline ? line_end - cursor : source.size() - cursor);
+
+    std::string rewritten = StripUniformLocationQualifier(line);
+    rewritten = StripUniformBindingQualifier(rewritten);
+    rewritten = StripUniformInitializer(rewritten);
+    rewritten = StripInterfaceLocationQualifier(rewritten, shader_type);
+    output.append(rewritten);
+
+    if (has_newline) {
+      output.push_back('\n');
+      cursor = line_end + 1;
+    } else {
+      cursor = source.size();
+    }
+  }
+
+  return output;
+}
+
+size_t MakeShaderCacheKey(GLenum shader_type, std::string_view source) {
+  const size_t source_hash = std::hash<std::string_view> {}(source);
+  return source_hash ^ (static_cast<size_t>(shader_type) * 0x9e3779b97f4a7c15ULL);
+}
+
+bool TranspileDesktopGLSLToESSL(GLenum shader_type, std::string_view source, std::string* out_source, std::string* out_error = nullptr) {
+  if (!out_source) {
+    return false;
+  }
+
+  shaderc::Compiler compiler;
+  shaderc::CompileOptions options;
+  options.SetSourceLanguage(shaderc_source_language_glsl);
+  options.SetTargetEnvironment(shaderc_target_env_opengl, shaderc_env_version_opengl_4_5);
+  options.SetTargetSpirv(shaderc_spirv_version_1_0);
+  // Desktop GLSL usually omits explicit interface/resource layouts; SPIR-V generation
+  // requires them, so map locations/bindings deterministically during compilation.
+  options.SetAutoMapLocations(true);
+  options.SetAutoBindUniforms(true);
+
+  const auto kind = ShaderKindFromGLType(shader_type);
+  const auto compilation =
+      compiler.CompileGlslToSpv(std::string {source}, kind, "hymobile_guest_shader.glsl", options);
+  if (compilation.GetCompilationStatus() != shaderc_compilation_status_success) {
+    const auto error_msg = compilation.GetErrorMessage();
+    if (out_error) {
+      *out_error = error_msg;
+    }
+    LogShaderTranspileEvent("compile-failed", shader_type, error_msg.empty() ? "unknown shaderc failure" : error_msg.c_str());
+    return false;
+  }
+
+  try {
+    std::vector<uint32_t> spirv(compilation.cbegin(), compilation.cend());
+    spirv_cross::CompilerGLSL cross_compiler(std::move(spirv));
+
+    auto glsl_options = cross_compiler.get_common_options();
+    glsl_options.es = true;
+    glsl_options.version = 320;
+    glsl_options.vulkan_semantics = false;
+    glsl_options.separate_shader_objects = false;
+    cross_compiler.set_common_options(glsl_options);
+
+    *out_source = SanitizeTranslatedESSL(cross_compiler.compile(), shader_type);
+  } catch (const std::exception& ex) {
+    if (out_error) {
+      *out_error = ex.what();
+    }
+    LogShaderTranspileEvent("cross-failed", shader_type, ex.what());
+    return false;
+  } catch (...) {
+    if (out_error) {
+      *out_error = "unknown spirv-cross exception";
+    }
+    LogShaderTranspileEvent("cross-failed", shader_type, "unknown spirv-cross exception");
+    return false;
+  }
+
+  if (shader_type == GL_FRAGMENT_SHADER && out_source->find("precision ") == std::string::npos) {
+    out_source->insert(0, "precision highp float;\nprecision highp int;\n");
+  }
+
+  return true;
+}
+#endif
+}
 
 #ifndef BUILD_ANDROID
 host_layout<_XDisplay*>::host_layout(guest_layout<_XDisplay*>& guest)
@@ -157,23 +704,134 @@ static void fexfn_impl_libGL_GL_SetGuestXDisplayString(uintptr_t GuestTarget, ui
 #include "thunkgen_host_libGL.inl"
 
 static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length) {
-  ::glShaderSource(shader, count, reinterpret_cast<const GLchar* const*>(strings), length);
+  const auto host_strings = reinterpret_cast<const GLchar* const*>(strings);
+#if defined(BUILD_ANDROID) && defined(HYMOBILE_ENABLE_RUNTIME_SHADER_TRANSLATOR)
+  if (host_strings && count > 0) {
+    GLint shader_type = 0;
+    ::glGetShaderiv(shader, GL_SHADER_TYPE, &shader_type);
+
+    const std::string source = FlattenShaderSource(count, host_strings, length);
+    if (!source.empty() && !IsAlreadyESSL(source)) {
+      const auto cache_key = MakeShaderCacheKey(static_cast<GLenum>(shader_type), source);
+      DumpShaderDebugText(true, static_cast<GLenum>(shader_type), cache_key, "original.glsl", source);
+      DumpShaderDebugText(false, static_cast<GLenum>(shader_type), cache_key, "attempt_source.glsl", source);
+
+      std::string translated_source;
+      bool cache_hit = false;
+      {
+        std::lock_guard lk(ShaderSourceCacheMutex);
+        const auto it = ShaderSourceCache.find(cache_key);
+        if (it != ShaderSourceCache.end()) {
+          translated_source = it->second;
+          cache_hit = true;
+        }
+      }
+      {
+        char detail[128] {};
+        std::snprintf(detail, sizeof(detail), "key=%zx source_len=%zu", cache_key, source.size());
+        LogShaderTranspileEvent(cache_hit ? "cache-hit" : "cache-miss", static_cast<GLenum>(shader_type), detail);
+      }
+
+      if (translated_source.empty() &&
+          [&] {
+            std::string transpile_error;
+            const bool transpile_ok = TranspileDesktopGLSLToESSL(static_cast<GLenum>(shader_type), source, &translated_source, &transpile_error);
+            if (!transpile_ok && !transpile_error.empty()) {
+              DumpShaderDebugText(false, static_cast<GLenum>(shader_type), cache_key, "transpile_error.txt", transpile_error);
+            } else if (!transpile_ok) {
+              char detail[128] {};
+              std::snprintf(detail, sizeof(detail), "key=%zx empty-error-message", cache_key);
+              LogShaderTranspileEvent("compile-failed", static_cast<GLenum>(shader_type), detail);
+            }
+            return transpile_ok;
+          }()) {
+        {
+          std::lock_guard lk(ShaderSourceCacheMutex);
+          ShaderSourceCache[cache_key] = translated_source;
+        }
+        char detail[128] {};
+        std::snprintf(detail, sizeof(detail), "key=%zx translated_len=%zu", cache_key, translated_source.size());
+        LogShaderTranspileEvent("compile-ok", static_cast<GLenum>(shader_type), detail);
+      }
+
+      if (!translated_source.empty()) {
+        translated_source = NormalizeVersionToES(translated_source);
+        DumpShaderDebugText(false, static_cast<GLenum>(shader_type), cache_key, "translated.glsl", translated_source);
+        {
+          char detail[128] {};
+          std::snprintf(detail, sizeof(detail), "key=%zx translated_len=%zu", cache_key, translated_source.size());
+          LogShaderTranspileEvent("emit-translated", static_cast<GLenum>(shader_type), detail);
+        }
+        const GLchar* translated_ptr = translated_source.c_str();
+        ::glShaderSource(shader, 1, &translated_ptr, nullptr);
+        return;
+      }
+
+      const std::string fallback_source = NormalizeVersionToES(source);
+      if (!fallback_source.empty() && fallback_source != source) {
+        DumpShaderDebugText(false, static_cast<GLenum>(shader_type), cache_key, "fallback_320es.glsl", fallback_source);
+        {
+          char detail[128] {};
+          std::snprintf(detail, sizeof(detail), "key=%zx fallback_len=%zu", cache_key, fallback_source.size());
+          LogShaderTranspileEvent("emit-fallback-320es", static_cast<GLenum>(shader_type), detail);
+        }
+        const GLchar* fallback_ptr = fallback_source.c_str();
+        ::glShaderSource(shader, 1, &fallback_ptr, nullptr);
+        return;
+      }
+
+      {
+        char detail[160] {};
+        std::snprintf(detail, sizeof(detail), "key=%zx passthrough translated_empty=1 fallback_changed=%d",
+                      cache_key, fallback_source != source ? 1 : 0);
+        LogShaderTranspileEvent("passthrough-original", static_cast<GLenum>(shader_type), detail);
+      }
+    } else if (source.empty()) {
+      LogShaderTranspileEvent("skip-empty-source", static_cast<GLenum>(shader_type));
+    } else {
+      LogShaderTranspileEvent("skip-essl-source", static_cast<GLenum>(shader_type));
+    }
+  }
+#endif
+  ::glShaderSource(shader, count, host_strings, length);
 }
+
+#ifdef BUILD_ANDROID
+extern "C" __attribute__((visibility("default")))
+void FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length) {
+  fexfn_impl_libGL_FEX_glShaderSource(shader, count, strings, length);
+}
+#endif
 
 auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr {
   using VoidFn = __GLXextFuncPtr;
+  if (!name) {
+    HyMobileAbortThunkNullTarget("glXGetProcAddress", "procname is null", kThunkGLXGetProcAddress);
+  }
   std::string_view name_sv {reinterpret_cast<const char*>(name)};
 #ifdef BUILD_ANDROID
+  HyMobileTraceThunkEvent(reinterpret_cast<const char*>(name), HYMOBILE_THUNK_EVENT_LOOKUP_FUNCTION, kThunkGLXGetProcAddress);
   if (name_sv == "glShaderSource" || name_sv == "glShaderSourceARB") {
-    return reinterpret_cast<VoidFn>(fexfn_impl_libGL_FEX_glShaderSource);
+    auto result = reinterpret_cast<VoidFn>(fexfn_impl_libGL_FEX_glShaderSource);
+    HyMobileTraceThunkEvent(reinterpret_cast<const char*>(name), HYMOBILE_THUNK_EVENT_EXIT, kThunkGLXGetProcAddress,
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), 1);
+    return result;
   }
 
   auto* android_name = reinterpret_cast<const char*>(name);
   if (auto egl_proc = reinterpret_cast<VoidFn>(eglGetProcAddress(android_name)); egl_proc) {
+    HyMobileTraceThunkEvent(android_name, HYMOBILE_THUNK_EVENT_EXIT, kThunkGLXGetProcAddress,
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(egl_proc)), 2);
     return egl_proc;
   }
-
-  return reinterpret_cast<VoidFn>(dlsym(RTLD_DEFAULT, android_name));
+  auto result = reinterpret_cast<VoidFn>(dlsym(RTLD_DEFAULT, android_name));
+  if (!result) {
+    HyMobileTraceThunkEvent(android_name, HYMOBILE_THUNK_EVENT_LOOKUP_MISS, kThunkGLXGetProcAddress, 0, 3);
+  } else {
+    HyMobileTraceThunkEvent(android_name, HYMOBILE_THUNK_EVENT_EXIT, kThunkGLXGetProcAddress,
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), 3);
+  }
+  return result;
 #else
   if (name_sv == "glCompileShaderIncludeARB") {
     return (VoidFn)fexfn_impl_libGL_glCompileShaderIncludeARB;
@@ -259,6 +917,16 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
 }
 
 // TODO: unsigned int *glXEnumerateVideoDevicesNV (Display *dpy, int screen, int *nelements);
+
+#ifdef BUILD_ANDROID
+void fexfn_impl_libGL_glShaderSource(GLuint a_0, GLsizei count, guest_layout<const GLchar* const*> a_2, const GLint* a_3) {
+  fexfn_impl_libGL_FEX_glShaderSource(a_0, count, reinterpret_cast<uintptr_t>(a_2.force_get_host_pointer()), a_3);
+}
+
+void fexfn_impl_libGL_glShaderSourceARB(GLuint a_0, GLsizei count, guest_layout<const GLcharARB**> a_2, const GLint* a_3) {
+  fexfn_impl_libGL_FEX_glShaderSource(a_0, count, reinterpret_cast<uintptr_t>(a_2.force_get_host_pointer()), a_3);
+}
+#endif
 
 #ifndef BUILD_ANDROID
 void fexfn_impl_libGL_glCompileShaderIncludeARB(GLuint a_0, GLsizei Count, guest_layout<const GLchar* const*> a_2, const GLint* a_3) {
@@ -535,7 +1203,8 @@ guest_layout<GLXFBConfig*> MakeGuestFBConfigArray(int* NumItems) {
     *NumItems = 1;
   }
   if (!GuestMalloc) {
-    return guest_layout<GLXFBConfig*> {.data = 0};
+    HyMobileAbortThunkNullTarget("MakeGuestFBConfigArray", "GuestMalloc is unset", kThunkGLGuestMalloc,
+                                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(NumItems)));
   }
 
   std::fprintf(stderr, "[libGL-host] MakeGuestFBConfigArray GuestMalloc=%p\n", reinterpret_cast<void*>(GuestMalloc));
@@ -563,7 +1232,7 @@ guest_layout<GLXFBConfigSGIX*> MakeGuestFBConfigArraySGIX(int* NumItems) {
 
 guest_layout<XVisualInfo*> MakeGuestVisualInfo() {
   if (!GuestMalloc) {
-    return guest_layout<XVisualInfo*> {.data = 0};
+    HyMobileAbortThunkNullTarget("MakeGuestVisualInfo", "GuestMalloc is unset", kThunkGLGuestMalloc);
   }
 
   XVisualInfo host_info {
@@ -621,8 +1290,15 @@ guest_layout<XVisualInfo*> fexfn_impl_libGL_glXChooseVisual(Display*, int, int*)
 }
 
 GLXContext fexfn_impl_libGL_glXCreateContext(Display*, guest_layout<XVisualInfo*>, GLXContext, Bool) {
+  HyMobileTraceThunkEvent("glXCreateContext", HYMOBILE_THUNK_EVENT_ENTER, kThunkGLXCreateContext,
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(eglGetCurrentDisplay())),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(eglGetCurrentSurface(EGL_DRAW))),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(eglGetCurrentContext())));
   auto context = eglGetCurrentContext();
-  return context != EGL_NO_CONTEXT ? reinterpret_cast<GLXContext>(context) : reinterpret_cast<GLXContext>(uintptr_t {1});
+  auto result = context != EGL_NO_CONTEXT ? reinterpret_cast<GLXContext>(context) : reinterpret_cast<GLXContext>(uintptr_t {1});
+  HyMobileTraceThunkEvent("glXCreateContext", HYMOBILE_THUNK_EVENT_EXIT, kThunkGLXCreateContext,
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)));
+  return result;
 }
 
 GLXPixmap fexfn_impl_libGL_glXCreateGLXPixmap(Display*, guest_layout<XVisualInfo*>, Pixmap Pixmap) {

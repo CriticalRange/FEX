@@ -13,7 +13,6 @@
 
 extern "C" using __GLXextFuncPtr = void (*)(void);
 extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
-extern "C" void FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length);
 #else
 #include <GL/glx.h>
 #include <GL/glxext.h>
@@ -24,6 +23,8 @@ extern "C" void FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strin
 #include "glcorearb.h"
 #include "android_gl_proc_list.h"
 #endif
+
+extern "C" void FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length);
 
 #include <type_traits>
 
@@ -97,12 +98,13 @@ struct fex_gen_config : fexgen::generate_guest_symtable, fexgen::indirect_guest_
 template<auto, int, typename = void>
 struct fex_gen_param {};
 
+template<>
+struct fex_gen_config<FEX_glShaderSource> : fexgen::custom_host_impl {};
+
 #ifdef BUILD_ANDROID
 #define FEX_ANDROID_GL_CONFIG(name) \
 template<> \
 struct fex_gen_config<name> {};
-template<>
-struct fex_gen_config<FEX_glShaderSource> : fexgen::custom_host_impl {};
 FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN(FEX_ANDROID_GL_CONFIG)
 #undef FEX_ANDROID_GL_CONFIG
 #else
@@ -4711,11 +4713,11 @@ struct fex_gen_config<glShaderOp2EXT> {};
 template<>
 struct fex_gen_config<glShaderOp3EXT> {};
 template<>
-struct fex_gen_config<glShaderSource> : fexgen::custom_host_impl {};
+struct fex_gen_config<glShaderSource> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
 template<>
 struct fex_gen_param<glShaderSource, 2, const GLchar* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glShaderSourceARB> : fexgen::custom_host_impl {};
+struct fex_gen_config<glShaderSourceARB> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
 template<>
 struct fex_gen_param<glShaderSourceARB, 2, const GLcharARB**> : fexgen::ptr_passthrough {};
 template<>

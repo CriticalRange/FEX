@@ -10,7 +10,7 @@ if (NOT MINGW)
     add_subdirectory(FEXConfig/)
   endif()
 
-  if (ENABLE_GDB_SYMBOLS)
+  if (ENABLE_GDB_SYMBOLS AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
     add_subdirectory(FEXGDBReader/)
   endif()
 

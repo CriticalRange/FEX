@@ -19,10 +19,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <memory_resource>
 #include <fcntl.h>
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/user.h>
+#include <unistd.h>
 #endif
 
 namespace fextl::pmr {
@@ -44,6 +46,15 @@ using GLIBC_REALLOC_Hook = void* (*)(void*, size_t, const void* caller);
 using GLIBC_FREE_Hook = void (*)(void*, const void* caller);
 
 fextl::unique_ptr<Alloc::HostAllocator> Alloc64 {};
+
+static void AllocatorStageTrace(const char* Msg) {
+  if (!Msg) {
+    return;
+  }
+
+  write(STDERR_FILENO, Msg, strlen(Msg));
+  write(STDERR_FILENO, "\n", 1);
+}
 
 void* FEX_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
   void* Result = Alloc64->Mmap(addr, length, prot, flags, fd, offset);
@@ -83,15 +94,28 @@ int FEX_munmap(void* addr, size_t length) {
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 static void AssignHookOverrides(size_t PageSize) {
+  AllocatorStageTrace("[FEXAllocator] AssignHookOverrides: begin");
   SetupAllocatorHooks(FEX_mmap, FEX_munmap);
+  AllocatorStageTrace("[FEXAllocator] AssignHookOverrides: allocator hooks installed");
   FEXCore::Allocator::mmap = FEX_mmap;
   FEXCore::Allocator::munmap = FEX_munmap;
-  InitializeAllocator(PageSize);
+  AllocatorStageTrace("[FEXAllocator] AssignHookOverrides: mmap/munmap hooks assigned");
 }
 
 void SetupHooks(size_t PageSize) {
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: begin");
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: before InitializeAllocator");
+  InitializeAllocator(PageSize);
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: after InitializeAllocator");
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: before InitializeThread");
+  InitializeThread();
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: after InitializeThread");
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: before Create64BitAllocator");
   Alloc64 = Alloc::OSAllocator::Create64BitAllocator();
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: after Create64BitAllocator");
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: before AssignHookOverrides");
   AssignHookOverrides(PageSize);
+  AllocatorStageTrace("[FEXAllocator] SetupHooks: end");
 }
 
 void ClearHooks() {
@@ -144,8 +168,9 @@ FEX_DEFAULT_VISIBILITY size_t DetermineVASize() {
 
 #define STEAL_LOG(...) // fprintf(stderr, __VA_ARGS__)
 
-fextl::vector<MemoryRegion> CollectMemoryGaps(uintptr_t Begin, uintptr_t End, int MapsFD) {
-  fextl::vector<MemoryRegion> Regions;
+namespace {
+template<class VectorType>
+void CollectMemoryGapsImpl(uintptr_t Begin, uintptr_t End, int MapsFD, VectorType& Regions) {
 
   uintptr_t RegionEnd = 0;
 
@@ -170,7 +195,7 @@ fextl::vector<MemoryRegion> CollectMemoryGaps(uintptr_t Begin, uintptr_t End, in
           Regions.push_back({(void*)MapBegin, End - MapBegin});
         }
 
-        return Regions;
+        return;
       }
 
       // Move pending content back to the beginning, then buffer more data.
@@ -212,7 +237,7 @@ fextl::vector<MemoryRegion> CollectMemoryGaps(uintptr_t Begin, uintptr_t End, in
 
       if (RegionEnd >= End) {
         // Early return if we are completely beyond the allocation space.
-        return Regions;
+        return;
       }
     }
 
@@ -221,6 +246,13 @@ fextl::vector<MemoryRegion> CollectMemoryGaps(uintptr_t Begin, uintptr_t End, in
   }
   FEX_UNREACHABLE;
 }
+} // namespace
+
+fextl::vector<MemoryRegion> CollectMemoryGaps(uintptr_t Begin, uintptr_t End, int MapsFD) {
+  fextl::vector<MemoryRegion> Regions;
+  CollectMemoryGapsImpl(Begin, End, MapsFD, Regions);
+  return Regions;
+}
 
 fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
   const uintptr_t StackLocation_u64 = reinterpret_cast<uintptr_t>(alloca(0));
@@ -228,8 +260,32 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
   const int MapsFD = open("/proc/self/maps", O_RDONLY);
   LogMan::Throw::AFmt(MapsFD != -1, "Failed to open /proc/self/maps");
 
-  auto Regions = CollectMemoryGaps(Begin, End, MapsFD);
+  size_t MaxRegions = 1;
+  char CountBuffer[2048];
+  while (true) {
+    ssize_t BytesRead {};
+    do {
+      BytesRead = read(MapsFD, CountBuffer, sizeof(CountBuffer));
+    } while (BytesRead == -1 && errno == EAGAIN);
+
+    LogMan::Throw::AFmt(BytesRead != -1, "Failed to read /proc/self/maps");
+    if (BytesRead == 0) {
+      break;
+    }
+
+    MaxRegions += std::count(CountBuffer, CountBuffer + BytesRead, '\n');
+  }
   close(MapsFD);
+
+  const int MapsFDRetry = open("/proc/self/maps", O_RDONLY);
+  LogMan::Throw::AFmt(MapsFDRetry != -1, "Failed to reopen /proc/self/maps");
+
+  auto* ScratchStorage = static_cast<MemoryRegion*>(alloca(sizeof(MemoryRegion) * MaxRegions));
+  fextl::pmr::fixed_size_monotonic_buffer_resource ScratchResource {ScratchStorage, sizeof(MemoryRegion) * MaxRegions};
+  std::pmr::vector<MemoryRegion> Regions {&ScratchResource};
+  Regions.reserve(MaxRegions);
+  CollectMemoryGapsImpl(Begin, End, MapsFDRetry, Regions);
+  close(MapsFDRetry);
 
   // If the memory bounds include the stack, blocking all memory regions will
   // limit the stack size to the current value. To allow some stack growth,
@@ -240,9 +296,7 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
       return reinterpret_cast<uintptr_t>(Region.Ptr) + Region.Size > StackLocation_u64;
     });
 
-    // If no gap crossing the stack pointer was found but the SP is within
-    // the given bounds, the stack mapping is right after the last gap.
-    bool IsStackMapping = StackRegionIt != Regions.end() || StackLocation_u64 <= End;
+    bool IsStackMapping = StackLocation_u64 >= Begin && StackLocation_u64 <= End;
 
     if (IsStackMapping && StackRegionIt != Regions.begin() &&
         reinterpret_cast<uintptr_t>(std::prev(StackRegionIt)->Ptr) + std::prev(StackRegionIt)->Size <= End) {
@@ -250,7 +304,8 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
       --StackRegionIt;
 
       auto Alloc =
-        ::mmap(StackRegionIt->Ptr, StackRegionIt->Size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED, -1, 0);
+        ::mmap(StackRegionIt->Ptr, StackRegionIt->Size, PROT_READ | PROT_WRITE,
+               MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
 
       LogMan::Throw::AFmt(Alloc != MAP_FAILED, "StealMemoryRegion:Stack: mmap({}, {:x}) failed: {}", fmt::ptr(StackRegionIt->Ptr),
                           StackRegionIt->Size, errno);
@@ -268,7 +323,7 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
     LogMan::Throw::AFmt(Alloc == RegionIt->Ptr, "mmap returned {} instead of {}", Alloc, fmt::ptr(RegionIt->Ptr));
   }
 
-  return Regions;
+  return {Regions.begin(), Regions.end()};
 }
 
 fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(size_t PageSize) {
@@ -288,9 +343,11 @@ fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(size_t PageSize) {
 }
 
 void ReclaimMemoryRegion(const fextl::vector<MemoryRegion>& Regions) {
+  AllocatorStageTrace("[FEXAllocator] ReclaimMemoryRegion: begin");
   for (const auto& Region : Regions) {
     ::munmap(Region.Ptr, Region.Size);
   }
+  AllocatorStageTrace("[FEXAllocator] ReclaimMemoryRegion: end");
 }
 
 void LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {

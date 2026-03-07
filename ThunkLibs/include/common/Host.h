@@ -53,6 +53,44 @@ struct ExportEntry {
 
 typedef void fex_call_callback_t(uintptr_t callback, void* arg0, void* arg1);
 
+extern "C" {
+__attribute__((weak)) void HyMobile_RecordThunkEvent(const char* name, uint32_t phase, uint64_t thunkId,
+                                                     uint64_t v0, uint64_t v1, uint64_t v2,
+                                                     uint64_t v3, uint64_t v4, uint64_t v5);
+}
+
+constexpr uint32_t HYMOBILE_THUNK_EVENT_ENTER = 1;
+constexpr uint32_t HYMOBILE_THUNK_EVENT_EXIT = 2;
+constexpr uint32_t HYMOBILE_THUNK_EVENT_LOOKUP_FUNCTION = 3;
+constexpr uint32_t HYMOBILE_THUNK_EVENT_LOOKUP_DATA = 4;
+constexpr uint32_t HYMOBILE_THUNK_EVENT_LOOKUP_MISS = 5;
+
+inline void HyMobileTraceThunkEvent(const char* name, uint32_t phase, uint64_t thunkId,
+                                    uint64_t v0 = 0, uint64_t v1 = 0, uint64_t v2 = 0,
+                                    uint64_t v3 = 0, uint64_t v4 = 0, uint64_t v5 = 0) {
+  if (HyMobile_RecordThunkEvent) {
+    HyMobile_RecordThunkEvent(name, phase, thunkId, v0, v1, v2, v3, v4, v5);
+  }
+}
+
+[[noreturn]] inline void HyMobileAbortThunkNullTarget(const char* name, const char* reason, uint64_t thunkId,
+                                                      uint64_t v0 = 0, uint64_t v1 = 0, uint64_t v2 = 0,
+                                                      uint64_t v3 = 0, uint64_t v4 = 0, uint64_t v5 = 0) {
+  HyMobileTraceThunkEvent(name, HYMOBILE_THUNK_EVENT_LOOKUP_MISS, thunkId, v0, v1, v2, v3, v4, v5);
+  std::fprintf(stderr,
+               "[HyMobile thunk] fatal null target: %s (%s) v0=0x%llx v1=0x%llx v2=0x%llx v3=0x%llx v4=0x%llx v5=0x%llx\n",
+               name ? name : "<null>",
+               reason ? reason : "unknown",
+               static_cast<unsigned long long>(v0),
+               static_cast<unsigned long long>(v1),
+               static_cast<unsigned long long>(v2),
+               static_cast<unsigned long long>(v3),
+               static_cast<unsigned long long>(v4),
+               static_cast<unsigned long long>(v5));
+  std::fflush(stderr);
+  std::abort();
+}
+
 #define EXPORTS(name)                       \
   extern "C" {                              \
   ExportEntry* fexthunks_exports_##name() { \

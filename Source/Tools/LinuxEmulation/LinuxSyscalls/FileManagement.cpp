@@ -29,11 +29,14 @@ $end_info$
 #include <algorithm>
 #include <errno.h>
 #include <cstring>
+#include <linux/memfd.h>
 #include <linux/openat2.h>
 #include <fcntl.h>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <stdio.h>
+#include <string_view>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/xattr.h>
@@ -45,6 +48,417 @@ $end_info$
 #include <tiny-json.h>
 
 namespace FEX::HLE {
+#ifdef __ANDROID__
+namespace {
+static bool ContainsControllerToken(std::string_view value, std::string_view token) {
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t comma = value.find(',', start);
+    const size_t end = comma == std::string_view::npos ? value.size() : comma;
+    if (value.substr(start, end - start) == token) {
+      return true;
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  return false;
+}
+
+struct AndroidCgroupMountInfo {
+  fextl::string UnifiedMount;
+  fextl::string CPUMount;
+  fextl::string MemoryMount;
+};
+
+static bool StartsWith(std::string_view value, std::string_view prefix) {
+  return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+static bool EndsWith(std::string_view value, std::string_view suffix) {
+  return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static std::optional<fextl::string> ReadSmallTextFile(const char* path) {
+  FILE* fp = fopen(path, "re");
+  if (!fp) {
+    return std::nullopt;
+  }
+
+  char buffer[512] {};
+  const size_t read = fread(buffer, 1, sizeof(buffer) - 1, fp);
+  const bool hadError = ferror(fp) != 0;
+  fclose(fp);
+  if (read == 0 && hadError) {
+    return std::nullopt;
+  }
+
+  buffer[read] = '\0';
+  while (buffer[0] != '\0' && (buffer[strlen(buffer) - 1] == '\n' || buffer[strlen(buffer) - 1] == '\r')) {
+    buffer[strlen(buffer) - 1] = '\0';
+  }
+  return fextl::string {buffer};
+}
+
+static bool GetSelfCgroupPath(std::string_view controller, fextl::string* outPath) {
+  if (!outPath) {
+    return false;
+  }
+
+  FILE* fp = fopen("/proc/self/cgroup", "re");
+  if (!fp) {
+    return false;
+  }
+
+  char line[512] {};
+  bool found = false;
+  while (fgets(line, sizeof(line), fp)) {
+    char* first = strchr(line, ':');
+    if (!first) {
+      continue;
+    }
+    char* second = strchr(first + 1, ':');
+    if (!second) {
+      continue;
+    }
+
+    *first = '\0';
+    *second = '\0';
+    const char* controllers = first + 1;
+    char* path = second + 1;
+    path[strcspn(path, "\r\n")] = '\0';
+
+    if (controller.empty()) {
+      if (controllers[0] == '\0') {
+        *outPath = path;
+        found = true;
+        break;
+      }
+      continue;
+    }
+
+    std::string_view controllersView {controllers};
+    size_t start = 0;
+    while (start <= controllersView.size()) {
+      const size_t comma = controllersView.find(',', start);
+      const size_t end = comma == std::string_view::npos ? controllersView.size() : comma;
+      if (controllersView.substr(start, end - start) == controller) {
+        *outPath = path;
+        found = true;
+        break;
+      }
+      if (comma == std::string_view::npos) {
+        break;
+      }
+      start = comma + 1;
+    }
+
+    if (found) {
+      break;
+    }
+  }
+
+  fclose(fp);
+  return found;
+}
+
+static AndroidCgroupMountInfo GetAndroidCgroupMountInfo() {
+  AndroidCgroupMountInfo info {};
+  FILE* fp = fopen("/proc/self/mountinfo", "re");
+  if (!fp) {
+    return info;
+  }
+
+  char line[1024] {};
+  while (fgets(line, sizeof(line), fp)) {
+    char* separator = strstr(line, " - ");
+    if (!separator) {
+      continue;
+    }
+
+    *separator = '\0';
+    char* right = separator + 3;
+
+    char mountID[32] {};
+    char parentID[32] {};
+    char majorMinor[32] {};
+    char root[PATH_MAX] {};
+    char mountPoint[PATH_MAX] {};
+    if (sscanf(line, "%31s %31s %31s %1023s %1023s", mountID, parentID, majorMinor, root, mountPoint) < 5) {
+      continue;
+    }
+
+    if (StartsWith(right, "cgroup2 ")) {
+      info.UnifiedMount = mountPoint;
+      continue;
+    }
+
+    if (!StartsWith(right, "cgroup ")) {
+      continue;
+    }
+
+    const char* superOptions = strrchr(right, ' ');
+    if (!superOptions) {
+      continue;
+    }
+    superOptions += 1;
+
+    if (ContainsControllerToken(superOptions, "cpu")) {
+      info.CPUMount = mountPoint;
+    }
+    if (ContainsControllerToken(superOptions, "memory")) {
+      info.MemoryMount = mountPoint;
+    }
+  }
+
+  fclose(fp);
+  return info;
+}
+
+static fextl::string JoinMountPath(const fextl::string& mount, const fextl::string& relative, std::string_view leaf) {
+  if (mount.empty()) {
+    return {};
+  }
+
+  fextl::string path = mount;
+  if (relative.empty() || relative == "/") {
+    path += "/";
+  } else if (relative.front() != '/') {
+    path += "/";
+    path += relative;
+    path += "/";
+  } else {
+    path += relative;
+    if (path.back() != '/') {
+      path += "/";
+    }
+  }
+  path += leaf;
+  return path;
+}
+
+static std::optional<int64_t> ParseSignedInt(std::string_view text) {
+  if (text.empty()) {
+    return std::nullopt;
+  }
+
+  errno = 0;
+  char* end {};
+  const auto value = strtoll(text.data(), &end, 10);
+  if (errno != 0 || end == text.data()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+static fextl::string BuildMemoryMaxContent(const fextl::string& legacyValue) {
+  constexpr int64_t UnlimitedThreshold = INT64_MAX - 4096;
+  if (auto parsed = ParseSignedInt(legacyValue); parsed.has_value() && *parsed >= UnlimitedThreshold) {
+    return "max\n";
+  }
+  return legacyValue + "\n";
+}
+
+static fextl::string BuildCPUMaxContent(const fextl::string& cpuMount, const fextl::string& cpuPath) {
+  const auto quotaPath = JoinMountPath(cpuMount, cpuPath, "cpu.cfs_quota_us");
+  const auto periodPath = JoinMountPath(cpuMount, cpuPath, "cpu.cfs_period_us");
+  const auto quotaText = ReadSmallTextFile(quotaPath.c_str());
+  const auto periodText = ReadSmallTextFile(periodPath.c_str());
+
+  if (quotaText && periodText) {
+    const auto quota = ParseSignedInt(*quotaText);
+    const auto period = ParseSignedInt(*periodText);
+    if (quota && period && *period > 0) {
+      if (*quota < 0) {
+        return fextl::fmt::format("max {}\n", *period);
+      }
+      return fextl::fmt::format("{} {}\n", *quota, *period);
+    }
+  }
+
+  return "max 100000\n";
+}
+
+static std::optional<fextl::string> CreateCompatMemfdPath(std::string_view name, const fextl::string& contents) {
+  const std::string memfdName {name};
+  const int fd = static_cast<int>(::syscall(SYS_memfd_create, memfdName.c_str(), MFD_CLOEXEC));
+  if (fd == -1) {
+    const char* tmpdir = getenv("TMPDIR");
+    if (!tmpdir || tmpdir[0] == '\0') {
+      tmpdir = "/data/local/tmp";
+    }
+
+    char pathTemplate[PATH_MAX] {};
+    snprintf(pathTemplate, sizeof(pathTemplate), "%s/%s-XXXXXX", tmpdir, memfdName.c_str());
+    const int tmpfd = mkstemp(pathTemplate);
+    if (tmpfd == -1) {
+      return std::nullopt;
+    }
+
+    if (!contents.empty()) {
+      const ssize_t written = write(tmpfd, contents.data(), contents.size());
+      if (written != static_cast<ssize_t>(contents.size())) {
+        close(tmpfd);
+        unlink(pathTemplate);
+        return std::nullopt;
+      }
+    }
+
+    close(tmpfd);
+    return fextl::string {pathTemplate};
+  }
+
+  if (ftruncate(fd, contents.size()) != 0) {
+    close(fd);
+    return std::nullopt;
+  }
+
+  if (!contents.empty()) {
+    const ssize_t written = write(fd, contents.data(), contents.size());
+    if (written != static_cast<ssize_t>(contents.size())) {
+      close(fd);
+      return std::nullopt;
+    }
+  }
+
+  return fextl::fmt::format("/proc/self/fd/{}", fd);
+}
+
+static int CreateCompatContentsFD(std::string_view name, const fextl::string& contents, int flags) {
+  const std::string memfdName {name};
+  int fd = static_cast<int>(::syscall(SYS_memfd_create, memfdName.c_str(), 0));
+  if (fd == -1) {
+    const char* tmpdir = getenv("TMPDIR");
+    if (!tmpdir || tmpdir[0] == '\0') {
+      tmpdir = "/data/local/tmp";
+    }
+
+    char pathTemplate[PATH_MAX] {};
+    snprintf(pathTemplate, sizeof(pathTemplate), "%s/%s-XXXXXX", tmpdir, memfdName.c_str());
+    fd = mkstemp(pathTemplate);
+    if (fd == -1) {
+      return -1;
+    }
+    unlink(pathTemplate);
+  }
+
+  if (ftruncate(fd, contents.size()) != 0) {
+    close(fd);
+    return -1;
+  }
+
+  if (!contents.empty()) {
+    const ssize_t written = write(fd, contents.data(), contents.size());
+    if (written != static_cast<ssize_t>(contents.size())) {
+      close(fd);
+      return -1;
+    }
+  }
+
+  if (lseek(fd, 0, SEEK_SET) == -1) {
+    close(fd);
+    return -1;
+  }
+
+  if (flags & O_CLOEXEC) {
+    const int current = fcntl(fd, F_GETFD);
+    if (current != -1) {
+      fcntl(fd, F_SETFD, current | FD_CLOEXEC);
+    }
+  }
+
+  return fd;
+}
+
+static int OpenAndroidCompatCgroupFile(const char* pathname, int flags) {
+  if (!pathname || pathname[0] != '/' || !StartsWith(pathname, "/sys/fs/cgroup/")) {
+    errno = ENOENT;
+    return -1;
+  }
+
+  const bool wantsCPUMax = EndsWith(pathname, "/cpu.max");
+  const bool wantsMemoryMax = EndsWith(pathname, "/memory.max");
+  if (!wantsCPUMax && !wantsMemoryMax) {
+    errno = ENOENT;
+    return -1;
+  }
+
+  const auto mounts = GetAndroidCgroupMountInfo();
+  fextl::string unifiedPath {};
+  if (GetSelfCgroupPath("", &unifiedPath) && !mounts.UnifiedMount.empty()) {
+    const auto v2Path = JoinMountPath(mounts.UnifiedMount, unifiedPath, wantsCPUMax ? "cpu.max" : "memory.max");
+    if (!v2Path.empty() && access(v2Path.c_str(), F_OK) == 0) {
+      return ::syscall(SYSCALL_DEF(openat), AT_FDCWD, v2Path.c_str(), flags, 0);
+    }
+  }
+
+  if (wantsMemoryMax) {
+    fextl::string memoryPath {};
+    if (GetSelfCgroupPath("memory", &memoryPath) && !mounts.MemoryMount.empty()) {
+      const auto legacyPath = JoinMountPath(mounts.MemoryMount, memoryPath, "memory.limit_in_bytes");
+      if (auto legacyValue = ReadSmallTextFile(legacyPath.c_str()); legacyValue.has_value()) {
+        return CreateCompatContentsFD("android-memory.max", BuildMemoryMaxContent(*legacyValue), flags);
+      }
+    }
+    errno = ENOENT;
+    return -1;
+  }
+
+  fextl::string cpuPath {};
+  if (GetSelfCgroupPath("cpu", &cpuPath) && !mounts.CPUMount.empty()) {
+    return CreateCompatContentsFD("android-cpu.max", BuildCPUMaxContent(mounts.CPUMount, cpuPath), flags);
+  }
+
+  errno = ENOENT;
+  return -1;
+}
+
+static std::optional<fextl::string> GetAndroidCompatCgroupPath(const char* pathname) {
+  if (!pathname || pathname[0] != '/' || !StartsWith(pathname, "/sys/fs/cgroup/")) {
+    return std::nullopt;
+  }
+
+  const bool wantsCPUMax = EndsWith(pathname, "/cpu.max");
+  const bool wantsMemoryMax = EndsWith(pathname, "/memory.max");
+  if (!wantsCPUMax && !wantsMemoryMax) {
+    return std::nullopt;
+  }
+
+  const auto mounts = GetAndroidCgroupMountInfo();
+  fextl::string unifiedPath {};
+  if (GetSelfCgroupPath("", &unifiedPath) && !mounts.UnifiedMount.empty()) {
+    const auto v2Path = JoinMountPath(mounts.UnifiedMount, unifiedPath, wantsCPUMax ? "cpu.max" : "memory.max");
+    if (!v2Path.empty() && access(v2Path.c_str(), F_OK) == 0) {
+      return v2Path;
+    }
+  }
+
+  if (wantsMemoryMax) {
+    fextl::string memoryPath {};
+    if (GetSelfCgroupPath("memory", &memoryPath) && !mounts.MemoryMount.empty()) {
+      const auto legacyPath = JoinMountPath(mounts.MemoryMount, memoryPath, "memory.limit_in_bytes");
+      if (auto legacyValue = ReadSmallTextFile(legacyPath.c_str()); legacyValue.has_value()) {
+        return CreateCompatMemfdPath("android-memory.max", BuildMemoryMaxContent(*legacyValue));
+      }
+    }
+    return std::nullopt;
+  }
+
+  fextl::string cpuPath {};
+  if (GetSelfCgroupPath("cpu", &cpuPath) && !mounts.CPUMount.empty()) {
+    return CreateCompatMemfdPath("android-cpu.max", BuildCPUMaxContent(mounts.CPUMount, cpuPath));
+  }
+
+  return std::nullopt;
+}
+}
+#else
+static std::optional<fextl::string> GetAndroidCompatCgroupPath(const char*) {
+  return std::nullopt;
+}
+#endif
+
 bool FileManager::RootFSPathExists(const char* Filepath) const {
   LOGMAN_THROW_A_FMT(Filepath && Filepath[0] == '/', "Filepath needs to be absolute");
   return FHU::Filesystem::ExistsAt(RootFSFD, Filepath + 1);
@@ -650,8 +1064,15 @@ bool FileManager::ReplaceEmuFd(int fd, int flags, uint32_t mode) {
 }
 
 uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  if (const int compatFD = OpenAndroidCompatCgroupFile(pathname, flags); compatFD != -1) {
+    int fd = compatFD;
+    ReplaceEmuFd(fd, flags, mode);
+    return fd;
+  }
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
   int fd = -1;
 
   if (!ShouldSkipOpenInEmu(flags)) {
@@ -716,8 +1137,13 @@ uint64_t FileManager::CloseRange(unsigned int first, unsigned int last, unsigned
 }
 
 uint64_t FileManager::Stat(const char* pathname, void* buf) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::stat(CompatPath->c_str(), reinterpret_cast<struct stat*>(buf));
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   // Stat follows symlinks
   FDPathTmpData TmpFilename;
@@ -732,8 +1158,13 @@ uint64_t FileManager::Stat(const char* pathname, void* buf) {
 }
 
 uint64_t FileManager::Lstat(const char* pathname, void* buf) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::lstat(CompatPath->c_str(), reinterpret_cast<struct stat*>(buf));
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   // lstat does not follow symlinks
   FDPathTmpData TmpFilename;
@@ -745,12 +1176,17 @@ uint64_t FileManager::Lstat(const char* pathname, void* buf) {
     }
   }
 
-  return ::lstat(pathname, reinterpret_cast<struct stat*>(buf));
+  return ::lstat(SelfPath, reinterpret_cast<struct stat*>(buf));
 }
 
 uint64_t FileManager::Access(const char* pathname, [[maybe_unused]] int mode) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::access(CompatPath->c_str(), mode);
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   // Access follows symlinks
   FDPathTmpData TmpFilename;
@@ -765,8 +1201,13 @@ uint64_t FileManager::Access(const char* pathname, [[maybe_unused]] int mode) {
 }
 
 uint64_t FileManager::FAccessat(int dirfd, const char* pathname, int mode) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::syscall(SYS_faccessat, AT_FDCWD, CompatPath->c_str(), mode);
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, true, TmpFilename);
@@ -781,8 +1222,13 @@ uint64_t FileManager::FAccessat(int dirfd, const char* pathname, int mode) {
 }
 
 uint64_t FileManager::FAccessat2(int dirfd, const char* pathname, int mode, int flags) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::syscall(SYSCALL_DEF(faccessat2), AT_FDCWD, CompatPath->c_str(), mode, flags);
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
@@ -802,14 +1248,20 @@ uint64_t FileManager::Readlink(const char* pathname, char* buf, size_t bufsiz) {
   char PidSelfPath[50];
   snprintf(PidSelfPath, 50, "/proc/%i/exe", CurrentPID);
 
-  if (strcmp(pathname, "/proc/self/exe") == 0 || strcmp(pathname, "/proc/thread-self/exe") == 0 || strcmp(pathname, PidSelfPath) == 0) {
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::readlink(CompatPath->c_str(), buf, bufsiz);
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+
+  if (strcmp(InputPath, "/proc/self/exe") == 0 || strcmp(InputPath, "/proc/thread-self/exe") == 0 || strcmp(InputPath, PidSelfPath) == 0) {
     const auto& App = Filename();
     strncpy(buf, App.c_str(), bufsiz);
     return std::min(bufsiz, App.size());
   }
 
   FDPathTmpData TmpFilename;
-  auto Path = GetEmulatedFDPath(AT_FDCWD, pathname, false, TmpFilename);
+  auto Path = GetEmulatedFDPath(AT_FDCWD, InputPath, false, TmpFilename);
   uint64_t Result = -1;
   if (Path.FD != -1) {
     Result = ::readlinkat(Path.FD, Path.Path, buf, bufsiz);
@@ -821,7 +1273,7 @@ uint64_t FileManager::Readlink(const char* pathname, char* buf, size_t bufsiz) {
     }
   }
   if (Result == -1) {
-    Result = ::readlink(pathname, buf, bufsiz);
+    Result = ::readlink(InputPath, buf, bufsiz);
   }
 
   // We might have read a /proc/self/fd/* link. If so, strip the RootFS prefix from it.
@@ -908,8 +1360,15 @@ uint64_t FileManager::Readlinkat(int dirfd, const char* pathname, char* buf, siz
 }
 
 uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, int flags, uint32_t mode) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  if (const int compatFD = OpenAndroidCompatCgroupFile(pathname, flags); compatFD != -1) {
+    int32_t fd = compatFD;
+    ReplaceEmuFd(fd, flags, mode);
+    return fd;
+  }
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   int32_t fd = -1;
 
@@ -949,8 +1408,15 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
 }
 
 uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_how* how, size_t usize) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  if (const int compatFD = OpenAndroidCompatCgroupFile(pathname, static_cast<int>(how->flags)); compatFD != -1) {
+    int32_t fd = compatFD;
+    ReplaceEmuFd(fd, how->flags, how->mode);
+    return fd;
+  }
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
   const int open_flags = static_cast<int>(how->flags);
 #if defined(__ANDROID__)
   (void)usize;
@@ -1005,14 +1471,20 @@ uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_ho
 }
 
 uint64_t FileManager::Statx(int dirfd, const char* pathname, int flags, uint32_t mask, struct statx* statxbuf) {
-  if (IsSelfNoFollow(pathname, flags)) {
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return FHU::Syscalls::statx(AT_FDCWD, CompatPath->c_str(), flags, mask, statxbuf);
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+
+  if (IsSelfNoFollow(InputPath, flags)) {
     // If we aren't following the symlink for self then we need to return data about the symlink itself.
     // Let's just /actually/ return FEX symlink information in this case.
-    return FHU::Syscalls::statx(dirfd, pathname, flags, mask, statxbuf);
+    return FHU::Syscalls::statx(dirfd, InputPath, flags, mask, statxbuf);
   }
 
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
@@ -1026,8 +1498,10 @@ uint64_t FileManager::Statx(int dirfd, const char* pathname, int flags, uint32_t
 }
 
 uint64_t FileManager::Mknod(const char* pathname, mode_t mode, dev_t dev) {
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(AT_FDCWD, SelfPath, false, TmpFilename);
@@ -1041,24 +1515,35 @@ uint64_t FileManager::Mknod(const char* pathname, mode_t mode, dev_t dev) {
 }
 
 uint64_t FileManager::Statfs(const char* path, void* buf) {
-  auto Path = GetEmulatedPath(path);
+  const auto CompatPath = GetAndroidCompatCgroupPath(path);
+  if (CompatPath) {
+    return ::statfs(CompatPath->c_str(), reinterpret_cast<struct statfs*>(buf));
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : path;
+  auto Path = GetEmulatedPath(InputPath);
   if (!Path.empty()) {
     uint64_t Result = ::statfs(Path.c_str(), reinterpret_cast<struct statfs*>(buf));
     if (Result != -1) {
       return Result;
     }
   }
-  return ::statfs(path, reinterpret_cast<struct statfs*>(buf));
+  return ::statfs(InputPath, reinterpret_cast<struct statfs*>(buf));
 }
 
 uint64_t FileManager::NewFSStatAt(int dirfd, const char* pathname, struct stat* buf, int flag) {
-  if (IsSelfNoFollow(pathname, flag)) {
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::fstatat(AT_FDCWD, CompatPath->c_str(), buf, flag);
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+
+  if (IsSelfNoFollow(InputPath, flag)) {
     // See Statx
-    return ::fstatat(dirfd, pathname, buf, flag);
+    return ::fstatat(dirfd, InputPath, buf, flag);
   }
 
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flag & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
@@ -1072,13 +1557,19 @@ uint64_t FileManager::NewFSStatAt(int dirfd, const char* pathname, struct stat* 
 }
 
 uint64_t FileManager::NewFSStatAt64(int dirfd, const char* pathname, struct stat64* buf, int flag) {
-  if (IsSelfNoFollow(pathname, flag)) {
+  const auto CompatPath = GetAndroidCompatCgroupPath(pathname);
+  if (CompatPath) {
+    return ::fstatat64(AT_FDCWD, CompatPath->c_str(), buf, flag);
+  }
+  const char* InputPath = CompatPath ? CompatPath->c_str() : pathname;
+
+  if (IsSelfNoFollow(InputPath, flag)) {
     // See Statx
-    return ::fstatat64(dirfd, pathname, buf, flag);
+    return ::fstatat64(dirfd, InputPath, buf, flag);
   }
 
-  auto NewPath = GetSelf(pathname);
-  const char* SelfPath = NewPath ? NewPath->data() : nullptr;
+  auto NewPath = GetSelf(InputPath);
+  const char* SelfPath = NewPath ? NewPath->data() : InputPath;
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flag & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);

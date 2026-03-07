@@ -238,6 +238,72 @@ void Initialize() {
   Meta = dynamic_cast<MetaLayer*>(ConfigLayers.begin()->second.get());
 }
 
+void ApplyAndroidConfigDefaults() {
+#if defined(BUILD_ANDROID) || defined(ENABLE_ANDROID) || defined(ANDROID_BUILD) || defined(__ANDROID__)
+  LOGMAN_THROW_A_FMT(Meta != nullptr, "Config meta layer must exist before applying Android defaults");
+
+  if (!Exists(FEXCore::Config::CONFIG_IS64BIT_MODE)) {
+    Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+  }
+
+  if (!Exists(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED)) {
+    Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
+  }
+
+  if (!Exists(FEXCore::Config::CONFIG_BLOCKJITNAMING)) {
+    Set(FEXCore::Config::CONFIG_BLOCKJITNAMING, "0");
+  }
+
+  if (!Exists(FEXCore::Config::CONFIG_GDBSERVER)) {
+    Set(FEXCore::Config::CONFIG_GDBSERVER, "0");
+  }
+#endif
+}
+
+void ApplyAndroidRuntimeConfig(std::string_view RootFSPath, std::string_view AppFilename, std::string_view ThunkHostLibsPath) {
+#if defined(BUILD_ANDROID) || defined(ENABLE_ANDROID) || defined(ANDROID_BUILD) || defined(__ANDROID__)
+  auto SetOrEraseStringOption = [](ConfigOption Option, std::string_view Value) {
+    if (Value.empty()) {
+      Erase(Option);
+    } else {
+      Set(Option, Value);
+    }
+  };
+
+  SetOrEraseStringOption(FEXCore::Config::CONFIG_ROOTFS, RootFSPath);
+  SetOrEraseStringOption(FEXCore::Config::CONFIG_APP_FILENAME, AppFilename);
+
+  if (!ThunkHostLibsPath.empty()) {
+    static constexpr std::array<std::string_view, 3> HostThunkLibraries {
+      "libSDL3-host.so",
+      "libGL-host.so",
+      "libEGL-host.so",
+    };
+
+    bool HaveAnyHostThunk {};
+    for (const auto& Library : HostThunkLibraries) {
+      const auto Candidate = fextl::fmt::format("{}/{}", ThunkHostLibsPath, Library);
+      if (FHU::Filesystem::Exists(Candidate)) {
+        HaveAnyHostThunk = true;
+        break;
+      }
+    }
+
+    if (HaveAnyHostThunk) {
+      Set(FEXCore::Config::CONFIG_THUNKHOSTLIBS, ThunkHostLibsPath);
+    } else {
+      Erase(FEXCore::Config::CONFIG_THUNKHOSTLIBS);
+    }
+  } else {
+    Erase(FEXCore::Config::CONFIG_THUNKHOSTLIBS);
+  }
+#else
+  (void)RootFSPath;
+  (void)AppFilename;
+  (void)ThunkHostLibsPath;
+#endif
+}
+
 void Shutdown() {
   ConfigLayers.clear();
   Meta = nullptr;

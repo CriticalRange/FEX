@@ -18,7 +18,9 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <cstdio>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -33,6 +35,15 @@
 namespace Alloc::OSAllocator {
 
 thread_local FEXCore::Core::InternalThreadState* TLSThread {};
+
+static void Alloc64StageTrace(const char* Msg) {
+  if (!Msg) {
+    return;
+  }
+
+  write(STDERR_FILENO, Msg, strlen(Msg));
+  write(STDERR_FILENO, "\n", 1);
+}
 
 class OSAllocator_64Bit final : public Alloc::HostAllocator {
 public:
@@ -182,7 +193,7 @@ private:
     return LiveIter;
   }
 
-  void AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::MemoryRegion>& Ranges);
+  bool AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::MemoryRegion>& Ranges);
   LiveVMARegion* FindLiveRegionForAddress(uintptr_t Addr, uintptr_t AddrEnd);
 };
 
@@ -314,8 +325,11 @@ again:
       if (AllocatedPage != ~0ULL) {
         AllocatedOffset = Region->SlabInfo->Base + AllocatedPage * FEXCore::Utils::FEX_PAGE_SIZE;
 
-        // We need to setup protections for this
-        void* MMapResult = ::mmap(reinterpret_cast<void*>(AllocatedOffset), length, prot, (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED, fd, offset);
+        // StealMemoryRegion pre-reserves the allocator VA space with PROT_NONE mappings.
+        // Materializing a live allocation inside that reserved slab must replace the
+        // placeholder mapping, so MAP_FIXED_NOREPLACE is incompatible here.
+        int MMapFlags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
+        void* MMapResult = ::mmap(reinterpret_cast<void*>(AllocatedOffset), length, prot, MMapFlags, fd, offset);
 
         if (MMapResult == MAP_FAILED) {
           return RangeResult {Region, reinterpret_cast<void*>(-errno)};
@@ -495,11 +509,13 @@ int OSAllocator_64Bit::Munmap(void* addr, size_t length) {
   return 0;
 }
 
-void OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::MemoryRegion>& Ranges) {
+bool OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::MemoryRegion>& Ranges) {
   // Need to allocate the ObjectAlloc up front. Find a region that is larger than our minimum size first.
   const size_t ObjectAllocSize = 64 * 1024 * 1024;
+  size_t LargestRange {};
 
   for (auto& it : Ranges) {
+    LargestRange = std::max(LargestRange, it.Size);
     if (ObjectAllocSize > it.Size) {
       continue;
     }
@@ -526,7 +542,20 @@ void OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::
   }
 
   if (!ObjectAlloc) {
-    ERROR_AND_DIE_FMT("Couldn't allocate object allocator!");
+    char Line[192];
+    const int Len = snprintf(
+      Line,
+      sizeof(Line),
+      "[FEXAllocator64] AllocateMemoryRegions: no region >= %zu bytes (largest=%zu, ranges=%zu)",
+      ObjectAllocSize,
+      LargestRange,
+      Ranges.size());
+    if (Len > 0) {
+      const size_t WriteLen = static_cast<size_t>(Len) < sizeof(Line) ? static_cast<size_t>(Len) : sizeof(Line) - 1;
+      write(STDERR_FILENO, Line, WriteLen);
+      write(STDERR_FILENO, "\n", 1);
+    }
+    return false;
   }
 
   for (auto [Ptr, AllocationSize] : Ranges) {
@@ -541,19 +570,83 @@ void OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::
     Region->RegionSize = AllocationSize;
     ReservedRegions->emplace_back(Region);
   }
+
+  return true;
 }
 
 
 OSAllocator_64Bit::OSAllocator_64Bit() {
+  Alloc64StageTrace("[FEXAllocator64] ctor: begin");
   DetermineVASize();
+  Alloc64StageTrace("[FEXAllocator64] ctor: after DetermineVASize");
 
-  auto Ranges = FEXCore::Allocator::StealMemoryRegion(LOWER_BOUND, UPPER_BOUND);
+  constexpr uint32_t MaxStealRetries = 8;
+  for (uint32_t attempt = 1; attempt <= MaxStealRetries; ++attempt) {
+    Alloc64StageTrace("[FEXAllocator64] ctor: before StealMemoryRegion");
+    auto Ranges = FEXCore::Allocator::StealMemoryRegion(LOWER_BOUND, UPPER_BOUND);
+    Alloc64StageTrace("[FEXAllocator64] ctor: after StealMemoryRegion");
+    {
+      size_t Largest {};
+      size_t NonZeroCount {};
+      for (const auto& Range : Ranges) {
+        Largest = std::max(Largest, Range.Size);
+        NonZeroCount += Range.Size != 0;
+      }
+      char Line[256];
+      const int Len = snprintf(
+        Line,
+        sizeof(Line),
+        "[FEXAllocator64] ctor: ranges=%zu largest=%llu nonzero=%zu",
+        Ranges.size(),
+        static_cast<unsigned long long>(Largest),
+        NonZeroCount);
+      if (Len > 0) {
+        const size_t WriteLen = static_cast<size_t>(Len) < sizeof(Line) ? static_cast<size_t>(Len) : sizeof(Line) - 1;
+        write(STDERR_FILENO, Line, WriteLen);
+        write(STDERR_FILENO, "\n", 1);
+      }
 
-  AllocateMemoryRegions(Ranges);
+      for (size_t i = 0; i < std::min<size_t>(Ranges.size(), 4); ++i) {
+        const auto& Range = Ranges[i];
+        const int RangeLen = snprintf(
+          Line,
+          sizeof(Line),
+          "[FEXAllocator64] ctor: range[%zu] ptr=%p size=%llu",
+          i,
+          Range.Ptr,
+          static_cast<unsigned long long>(Range.Size));
+        if (RangeLen > 0) {
+          const size_t WriteLen = static_cast<size_t>(RangeLen) < sizeof(Line) ? static_cast<size_t>(RangeLen) : sizeof(Line) - 1;
+          write(STDERR_FILENO, Line, WriteLen);
+          write(STDERR_FILENO, "\n", 1);
+        }
+      }
+    }
+    Alloc64StageTrace("[FEXAllocator64] ctor: before AllocateMemoryRegions");
+    if (AllocateMemoryRegions(Ranges)) {
+      Alloc64StageTrace("[FEXAllocator64] ctor: AllocateMemoryRegions success");
+      return;
+    }
+    Alloc64StageTrace("[FEXAllocator64] ctor: AllocateMemoryRegions failed");
+
+    Alloc64StageTrace("[FEXAllocator64] ctor: before ReclaimMemoryRegion");
+    FEXCore::Allocator::ReclaimMemoryRegion(Ranges);
+    Alloc64StageTrace("[FEXAllocator64] ctor: after ReclaimMemoryRegion");
+
+    if (attempt != MaxStealRetries) {
+      Alloc64StageTrace("[FEXAllocator64] ctor: before retry sleep");
+      usleep(1000);
+      Alloc64StageTrace("[FEXAllocator64] ctor: after retry sleep");
+    }
+  }
+
+  ERROR_AND_DIE_FMT("Couldn't allocate object allocator after {} retries!", MaxStealRetries);
 }
 
 OSAllocator_64Bit::OSAllocator_64Bit(fextl::vector<FEXCore::Allocator::MemoryRegion>& Regions) {
-  AllocateMemoryRegions(Regions);
+  if (!AllocateMemoryRegions(Regions)) {
+    ERROR_AND_DIE_FMT("Couldn't allocate object allocator!");
+  }
 }
 
 OSAllocator_64Bit::~OSAllocator_64Bit() {

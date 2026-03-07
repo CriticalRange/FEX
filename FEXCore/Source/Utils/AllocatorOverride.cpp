@@ -10,6 +10,20 @@
 #include <sstream>
 #include <unistd.h>
 
+#if defined(__BIONIC__)
+namespace FEXCore::Allocator {
+#ifdef GLIBC_ALLOCATOR_FAULT
+// Bionic doesn't expose glibc's __libc_* allocator entry points, so the
+// glibc fault-hook path can't be wired here. Keep this as no-op on Android.
+YesIKnowImNotSupposedToUseTheGlibcAllocator::YesIKnowImNotSupposedToUseTheGlibcAllocator() = default;
+YesIKnowImNotSupposedToUseTheGlibcAllocator::~YesIKnowImNotSupposedToUseTheGlibcAllocator() = default;
+void YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable() {}
+void SetupFaultEvaluate() {}
+void ClearFaultEvaluate() {}
+#endif
+} // namespace FEXCore::Allocator
+#else
+
 extern "C" {
 // The majority of FEX internal code should avoid using the glibc allocator. To ensure glibc allocations don't accidentally slip
 // in, FEX overrides these glibc functions with faulting variants.
@@ -39,8 +53,8 @@ void* valloc(size_t) GLIBC_ALIAS_FUNCTION(fault_valloc);
 extern int __posix_memalign(void**, size_t, size_t);
 int posix_memalign(void**, size_t, size_t) GLIBC_ALIAS_FUNCTION(fault_posix_memalign);
 
-extern size_t __malloc_usable_size(void*);
-size_t malloc_usable_size(void*) GLIBC_ALIAS_FUNCTION(fault_malloc_usable_size);
+extern size_t __malloc_usable_size(const void*);
+size_t malloc_usable_size(const void*) GLIBC_ALIAS_FUNCTION(fault_malloc_usable_size);
 
 // Reuse __libc_memalign
 void* aligned_alloc(size_t, size_t) GLIBC_ALIAS_FUNCTION(fault_aligned_alloc);
@@ -146,7 +160,7 @@ int fault_posix_memalign(void** r, size_t a, size_t s) {
   FEXCore::Allocator::EvaluateReturnAddress(__builtin_extract_return_addr(__builtin_return_address(0)));
   return FEXCore::Allocator::posix_memalign_ptr(r, a, s);
 }
-size_t fault_malloc_usable_size(void* ptr) {
+size_t fault_malloc_usable_size(const void* ptr) {
   FEXCore::Allocator::EvaluateReturnAddress(__builtin_extract_return_addr(__builtin_return_address(0)));
   return FEXCore::Allocator::malloc_usable_size_ptr(ptr);
 }
@@ -155,3 +169,5 @@ void* fault_aligned_alloc(size_t a, size_t s) {
   return FEXCore::Allocator::aligned_alloc_ptr(a, s);
 }
 }
+
+#endif

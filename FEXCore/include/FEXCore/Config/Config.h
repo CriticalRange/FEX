@@ -218,6 +218,8 @@ FEX_DEFAULT_VISIBILITY void Load();
 FEX_DEFAULT_VISIBILITY void ReloadMetaLayer();
 FEX_DEFAULT_VISIBILITY fextl::string FindContainer();
 FEX_DEFAULT_VISIBILITY fextl::string FindContainerPrefix();
+FEX_DEFAULT_VISIBILITY void ApplyAndroidConfigDefaults();
+FEX_DEFAULT_VISIBILITY void ApplyAndroidRuntimeConfig(std::string_view RootFSPath, std::string_view AppFilename, std::string_view ThunkHostLibsPath);
 
 FEX_DEFAULT_VISIBILITY void AddLayer(fextl::unique_ptr<FEXCore::Config::Layer> _Layer);
 

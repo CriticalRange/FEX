@@ -32,6 +32,10 @@ $end_info$
 namespace {
 constexpr const char* LOG_TAG = "HyMobile-SDL3Thunk";
 constexpr const char* SDLContextReadyFlagPath = "/sdcard/HyMobile.Android/sdl_context_ready.flag";
+constexpr uint64_t kThunkSDLGLCreateContext = 0x53444C330001ULL;
+constexpr uint64_t kThunkSDLGLDeleteContext = 0x53444C330002ULL;
+constexpr uint64_t kThunkSDLGLSetSwapInterval = 0x53444C330003ULL;
+constexpr uint64_t kThunkSDLGLSwapWindow = 0x53444C330004ULL;
 
 #define SDL3_LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define SDL3_LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
@@ -523,9 +527,14 @@ static int fexfn_impl_libSDL3_FEX_SDL_GetWindowSize(SDL_Window* window, int* w, 
 }
 
 static SDL_GLContext fexfn_impl_libSDL3_FEX_SDL_GL_CreateContext(SDL_Window*) {
+  HyMobileTraceThunkEvent("SDL_GL_CreateContext", HYMOBILE_THUNK_EVENT_ENTER, kThunkSDLGLCreateContext,
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Display)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Surface)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Context)));
   if (!EnsureEGLContextReady()) {
     SetSDLContextReadyState(false, "SDL_GL_CreateContext");
     SDL3_LOGW("SDL_GL_CreateContext failed: no EGL context is available");
+    HyMobileTraceThunkEvent("SDL_GL_CreateContext", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLCreateContext, 0, 0, 0, 0, 0, 0);
     return nullptr;
   }
 
@@ -533,41 +542,78 @@ static SDL_GLContext fexfn_impl_libSDL3_FEX_SDL_GL_CreateContext(SDL_Window*) {
   g_GLCreateOwnerTid = CurrentThreadToken();
   SDL3_LOGI("SDL_GL_CreateContext succeeded with SDL3 thunk-managed EGL (owner=%lu)",
             g_GLCreateOwnerTid);
+  HyMobileTraceThunkEvent("SDL_GL_CreateContext", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLCreateContext,
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Context)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Display)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Surface)),
+                          static_cast<uint64_t>(g_GLCreateOwnerTid),
+                          static_cast<uint64_t>(CurrentEGL.Width),
+                          static_cast<uint64_t>(CurrentEGL.Height));
   return reinterpret_cast<SDL_GLContext>(CurrentEGL.Context);
 }
 
 static void fexfn_impl_libSDL3_FEX_SDL_GL_DeleteContext(SDL_GLContext) {
+  HyMobileTraceThunkEvent("SDL_GL_DeleteContext", HYMOBILE_THUNK_EVENT_ENTER, kThunkSDLGLDeleteContext,
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Context)),
+                          static_cast<uint64_t>(g_GLCreateOwnerTid));
   if (!ValidateGLOwnerThread("SDL_GL_DeleteContext")) {
+    HyMobileTraceThunkEvent("SDL_GL_DeleteContext", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLDeleteContext, 0, 0, 0, 0, 0, 0);
     return;
   }
 
   SetSDLContextReadyState(false, "SDL_GL_DeleteContext");
   DestroyManagedEGLContext();
   g_GLCreateOwnerTid = 0;
+  HyMobileTraceThunkEvent("SDL_GL_DeleteContext", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLDeleteContext, 1, 0, 0, 0, 0, 0);
 }
 
 static int fexfn_impl_libSDL3_FEX_SDL_GL_SetSwapInterval(int interval) {
+  HyMobileTraceThunkEvent("SDL_GL_SetSwapInterval", HYMOBILE_THUNK_EVENT_ENTER, kThunkSDLGLSetSwapInterval,
+                          static_cast<uint64_t>(interval),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Display)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Surface)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Context)));
   if (!ValidateGLOwnerThread("SDL_GL_SetSwapInterval")) {
+    HyMobileTraceThunkEvent("SDL_GL_SetSwapInterval", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLSetSwapInterval, 0, 0, 0, 0, 0, 0);
     return 0;
   }
 
   if (!EnsureEGLContextReady()) {
+    HyMobileTraceThunkEvent("SDL_GL_SetSwapInterval", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLSetSwapInterval, 0, 0, 0, 0, 0, 0);
     return 0;
   }
 
-  return eglSwapInterval(CurrentEGL.Display, interval) == EGL_TRUE ? 1 : 0;
+  const int result = eglSwapInterval(CurrentEGL.Display, interval) == EGL_TRUE ? 1 : 0;
+  HyMobileTraceThunkEvent("SDL_GL_SetSwapInterval", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLSetSwapInterval,
+                          static_cast<uint64_t>(result),
+                          static_cast<uint64_t>(eglGetError()),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Display)));
+  return result;
 }
 
 static int fexfn_impl_libSDL3_FEX_SDL_GL_SwapWindow(SDL_Window*) {
+  HyMobileTraceThunkEvent("SDL_GL_SwapWindow", HYMOBILE_THUNK_EVENT_ENTER, kThunkSDLGLSwapWindow,
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Display)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Surface)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Context)),
+                          static_cast<uint64_t>(g_GLCreateOwnerTid));
   if (!ValidateGLOwnerThread("SDL_GL_SwapWindow")) {
+    HyMobileTraceThunkEvent("SDL_GL_SwapWindow", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLSwapWindow, 0, 0, 0, 0, 0, 0);
     return 0;
   }
 
   if (!EnsureEGLContextReady()) {
+    HyMobileTraceThunkEvent("SDL_GL_SwapWindow", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLSwapWindow, 0, 0, 0, 0, 0, 0);
     return 0;
   }
 
-  return eglSwapBuffers(CurrentEGL.Display, CurrentEGL.Surface) == EGL_TRUE ? 1 : 0;
+  const int result = eglSwapBuffers(CurrentEGL.Display, CurrentEGL.Surface) == EGL_TRUE ? 1 : 0;
+  HyMobileTraceThunkEvent("SDL_GL_SwapWindow", HYMOBILE_THUNK_EVENT_EXIT, kThunkSDLGLSwapWindow,
+                          static_cast<uint64_t>(result),
+                          static_cast<uint64_t>(eglGetError()),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Display)),
+                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CurrentEGL.Surface)));
+  return result;
 }
 
 static int fexfn_impl_libSDL3_FEX_SDL_PollEvent(void* event) {

@@ -13,13 +13,11 @@ $end_info$
 #include <SDL3/SDL_loadso.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_messagebox.h>
+#include <SDL3/SDL_opengl.h>
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_version.h>
-
-#include <GL/gl.h>
-#include <GL/glext.h>
 
 #undef GL_ARB_viewport_array
 #include "../libGL/glcorearb.h"
@@ -29,6 +27,8 @@ extern "C" {
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <stdio.h>
+
+void* glXGetProcAddress(const GLubyte* procname);
 }
 
 #include <array>
@@ -37,6 +37,7 @@ extern "C" {
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -75,6 +76,10 @@ constexpr size_t GLAttributeCount = static_cast<size_t>(SDL_GL_EGL_PLATFORM) + 1
 
 std::array<int, GLAttributeCount> GLAttributes {};
 std::atomic<bool> GLAttributesInitialized {false};
+std::atomic<uintptr_t> CurrentGLWindowPointer {0};
+std::atomic<uintptr_t> CurrentGLContextPointer {0};
+std::atomic<int> CurrentSwapInterval {0};
+std::atomic<bool> GLLibraryLoaded {true};
 
 struct SDLPropertyValue {
   SDL_PropertyType Type {SDL_PROPERTY_TYPE_INVALID};
@@ -241,6 +246,744 @@ void EnsureGLAttributesInitialized() {
   GLAttributes[SDL_GL_CONTEXT_MAJOR_VERSION] = 3;
   GLAttributes[SDL_GL_CONTEXT_MINOR_VERSION] = 0;
   GLAttributes[SDL_GL_CONTEXT_PROFILE_MASK] = SDL_GL_CONTEXT_PROFILE_ES;
+}
+
+void ClearCurrentGLStateIfMatching(SDL_GLContext context) {
+  if (!context) {
+    return;
+  }
+
+  const uintptr_t target = reinterpret_cast<uintptr_t>(context);
+  if (CurrentGLContextPointer.load(std::memory_order_acquire) == target) {
+    CurrentGLContextPointer.store(0, std::memory_order_release);
+    CurrentGLWindowPointer.store(0, std::memory_order_release);
+  }
+}
+
+bool ShouldTraceGLProcName(std::string_view name) {
+  return name.rfind("gl", 0) == 0 ||
+         name.rfind("egl", 0) == 0 ||
+         name.rfind("SDL_GL_", 0) == 0;
+}
+
+void TraceGLProcLookup(const char* proc, const void* resolved, const char* source) {
+  if (!proc) {
+    return;
+  }
+
+  const std::string_view name {proc};
+  if (!ShouldTraceGLProcName(name)) {
+    return;
+  }
+
+  static std::atomic<uint32_t> budget {256};
+  uint32_t remaining = budget.load(std::memory_order_acquire);
+  while (remaining > 0 &&
+         !budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  if (remaining == 0) {
+    return;
+  }
+
+  std::fprintf(stderr, "[SDL3 thunk] SDL_GL_GetProcAddress('%s') => %p via %s\n",
+               proc,
+               resolved,
+               source ? source : "unknown");
+
+  if (FILE* f = std::fopen("/sdcard/HyMobile.Android/gl_proc_trace.log", "a")) {
+    std::fprintf(f, "[SDL3 thunk] SDL_GL_GetProcAddress('%s') => %p via %s\n",
+                 proc,
+                 resolved,
+                 source ? source : "unknown");
+    std::fclose(f);
+  }
+}
+
+// Android GLES drivers frequently expose desktop-style query APIs through EXT
+// names only. Provide a small alias map so SDL_GL_GetProcAddress can resolve
+// them without returning null to the guest.
+std::array<const char*, 4> GetAndroidGLProcAliases(std::string_view proc_name) {
+  if (proc_name == "glQueryCounter") {
+    return {"glQueryCounterEXT", nullptr, nullptr, nullptr};
+  }
+  if (proc_name == "glGetQueryObjectui64v") {
+    return {"glGetQueryObjectui64vEXT", nullptr, nullptr, nullptr};
+  }
+  if (proc_name == "glGenQueries") {
+    return {"glGenQueriesEXT", nullptr, nullptr, nullptr};
+  }
+  if (proc_name == "glDeleteQueries") {
+    return {"glDeleteQueriesEXT", nullptr, nullptr, nullptr};
+  }
+  if (proc_name == "glBeginQuery") {
+    return {"glBeginQueryEXT", nullptr, nullptr, nullptr};
+  }
+  if (proc_name == "glEndQuery") {
+    return {"glEndQueryEXT", nullptr, nullptr, nullptr};
+  }
+  if (proc_name == "glGetQueryObjectuiv") {
+    return {"glGetQueryObjectuivEXT", nullptr, nullptr, nullptr};
+  }
+  return {nullptr, nullptr, nullptr, nullptr};
+}
+
+using GLClearDepthfFn = void (*)(GLfloat);
+using GLDepthRangefFn = void (*)(GLfloat, GLfloat);
+using GLPolygonModeFn = void (*)(GLenum, GLenum);
+using GLTexImage2DFn = void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
+using GLTexImage2DMultisampleFn = void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
+using GLTexStorage2DMultisampleFn = void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
+using GLDrawBufferFn = void (*)(GLenum);
+using GLDrawBuffersFn = void (*)(GLsizei, const GLenum*);
+using GLGetBufferSubDataFn = void (*)(GLenum, GLintptr, GLsizeiptr, void*);
+using GLMapBufferRangeFn = void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+using GLUnmapBufferFn = GLboolean (*)(GLenum);
+using GLVertexAttribI2iFn = void (*)(GLuint, GLint, GLint);
+using GLVertexAttribI4iFn = void (*)(GLuint, GLint, GLint, GLint, GLint);
+using GLGetFramebufferAttachmentParameterivFn = void (*)(GLenum, GLenum, GLenum, GLint*);
+using GLGetTexLevelParameterivFn = void (*)(GLenum, GLint, GLenum, GLint*);
+using GLGetIntegervFn = void (*)(GLenum, GLint*);
+using GLGenFramebuffersFn = void (*)(GLsizei, GLuint*);
+using GLDeleteFramebuffersFn = void (*)(GLsizei, const GLuint*);
+using GLBindFramebufferFn = void (*)(GLenum, GLuint);
+using GLFramebufferTexture2DFn = void (*)(GLenum, GLenum, GLenum, GLuint, GLint);
+using GLCheckFramebufferStatusFn = GLenum (*)(GLenum);
+using GLReadPixelsFn = void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+
+std::atomic<GLClearDepthfFn> CachedGLClearDepthf {nullptr};
+std::atomic<GLDepthRangefFn> CachedGLDepthRangef {nullptr};
+std::atomic<GLPolygonModeFn> CachedGLPolygonMode {nullptr};
+std::atomic<bool> CachedGLPolygonModeResolved {false};
+std::atomic<GLTexImage2DFn> CachedGLTexImage2D {nullptr};
+std::atomic<GLTexImage2DMultisampleFn> CachedGLTexImage2DMultisample {nullptr};
+std::atomic<bool> CachedGLTexImage2DMultisampleResolved {false};
+std::atomic<GLTexStorage2DMultisampleFn> CachedGLTexStorage2DMultisample {nullptr};
+std::atomic<GLDrawBufferFn> CachedGLDrawBuffer {nullptr};
+std::atomic<bool> CachedGLDrawBufferResolved {false};
+std::atomic<GLDrawBuffersFn> CachedGLDrawBuffers {nullptr};
+std::atomic<GLGetBufferSubDataFn> CachedGLGetBufferSubData {nullptr};
+std::atomic<bool> CachedGLGetBufferSubDataResolved {false};
+std::atomic<GLMapBufferRangeFn> CachedGLMapBufferRange {nullptr};
+std::atomic<GLUnmapBufferFn> CachedGLUnmapBuffer {nullptr};
+std::atomic<GLVertexAttribI2iFn> CachedGLVertexAttribI2i {nullptr};
+std::atomic<bool> CachedGLVertexAttribI2iResolved {false};
+std::atomic<GLVertexAttribI4iFn> CachedGLVertexAttribI4i {nullptr};
+std::atomic<GLGetFramebufferAttachmentParameterivFn> CachedGLGetFramebufferAttachmentParameteriv {nullptr};
+std::atomic<bool> CachedGLGetFramebufferAttachmentParameterivResolved {false};
+std::atomic<GLGetTexLevelParameterivFn> CachedGLGetTexLevelParameteriv {nullptr};
+std::atomic<GLGetIntegervFn> CachedGLGetIntegerv {nullptr};
+std::atomic<GLGenFramebuffersFn> CachedGLGenFramebuffers {nullptr};
+std::atomic<GLDeleteFramebuffersFn> CachedGLDeleteFramebuffers {nullptr};
+std::atomic<GLBindFramebufferFn> CachedGLBindFramebuffer {nullptr};
+std::atomic<GLFramebufferTexture2DFn> CachedGLFramebufferTexture2D {nullptr};
+std::atomic<GLCheckFramebufferStatusFn> CachedGLCheckFramebufferStatus {nullptr};
+std::atomic<GLReadPixelsFn> CachedGLReadPixels {nullptr};
+
+GLClearDepthfFn ResolveGLClearDepthf() {
+  if (auto fn = CachedGLClearDepthf.load(std::memory_order_acquire)) {
+    return fn;
+  }
+
+  auto fn = reinterpret_cast<GLClearDepthfFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glClearDepthf")));
+  CachedGLClearDepthf.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLDepthRangefFn ResolveGLDepthRangef() {
+  if (auto fn = CachedGLDepthRangef.load(std::memory_order_acquire)) {
+    return fn;
+  }
+
+  auto fn = reinterpret_cast<GLDepthRangefFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glDepthRangef")));
+  CachedGLDepthRangef.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLTexImage2DFn ResolveGLTexImage2D() {
+  if (auto fn = CachedGLTexImage2D.load(std::memory_order_acquire)) {
+    return fn;
+  }
+
+  auto fn = reinterpret_cast<GLTexImage2DFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glTexImage2D")));
+  CachedGLTexImage2D.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLTexImage2DMultisampleFn ResolveGLTexImage2DMultisample() {
+  if (CachedGLTexImage2DMultisampleResolved.load(std::memory_order_acquire)) {
+    return CachedGLTexImage2DMultisample.load(std::memory_order_acquire);
+  }
+
+  GLTexImage2DMultisampleFn fn = reinterpret_cast<GLTexImage2DMultisampleFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glTexImage2DMultisample")));
+  if (!fn) {
+    fn = reinterpret_cast<GLTexImage2DMultisampleFn>(
+        glXGetProcAddress(reinterpret_cast<const GLubyte*>("glTexImage2DMultisampleEXT")));
+  }
+
+  CachedGLTexImage2DMultisample.store(fn, std::memory_order_release);
+  CachedGLTexImage2DMultisampleResolved.store(true, std::memory_order_release);
+  return fn;
+}
+
+GLTexStorage2DMultisampleFn ResolveGLTexStorage2DMultisample() {
+  if (auto fn = CachedGLTexStorage2DMultisample.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLTexStorage2DMultisampleFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glTexStorage2DMultisample")));
+  CachedGLTexStorage2DMultisample.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLDrawBufferFn ResolveGLDrawBuffer() {
+  if (CachedGLDrawBufferResolved.load(std::memory_order_acquire)) {
+    return CachedGLDrawBuffer.load(std::memory_order_acquire);
+  }
+
+  GLDrawBufferFn fn =
+      reinterpret_cast<GLDrawBufferFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glDrawBuffer")));
+  if (!fn) {
+    fn = reinterpret_cast<GLDrawBufferFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glDrawBufferEXT")));
+  }
+
+  CachedGLDrawBuffer.store(fn, std::memory_order_release);
+  CachedGLDrawBufferResolved.store(true, std::memory_order_release);
+  return fn;
+}
+
+GLDrawBuffersFn ResolveGLDrawBuffers() {
+  if (auto fn = CachedGLDrawBuffers.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLDrawBuffersFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glDrawBuffers")));
+  CachedGLDrawBuffers.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLGetBufferSubDataFn ResolveGLGetBufferSubData() {
+  if (CachedGLGetBufferSubDataResolved.load(std::memory_order_acquire)) {
+    return CachedGLGetBufferSubData.load(std::memory_order_acquire);
+  }
+
+  GLGetBufferSubDataFn fn = reinterpret_cast<GLGetBufferSubDataFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glGetBufferSubData")));
+  if (!fn) {
+    fn = reinterpret_cast<GLGetBufferSubDataFn>(
+        glXGetProcAddress(reinterpret_cast<const GLubyte*>("glGetBufferSubDataARB")));
+  }
+
+  CachedGLGetBufferSubData.store(fn, std::memory_order_release);
+  CachedGLGetBufferSubDataResolved.store(true, std::memory_order_release);
+  return fn;
+}
+
+GLMapBufferRangeFn ResolveGLMapBufferRange() {
+  if (auto fn = CachedGLMapBufferRange.load(std::memory_order_acquire)) {
+    return fn;
+  }
+
+  GLMapBufferRangeFn fn = reinterpret_cast<GLMapBufferRangeFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glMapBufferRange")));
+  if (!fn) {
+    fn = reinterpret_cast<GLMapBufferRangeFn>(
+        glXGetProcAddress(reinterpret_cast<const GLubyte*>("glMapBufferRangeEXT")));
+  }
+
+  CachedGLMapBufferRange.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLUnmapBufferFn ResolveGLUnmapBuffer() {
+  if (auto fn = CachedGLUnmapBuffer.load(std::memory_order_acquire)) {
+    return fn;
+  }
+
+  GLUnmapBufferFn fn =
+      reinterpret_cast<GLUnmapBufferFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glUnmapBuffer")));
+  if (!fn) {
+    fn = reinterpret_cast<GLUnmapBufferFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glUnmapBufferOES")));
+  }
+
+  CachedGLUnmapBuffer.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLVertexAttribI2iFn ResolveGLVertexAttribI2i() {
+  if (CachedGLVertexAttribI2iResolved.load(std::memory_order_acquire)) {
+    return CachedGLVertexAttribI2i.load(std::memory_order_acquire);
+  }
+
+  GLVertexAttribI2iFn fn = reinterpret_cast<GLVertexAttribI2iFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glVertexAttribI2i")));
+  if (!fn) {
+    fn = reinterpret_cast<GLVertexAttribI2iFn>(
+        glXGetProcAddress(reinterpret_cast<const GLubyte*>("glVertexAttribI2iEXT")));
+  }
+
+  CachedGLVertexAttribI2i.store(fn, std::memory_order_release);
+  CachedGLVertexAttribI2iResolved.store(true, std::memory_order_release);
+  return fn;
+}
+
+GLVertexAttribI4iFn ResolveGLVertexAttribI4i() {
+  if (auto fn = CachedGLVertexAttribI4i.load(std::memory_order_acquire)) {
+    return fn;
+  }
+
+  GLVertexAttribI4iFn fn = reinterpret_cast<GLVertexAttribI4iFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glVertexAttribI4i")));
+  if (!fn) {
+    fn = reinterpret_cast<GLVertexAttribI4iFn>(
+        glXGetProcAddress(reinterpret_cast<const GLubyte*>("glVertexAttribI4iEXT")));
+  }
+
+  CachedGLVertexAttribI4i.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLGetFramebufferAttachmentParameterivFn ResolveGLGetFramebufferAttachmentParameteriv() {
+  if (CachedGLGetFramebufferAttachmentParameterivResolved.load(std::memory_order_acquire)) {
+    return CachedGLGetFramebufferAttachmentParameteriv.load(std::memory_order_acquire);
+  }
+
+  GLGetFramebufferAttachmentParameterivFn fn = reinterpret_cast<GLGetFramebufferAttachmentParameterivFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glGetFramebufferAttachmentParameteriv")));
+  if (!fn) {
+    fn = reinterpret_cast<GLGetFramebufferAttachmentParameterivFn>(
+        glXGetProcAddress(reinterpret_cast<const GLubyte*>("glGetFramebufferAttachmentParameterivEXT")));
+  }
+
+  CachedGLGetFramebufferAttachmentParameteriv.store(fn, std::memory_order_release);
+  CachedGLGetFramebufferAttachmentParameterivResolved.store(true, std::memory_order_release);
+  return fn;
+}
+
+GLGetTexLevelParameterivFn ResolveGLGetTexLevelParameteriv() {
+  if (auto fn = CachedGLGetTexLevelParameteriv.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLGetTexLevelParameterivFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glGetTexLevelParameteriv")));
+  CachedGLGetTexLevelParameteriv.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLGetIntegervFn ResolveGLGetIntegerv() {
+  if (auto fn = CachedGLGetIntegerv.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLGetIntegervFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glGetIntegerv")));
+  CachedGLGetIntegerv.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLGenFramebuffersFn ResolveGLGenFramebuffers() {
+  if (auto fn = CachedGLGenFramebuffers.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLGenFramebuffersFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glGenFramebuffers")));
+  CachedGLGenFramebuffers.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLDeleteFramebuffersFn ResolveGLDeleteFramebuffers() {
+  if (auto fn = CachedGLDeleteFramebuffers.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLDeleteFramebuffersFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glDeleteFramebuffers")));
+  CachedGLDeleteFramebuffers.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLBindFramebufferFn ResolveGLBindFramebuffer() {
+  if (auto fn = CachedGLBindFramebuffer.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLBindFramebufferFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glBindFramebuffer")));
+  CachedGLBindFramebuffer.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLFramebufferTexture2DFn ResolveGLFramebufferTexture2D() {
+  if (auto fn = CachedGLFramebufferTexture2D.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLFramebufferTexture2DFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glFramebufferTexture2D")));
+  CachedGLFramebufferTexture2D.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLCheckFramebufferStatusFn ResolveGLCheckFramebufferStatus() {
+  if (auto fn = CachedGLCheckFramebufferStatus.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLCheckFramebufferStatusFn>(
+      glXGetProcAddress(reinterpret_cast<const GLubyte*>("glCheckFramebufferStatus")));
+  CachedGLCheckFramebufferStatus.store(fn, std::memory_order_release);
+  return fn;
+}
+
+GLReadPixelsFn ResolveGLReadPixels() {
+  if (auto fn = CachedGLReadPixels.load(std::memory_order_acquire)) {
+    return fn;
+  }
+  auto fn = reinterpret_cast<GLReadPixelsFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glReadPixels")));
+  CachedGLReadPixels.store(fn, std::memory_order_release);
+  return fn;
+}
+
+bool GetTexImageBindingInfo(GLenum target, GLenum* bind_pname, GLenum* textarget) {
+  switch (target) {
+    case GL_TEXTURE_2D:
+      *bind_pname = GL_TEXTURE_BINDING_2D;
+      *textarget = GL_TEXTURE_2D;
+      return true;
+    case GL_TEXTURE_CUBE_MAP_POSITIVE_X:
+    case GL_TEXTURE_CUBE_MAP_NEGATIVE_X:
+    case GL_TEXTURE_CUBE_MAP_POSITIVE_Y:
+    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
+    case GL_TEXTURE_CUBE_MAP_POSITIVE_Z:
+    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
+      *bind_pname = GL_TEXTURE_BINDING_CUBE_MAP;
+      *textarget = target;
+      return true;
+    case GL_TEXTURE_1D:
+    case GL_PROXY_TEXTURE_1D:
+      *bind_pname = GL_TEXTURE_BINDING_2D;
+      *textarget = GL_TEXTURE_2D;
+      return true;
+    default:
+      return false;
+  }
+}
+
+void GLCompatClearDepth(GLdouble depth) {
+  (void)depth;
+
+  // Temporary compat fallback: skip glClearDepthf on Android/FEX because some
+  // drivers expose a callable entry that still resolves to a null target at
+  // runtime. This avoids a hard crash but can cause visual differences.
+  static std::atomic<uint32_t> warn_budget {1};
+  uint32_t remaining = warn_budget.load(std::memory_order_acquire);
+  while (remaining > 0 &&
+         !warn_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  if (remaining > 0) {
+    std::fprintf(stderr, "[SDL3 thunk] glClearDepth fallback: skipped (may cause visual differences)\n");
+  }
+}
+
+void GLCompatClearStencil(GLint s) {
+  (void)s;
+
+  // Temporary compat fallback: skip glClearStencil on Android/FEX because the
+  // resolved host trampoline can still branch through a null runtime target.
+  // This avoids a hard crash but can cause visual differences.
+  static std::atomic<uint32_t> warn_budget {1};
+  uint32_t remaining = warn_budget.load(std::memory_order_acquire);
+  while (remaining > 0 &&
+         !warn_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  if (remaining > 0) {
+    std::fprintf(stderr, "[SDL3 thunk] glClearStencil fallback: skipped (may cause visual differences)\n");
+  }
+}
+
+void GLCompatDepthRange(GLdouble z_near, GLdouble z_far) {
+  if (auto fn = ResolveGLDepthRangef()) {
+    fn(static_cast<GLfloat>(z_near), static_cast<GLfloat>(z_far));
+  }
+}
+
+GLPolygonModeFn ResolveGLPolygonMode() {
+  if (CachedGLPolygonModeResolved.load(std::memory_order_acquire)) {
+    return CachedGLPolygonMode.load(std::memory_order_acquire);
+  }
+
+  GLPolygonModeFn fn = reinterpret_cast<GLPolygonModeFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glPolygonMode")));
+  if (!fn) {
+    fn = reinterpret_cast<GLPolygonModeFn>(glXGetProcAddress(reinterpret_cast<const GLubyte*>("glPolygonModeEXT")));
+  }
+
+  CachedGLPolygonMode.store(fn, std::memory_order_release);
+  CachedGLPolygonModeResolved.store(true, std::memory_order_release);
+  return fn;
+}
+
+void GLCompatPolygonMode(GLenum face, GLenum mode) {
+  if (auto fn = ResolveGLPolygonMode()) {
+    fn(face, mode);
+    return;
+  }
+
+  // GLES has no polygon rasterization mode toggle; fill is default behavior.
+  // NOTE: This fallback can cause visual differences/artifacts versus desktop GL
+  // when the title expects line/point polygon modes.
+  if (mode == GL_FILL) {
+    return;
+  }
+
+  static std::atomic<uint32_t> warn_budget {16};
+  uint32_t remaining = warn_budget.load(std::memory_order_acquire);
+  while (remaining > 0 &&
+         !warn_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  if (remaining == 0) {
+    return;
+  }
+
+  std::fprintf(stderr, "[SDL3 thunk] glPolygonMode fallback ignored unsupported mode=0x%x\n", static_cast<unsigned>(mode));
+}
+
+void GLCompatTexImage1D(GLenum target,
+                        GLint level,
+                        GLint internalformat,
+                        GLsizei width,
+                        GLint border,
+                        GLenum format,
+                        GLenum type,
+                        const void* pixels) {
+  if (auto fn = ResolveGLTexImage2D()) {
+    GLenum target_2d = target;
+    if (target == GL_TEXTURE_1D || target == GL_PROXY_TEXTURE_1D) {
+      target_2d = GL_TEXTURE_2D;
+    }
+
+    // Compat note: 1D textures are emulated as 2D textures with height=1.
+    // This can cause rendering differences in titles that rely on strict
+    // desktop 1D texture behavior.
+    fn(target_2d, level, internalformat, width, 1, border, format, type, pixels);
+  }
+}
+
+void GLCompatTexImage2DMultisample(GLenum target,
+                                   GLsizei samples,
+                                   GLint internalformat,
+                                   GLsizei width,
+                                   GLsizei height,
+                                   GLboolean fixedsamplelocations) {
+  if (auto fn = ResolveGLTexImage2DMultisample()) {
+    fn(target, samples, static_cast<GLenum>(internalformat), width, height, fixedsamplelocations);
+    return;
+  }
+
+  if (auto fn = ResolveGLTexStorage2DMultisample()) {
+    // Compat fallback: immutable multisample storage path used when desktop
+    // glTexImage2DMultisample entry points are missing on GLES drivers.
+    fn(target, samples, static_cast<GLenum>(internalformat), width, height, fixedsamplelocations);
+  }
+}
+
+void GLCompatDrawBuffer(GLenum buf) {
+  if (auto fn = ResolveGLDrawBuffer()) {
+    fn(buf);
+    return;
+  }
+
+  if (auto fn = ResolveGLDrawBuffers()) {
+    GLenum mapped = buf;
+    switch (buf) {
+      case GL_FRONT:
+      case GL_FRONT_LEFT:
+      case GL_FRONT_RIGHT:
+      case GL_BACK_LEFT:
+      case GL_BACK_RIGHT:
+      case GL_LEFT:
+      case GL_RIGHT:
+        mapped = GL_BACK;
+        break;
+      default:
+        break;
+    }
+    fn(1, &mapped);
+    return;
+  }
+
+  // Last-resort fallback for default framebuffer semantics on GLES.
+  if (buf == GL_BACK || buf == GL_NONE) {
+    return;
+  }
+
+  static std::atomic<uint32_t> warn_budget {16};
+  uint32_t remaining = warn_budget.load(std::memory_order_acquire);
+  while (remaining > 0 &&
+         !warn_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  if (remaining == 0) {
+    return;
+  }
+
+  std::fprintf(stderr, "[SDL3 thunk] glDrawBuffer fallback ignored unsupported buf=0x%x\n", static_cast<unsigned>(buf));
+}
+
+void GLCompatGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data) {
+  if (!data || size <= 0) {
+    return;
+  }
+
+  if (auto fn = ResolveGLGetBufferSubData()) {
+    fn(target, offset, size, data);
+    return;
+  }
+
+  const auto map_buffer_range = ResolveGLMapBufferRange();
+  const auto unmap_buffer = ResolveGLUnmapBuffer();
+  if (!map_buffer_range || !unmap_buffer) {
+    return;
+  }
+
+  // Compat path for GLES: map read-only range and copy requested bytes.
+  void* mapped = map_buffer_range(target, offset, size, GL_MAP_READ_BIT);
+  if (!mapped) {
+    return;
+  }
+
+  std::memcpy(data, mapped, static_cast<size_t>(size));
+  unmap_buffer(target);
+}
+
+void GLCompatVertexAttribI2i(GLuint index, GLint x, GLint y) {
+  if (auto fn = ResolveGLVertexAttribI2i()) {
+    fn(index, x, y);
+    return;
+  }
+
+  if (auto fn = ResolveGLVertexAttribI4i()) {
+    // Compat fallback: widen ivec2 constant attribute assignment to ivec4.
+    fn(index, x, y, 0, 1);
+    return;
+  }
+
+  static std::atomic<uint32_t> warn_budget {16};
+  uint32_t remaining = warn_budget.load(std::memory_order_acquire);
+  while (remaining > 0 &&
+         !warn_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  if (remaining == 0) {
+    return;
+  }
+
+  std::fprintf(stderr, "[SDL3 thunk] glVertexAttribI2i fallback unavailable for index=%u\n", index);
+}
+
+void GLCompatGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint* params) {
+  if (!params) {
+    return;
+  }
+
+  if (auto fn = ResolveGLGetFramebufferAttachmentParameteriv()) {
+    fn(target, attachment, pname, params);
+    return;
+  }
+
+  // Fallback for drivers where the desktop query entry point isn't exposed.
+  // Values are conservative defaults and may cause visual differences.
+  switch (pname) {
+    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE:
+      *params = GL_NONE;
+      return;
+    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME:
+    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL:
+    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE:
+    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER:
+      *params = 0;
+      return;
+    case GL_FRAMEBUFFER_ATTACHMENT_RED_SIZE:
+    case GL_FRAMEBUFFER_ATTACHMENT_GREEN_SIZE:
+    case GL_FRAMEBUFFER_ATTACHMENT_BLUE_SIZE:
+    case GL_FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE:
+      *params = 8;
+      return;
+    case GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE:
+      *params = 24;
+      return;
+    case GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE:
+      *params = 8;
+      return;
+    case GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING:
+      *params = GL_LINEAR;
+      return;
+    case GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE:
+      *params = GL_UNSIGNED_NORMALIZED;
+      return;
+    default:
+      break;
+  }
+
+  *params = 0;
+}
+
+void GLCompatGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels) {
+  if (!pixels) {
+    return;
+  }
+
+  const auto get_tex_level_param = ResolveGLGetTexLevelParameteriv();
+  const auto get_integerv = ResolveGLGetIntegerv();
+  const auto gen_framebuffers = ResolveGLGenFramebuffers();
+  const auto delete_framebuffers = ResolveGLDeleteFramebuffers();
+  const auto bind_framebuffer = ResolveGLBindFramebuffer();
+  const auto framebuffer_texture_2d = ResolveGLFramebufferTexture2D();
+  const auto check_framebuffer_status = ResolveGLCheckFramebufferStatus();
+  const auto read_pixels = ResolveGLReadPixels();
+
+  if (!get_tex_level_param || !get_integerv || !gen_framebuffers || !delete_framebuffers ||
+      !bind_framebuffer || !framebuffer_texture_2d || !check_framebuffer_status || !read_pixels) {
+    return;
+  }
+
+  GLenum bind_pname {};
+  GLenum textarget {};
+  if (!GetTexImageBindingInfo(target, &bind_pname, &textarget)) {
+    return;
+  }
+
+  GLint texture = 0;
+  get_integerv(bind_pname, &texture);
+  if (texture == 0) {
+    return;
+  }
+
+  GLint width = 0;
+  GLint height = 1;
+  get_tex_level_param(target, level, GL_TEXTURE_WIDTH, &width);
+  if (width <= 0) {
+    return;
+  }
+
+  if (target != GL_TEXTURE_1D && target != GL_PROXY_TEXTURE_1D) {
+    get_tex_level_param(target, level, GL_TEXTURE_HEIGHT, &height);
+    if (height <= 0) {
+      return;
+    }
+  }
+
+  GLint prev_read_fbo = 0;
+  GLint prev_draw_fbo = 0;
+  get_integerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+  get_integerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+
+  GLuint fbo = 0;
+  gen_framebuffers(1, &fbo);
+  if (fbo == 0) {
+    return;
+  }
+
+  // Compat path: emulate glGetTexImage via FBO attachment + glReadPixels.
+  // This is close to desktop semantics but may still differ for some formats.
+  bind_framebuffer(GL_READ_FRAMEBUFFER, fbo);
+  bind_framebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+  framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, textarget, static_cast<GLuint>(texture), level);
+
+  if (check_framebuffer_status(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+    read_pixels(0, 0, width, height, format, type, pixels);
+  }
+
+  bind_framebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_read_fbo));
+  bind_framebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw_fbo));
+  delete_framebuffers(1, &fbo);
 }
 
 std::unordered_map<std::string, SDLPropertyValue>* FindPropertiesLocked(SDL_PropertiesID props) {
@@ -1205,11 +1948,94 @@ extern "C" void SDL_DestroyProperties(SDL_PropertiesID props) {
 }
 
 extern "C" SDL_GLContext SDL_GL_CreateContext(SDL_Window* window) {
-  return fexfn_pack_FEX_SDL_GL_CreateContext(window);
+  SDL_GLContext context = fexfn_pack_FEX_SDL_GL_CreateContext(window);
+  if (context) {
+    CurrentGLContextPointer.store(reinterpret_cast<uintptr_t>(context), std::memory_order_release);
+    CurrentGLWindowPointer.store(reinterpret_cast<uintptr_t>(window), std::memory_order_release);
+    GLLibraryLoaded.store(true, std::memory_order_release);
+  }
+  return context;
+}
+
+extern "C" bool SDL_GL_DestroyContext(SDL_GLContext context) {
+  fexfn_pack_FEX_SDL_GL_DeleteContext(context);
+  ClearCurrentGLStateIfMatching(context);
+  return true;
 }
 
 extern "C" void SDL_GL_DeleteContext(SDL_GLContext context) {
-  fexfn_pack_FEX_SDL_GL_DeleteContext(context);
+  (void)SDL_GL_DestroyContext(context);
+}
+
+extern "C" bool SDL_GL_LoadLibrary(const char*) {
+  GLLibraryLoaded.store(true, std::memory_order_release);
+  return true;
+}
+
+extern "C" void SDL_GL_UnloadLibrary() {
+  GLLibraryLoaded.store(false, std::memory_order_release);
+}
+
+extern "C" bool SDL_GL_ExtensionSupported(const char* extension) {
+  if (!extension || extension[0] == '\0') {
+    return false;
+  }
+  if (!GLLibraryLoaded.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  const char* all_extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+  if (!all_extensions || all_extensions[0] == '\0') {
+    return false;
+  }
+
+  const size_t ext_len = std::strlen(extension);
+  const char* search = all_extensions;
+  while (search) {
+    const char* match = std::strstr(search, extension);
+    if (!match) {
+      break;
+    }
+
+    const bool has_left_boundary = (match == all_extensions) || (match[-1] == ' ');
+    const char right = match[ext_len];
+    const bool has_right_boundary = (right == '\0') || (right == ' ');
+    if (has_left_boundary && has_right_boundary) {
+      return true;
+    }
+
+    search = match + ext_len;
+  }
+  return false;
+}
+
+extern "C" void SDL_GL_ResetAttributes() {
+  GLAttributesInitialized.store(false, std::memory_order_release);
+  EnsureGLAttributesInitialized();
+}
+
+extern "C" bool SDL_GL_MakeCurrent(SDL_Window* window, SDL_GLContext context) {
+  if (!window && !context) {
+    CurrentGLWindowPointer.store(0, std::memory_order_release);
+    CurrentGLContextPointer.store(0, std::memory_order_release);
+    return true;
+  }
+
+  if (!window || !context) {
+    return SDL_SetError("SDL_GL_MakeCurrent requires both window and context");
+  }
+
+  CurrentGLWindowPointer.store(reinterpret_cast<uintptr_t>(window), std::memory_order_release);
+  CurrentGLContextPointer.store(reinterpret_cast<uintptr_t>(context), std::memory_order_release);
+  return true;
+}
+
+extern "C" SDL_Window* SDL_GL_GetCurrentWindow() {
+  return reinterpret_cast<SDL_Window*>(CurrentGLWindowPointer.load(std::memory_order_acquire));
+}
+
+extern "C" SDL_GLContext SDL_GL_GetCurrentContext() {
+  return reinterpret_cast<SDL_GLContext>(CurrentGLContextPointer.load(std::memory_order_acquire));
 }
 
 extern "C" bool SDL_GL_SetAttribute(SDL_GLAttr attr, int value) {
@@ -1233,7 +2059,19 @@ extern "C" bool SDL_GL_GetAttribute(SDL_GLAttr attr, int* value) {
 }
 
 extern "C" bool SDL_GL_SetSwapInterval(int interval) {
-  return fexfn_pack_FEX_SDL_GL_SetSwapInterval(interval) != 0;
+  const bool success = fexfn_pack_FEX_SDL_GL_SetSwapInterval(interval) != 0;
+  if (success) {
+    CurrentSwapInterval.store(interval, std::memory_order_release);
+  }
+  return success;
+}
+
+extern "C" bool SDL_GL_GetSwapInterval(int* interval) {
+  if (!interval) {
+    return false;
+  }
+  *interval = CurrentSwapInterval.load(std::memory_order_acquire);
+  return true;
 }
 
 extern "C" bool SDL_GL_SwapWindow(SDL_Window* window) {
@@ -1245,16 +2083,134 @@ extern "C" SDL_FunctionPointer SDL_GL_GetProcAddress(const char* proc) {
     return nullptr;
   }
 
-  for (const auto& entry : GLProcTable) {
-    if (entry.Name == proc) {
-      return entry.Function;
+  const std::string_view proc_name {proc};
+
+  auto ReturnResolved = [&](void* resolved, const char* source) -> SDL_FunctionPointer {
+    TraceGLProcLookup(proc, resolved, source);
+    return reinterpret_cast<SDL_FunctionPointer>(resolved);
+  };
+
+  // Force runtime proc lookup for shader source so Android can route through
+  // libGL-host's custom shader translation path when available.
+  if (proc_name == "glShaderSource" || proc_name == "glShaderSourceARB") {
+    if (void* resolved = reinterpret_cast<void*>(glXGetProcAddress(reinterpret_cast<const GLubyte*>(proc)))) {
+      return ReturnResolved(resolved, "glXGetProcAddress(force-shadersource)");
     }
   }
 
-  if (std::string_view {proc} == "SDL_GL_GetProcAddress") {
-    return reinterpret_cast<SDL_FunctionPointer>(SDL_GL_GetProcAddress);
+  for (const auto& entry : GLProcTable) {
+    if (entry.Name == proc) {
+      return ReturnResolved(reinterpret_cast<void*>(entry.Function), "table");
+    }
   }
 
+  if (proc_name == "SDL_GL_GetProcAddress") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_GetProcAddress), "self");
+  }
+  if (proc_name == "SDL_GL_ExtensionSupported") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_ExtensionSupported), "self");
+  }
+  if (proc_name == "SDL_GL_LoadLibrary") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_LoadLibrary), "self");
+  }
+  if (proc_name == "SDL_GL_UnloadLibrary") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_UnloadLibrary), "self");
+  }
+  if (proc_name == "SDL_GL_ResetAttributes") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_ResetAttributes), "self");
+  }
+  if (proc_name == "SDL_GL_MakeCurrent") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_MakeCurrent), "self");
+  }
+  if (proc_name == "SDL_GL_GetCurrentWindow") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_GetCurrentWindow), "self");
+  }
+  if (proc_name == "SDL_GL_GetCurrentContext") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_GetCurrentContext), "self");
+  }
+  if (proc_name == "SDL_GL_GetSwapInterval") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_GetSwapInterval), "self");
+  }
+  if (proc_name == "SDL_GL_DestroyContext") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_DestroyContext), "self");
+  }
+  if (proc_name == "SDL_GL_DeleteContext") {
+    return ReturnResolved(reinterpret_cast<void*>(SDL_GL_DeleteContext), "self");
+  }
+  if (proc_name == "glClearDepth") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatClearDepth), "compat(glClearDepthf)");
+  }
+  if (proc_name == "glClearStencil") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatClearStencil), "compat(no-op)");
+  }
+  if (proc_name == "glDepthRange") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatDepthRange), "compat(glDepthRangef)");
+  }
+  if (proc_name == "glPolygonMode") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatPolygonMode), "compat(no-op)");
+  }
+  if (proc_name == "glTexImage1D") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatTexImage1D), "compat(glTexImage2D,h=1)");
+  }
+  if (proc_name == "glTexImage2DMultisample") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatTexImage2DMultisample), "compat(multisample)");
+  }
+  if (proc_name == "glDrawBuffer") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatDrawBuffer), "compat(drawbuffers)");
+  }
+  if (proc_name == "glGetBufferSubData") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatGetBufferSubData), "compat(mapbufferrange)");
+  }
+  if (proc_name == "glVertexAttribI2i") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatVertexAttribI2i), "compat(vertexattribi4i)");
+  }
+  if (proc_name == "glGetFramebufferAttachmentParameteriv") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatGetFramebufferAttachmentParameteriv), "compat(framebuffer-attach-query)");
+  }
+  if (proc_name == "glGetTexImage") {
+    return ReturnResolved(reinterpret_cast<void*>(GLCompatGetTexImage), "compat(glReadPixels)");
+  }
+
+  const bool is_gl_or_egl_proc = proc_name.rfind("gl", 0) == 0 || proc_name.rfind("egl", 0) == 0;
+  if (is_gl_or_egl_proc) {
+    if (void* resolved = reinterpret_cast<void*>(glXGetProcAddress(reinterpret_cast<const GLubyte*>(proc)))) {
+      return ReturnResolved(resolved, "glXGetProcAddress");
+    }
+
+    for (const char* alias : GetAndroidGLProcAliases(proc_name)) {
+      if (!alias) {
+        break;
+      }
+      if (void* resolved = reinterpret_cast<void*>(glXGetProcAddress(reinterpret_cast<const GLubyte*>(alias)))) {
+        return ReturnResolved(resolved, "glXGetProcAddress(alias)");
+      }
+    }
+  }
+
+  // If the GL thunk couldn't bridge a GL/EGL entry point then falling back to
+  // RTLD_DEFAULT only returns the guest-side export, which can still point at a
+  // null host function pointer.
+  if (is_gl_or_egl_proc) {
+    TraceGLProcLookup(proc, nullptr, "gl-miss");
+    return nullptr;
+  }
+
+  // Table miss fallback: let dynamic linker resolve GL symbols from libGL thunk.
+  if (void* resolved = dlsym(RTLD_DEFAULT, proc)) {
+    return ReturnResolved(resolved, "RTLD_DEFAULT");
+  }
+
+  static void* gl_handle = dlopen("libGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+  if (!gl_handle) {
+    gl_handle = dlopen("libGL.so", RTLD_NOW | RTLD_GLOBAL);
+  }
+  if (gl_handle) {
+    if (void* resolved = dlsym(gl_handle, proc)) {
+      return ReturnResolved(resolved, "libGL handle");
+    }
+  }
+
+  TraceGLProcLookup(proc, nullptr, "miss");
   return nullptr;
 }
 

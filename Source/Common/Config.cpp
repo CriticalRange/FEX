@@ -495,6 +495,7 @@ void LoadConfig(fextl::string ProgramName, char** const envp, const PortableInfo
 
   FEXCore::Config::AddLayer(CreateEnvironmentLayer(envp));
   FEXCore::Config::Load();
+  FEXCore::Config::ApplyAndroidConfigDefaults();
 }
 
 #ifndef _WIN32

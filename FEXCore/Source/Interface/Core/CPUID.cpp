@@ -105,6 +105,16 @@ uint32_t GetCPUID_Syscall() {
   return CPU;
 }
 
+static uint32_t NormalizeCPUIndex(uint32_t CPU, size_t CPUCount) {
+  if (CPUCount == 0) {
+    return 0;
+  }
+  if (CPU < CPUCount) {
+    return CPU;
+  }
+  return static_cast<uint32_t>(CPU % CPUCount);
+}
+
 struct CPUFamily {
   uint32_t Stepping         : 4;
   uint32_t Model            : 4;
@@ -824,8 +834,8 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_15h(uint32_t Leaf) const {
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_1Ah(uint32_t Leaf) const {
   FEXCore::CPUID::FunctionResults Res {};
-  if (Hybrid) {
-    uint32_t CPU = GetCPUID();
+  if (Hybrid && !PerCPUData.empty()) {
+    const uint32_t CPU = NormalizeCPUIndex(GetCPUID(), PerCPUData.size());
     auto& Data = PerCPUData[CPU];
     // 0x40 is a big CPU
     // 0x20 is a little CPU
@@ -1003,14 +1013,22 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf) con
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0002h(uint32_t Leaf, uint32_t CPU) const {
   FEXCore::CPUID::FunctionResults Res {};
-  auto& Data = PerCPUData[CPU];
+  if (PerCPUData.empty()) {
+    return Res;
+  }
+  const uint32_t SafeCPU = NormalizeCPUIndex(CPU, PerCPUData.size());
+  auto& Data = PerCPUData[SafeCPU];
   memcpy(&Res, Data.ProductName, std::min(strlen(Data.ProductName), sizeof(FEXCore::CPUID::FunctionResults)));
   return Res;
 }
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0003h(uint32_t Leaf, uint32_t CPU) const {
   FEXCore::CPUID::FunctionResults Res {};
-  auto& Data = PerCPUData[CPU];
+  if (PerCPUData.empty()) {
+    return Res;
+  }
+  const uint32_t SafeCPU = NormalizeCPUIndex(CPU, PerCPUData.size());
+  auto& Data = PerCPUData[SafeCPU];
   const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 16);
   memcpy(&Res, Data.ProductName + 16, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
   return Res;
@@ -1018,7 +1036,11 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0003h(uint32_t Leaf, uin
 
 FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf, uint32_t CPU) const {
   FEXCore::CPUID::FunctionResults Res {};
-  auto& Data = PerCPUData[CPU];
+  if (PerCPUData.empty()) {
+    return Res;
+  }
+  const uint32_t SafeCPU = NormalizeCPUIndex(CPU, PerCPUData.size());
+  auto& Data = PerCPUData[SafeCPU];
   const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 32);
   memcpy(&Res, Data.ProductName + 32, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
   return Res;
