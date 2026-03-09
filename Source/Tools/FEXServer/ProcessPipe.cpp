@@ -148,7 +148,7 @@ bool InitializeServerPipe() {
   if (Ret == -1 && errno == EEXIST) {
     // If the lock exists then it might be a stale connection.
     // Check the lock status to see if another process is still alive.
-    ServerLockFD = open(ServerLockPath.c_str(), O_RDWR | O_CLOEXEC, USER_PERMS);
+    ServerLockFD = open(ServerLockPath.c_str(), O_RDWR | O_CLOEXEC); // VEXA_FIXES unrelated but USER_PERMS was unnecessary here, just a warning removal
     if (ServerLockFD != -1) {
       // Now that we have opened the file, try to get a write lock.
       struct flock lk {

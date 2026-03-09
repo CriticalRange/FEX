@@ -111,7 +111,8 @@ void RegisterTime(FEX::HLE::SyscallHandler* Handler) {
       const struct timespec req64 = *req;
       Result = ::nanosleep(&req64, rem64_ptr);
     } else {
-      Result = ::nanosleep(nullptr, rem64_ptr);
+      timespec ignored_timespec {}; // VEXA_FIXES useless warning removal, it was returning nullptr instead
+      Result = ::nanosleep(&ignored_timespec, rem64_ptr);
     }
 
     if (rem) {

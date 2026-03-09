@@ -17,6 +17,11 @@
 #include <fcntl.h>
 #include <git_version.h>
 
+#ifdef __ANDROID__ // VEXA_FIXES For memfd_create workaround on shm_open and shm_unlink to work
+  #include <linux/memfd.h>
+  #include <sys/syscall.h>
+#endif
+
 namespace FEX::HLE {
 
 ThreadManager::StatAlloc::StatAlloc() {
@@ -29,10 +34,23 @@ void ThreadManager::StatAlloc::Initialize() {
     return;
   }
 
-  int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_CREAT | O_TRUNC | O_RDWR, USER_PERMS);
-  if (fd == -1) {
-    return;
-  }
+  #ifdef __ANDROID__ // VEXA_FIXES shm_open isn't available on Android/bionic libc so replacing it with memfd_create
+      if (StatsFD != -1) {
+        ::close(StatsFD);
+        StatsFD = -1;
+      }
+
+      auto Name = fextl::fmt::format("fex-{}-stats", ::getpid());
+      int fd = static_cast<int>(::syscall(SYS_memfd_create, Name.c_str(), MFD_CLOEXEC));
+      if (fd == -1) {
+        return;
+      }
+  #else
+      int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_CREAT | O_TRUNC | O_RDWR, USER_PERMS);
+      if (fd == -1) {
+        return;
+      };
+  #endif
   CurrentSize = sysconf(_SC_PAGESIZE);
   CurrentSize = CurrentSize > 0 ? CurrentSize : FEXCore::Utils::FEX_PAGE_SIZE;
 
@@ -66,8 +84,16 @@ void ThreadManager::StatAlloc::Initialize() {
     }
   }
 
+  #ifdef __ANDROID__
+    StatsFD = fd;
+    fd = -1;
+  #endif
+
 err:
+  if (fd != -1) {
   close(fd);
+  }
+  return;
 }
 
 uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
@@ -79,10 +105,18 @@ uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
   NewSize = std::min(MAX_STATS_SIZE, NewSize);
 
   // When allocating more slots, open the fd without O_TRUNC | O_CREAT.
-  int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_RDWR, USER_PERMS);
-  if (fd == -1) {
-    return CurrentSize;
-  }
+  #ifdef __ANDROID__ // VEXA_FIXES shm_open is already replaced above so just check if it exists, otherwise error
+      int fd = StatsFD;
+      if (fd == -1) {
+        LogMan::Msg::EFmt("[StatAlloc] StatsFD is invalid in FrontendAllocateSlots");
+        return CurrentSize;
+      }
+  #else
+      int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_RDWR, USER_PERMS);
+      if (fd == -1) {
+        return CurrentSize;
+      };
+  #endif
 
   if (ftruncate(fd, NewSize) == -1) {
     LogMan::Msg::EFmt("[StatAlloc] ftruncate more failed");
@@ -99,7 +133,9 @@ uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
   }
 
 err:
+#ifndef __ANDROID__
   close(fd);
+#endif
   return NewSize;
 }
 
@@ -118,7 +154,14 @@ void ThreadManager::StatAlloc::DeallocateSlot(FEXCore::SHMStats::ThreadStats* Al
 }
 
 void ThreadManager::StatAlloc::CleanupForExit() {
+  #ifdef __ANDROID__ // VEXA_FIXES shm_unlink unavailable in Android bionic libc so replacing it with the above implemented memfd_create workaround
+  if (StatsFD != -1) {
+    ::close(StatsFD);
+    StatsFD = -1;
+  }
+  #else
   shm_unlink(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str());
+  #endif
 }
 
 void ThreadManager::StatAlloc::LockBeforeFork() {

@@ -8,7 +8,7 @@ set(FEXCORE_BASE_SRCS
   Utils/LogManager.cpp
   Utils/SpinWaitLock.cpp)
 
-if (NOT MINGW)
+if (NOT MINGW OR NOT ANDROID) # VEXA_FIXES Android added for FEXCore_Base dependency to work with it.
   list(APPEND FEXCORE_BASE_SRCS
     Utils/Allocator/64BitAllocator.cpp)
 endif()
@@ -261,9 +261,9 @@ function(AddLibrary Name Type)
   add_library(${Name} ${Type} $<TARGET_OBJECTS:${PROJECT_NAME}_object>)
   set_target_properties(${Name} PROPERTIES OUTPUT_NAME FEXCore)
 
-  # During generation of the import library (dll.a), MinGW needs some extra symbols from libraries
+  # During generation of the import library (dll.a), MinGW and Android needs some extra symbols from libraries
   # such as fmt, which are propagated by FEXCore_Base. Wonderful.
-  if (MINGW)
+  if (MINGW OR ANDROID) # VEXA_FIXES Android added for FEXCore_Base dependency to link.
     target_link_libraries(${Name} FEXCore_Base)
   endif()
   AddDefaultOptionsToTarget(${Name})

@@ -20,8 +20,8 @@ option(ENABLE_ASSERTIONS "Enable debug assertions" FALSE)
 option(ENABLE_GDB_SYMBOLS "Enable GDBSymbols integration support" ${HAVE_GDB_JIT_READER_H})
 option(ENABLE_STRICT_WERROR "Enable stricter -Werror" FALSE)
 option(ENABLE_WERROR "Enable -Werror" FALSE)
-option(ENABLE_JEMALLOC "Enable jemalloc allocator" TRUE)
-option(ENABLE_JEMALLOC_GLIBC_ALLOC "Enable jemalloc glibc allocator" TRUE)
+option(ENABLE_JEMALLOC "Enable jemalloc allocator" FALSE) # Disabled, might make a scudo-aware replacement later
+option(ENABLE_JEMALLOC_GLIBC_ALLOC "Enable jemalloc glibc allocator" FALSE) # Disabled
 option(ENABLE_OFFLINE_TELEMETRY "Enable FEX offline telemetry" TRUE)
 option(ENABLE_COMPILE_TIME_TRACE "Enable time trace compile option" FALSE)
 option(ENABLE_LIBCXX "Use LLVM's libc++ instead of the GNU libstdc++" FALSE)
@@ -60,9 +60,9 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Unsupported pointer size ${CMAKE_SIZEOF_VOID_P}."
     " FEX only supports 64-bit (8-byte pointer) systems."
     " If you believe this is in error, file an issue.")
-elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ANDROID))
   message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
-    " FEX only supports Linux and Windows."
+    " FEX only supports Linux, Android and Windows."
     " If you believe this is in error, file an issue.")
 endif()
 
@@ -248,7 +248,9 @@ if (ENABLE_COMPILE_TIME_TRACE)
   link_libraries(-ftime-trace)
 endif()
 
-set(PTHREAD_LIB pthread)
+# VEXA_FIXES Keeps existing ${PTHREAD_LIB} call sites working, while on android this resolves to no extra flags/libs
+find_package(Threads REQUIRED)
+set(PTHREAD_LIB Threads::Threads)
 
 if (USE_LINKER)
   message(STATUS "Overriding linker to: ${USE_LINKER}")

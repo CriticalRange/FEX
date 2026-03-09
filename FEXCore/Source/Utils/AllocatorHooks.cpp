@@ -3,6 +3,8 @@
 #include <jemalloc/jemalloc.h>
 #endif
 
+#include <cerrno>
+
 #include <malloc.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -72,7 +74,20 @@ void* memalign(size_t align, size_t s) {
   return ::memalign(align, s);
 }
 void* valloc(size_t size) {
+  #ifdef __ANDROID__ // VEXA_FIXES Valloc isn't supported on most android devices, so this convenient posix memalign replacement shouldn't cause any issues
+  void* ptr {};
+  long page = ::sysconf(_SC_PAGESIZE);
+  size_t align = page > 0 ? static_cast<size_t>(page) : 4096u;
+  
+  int rc = ::posix_memalign(&ptr, align, size);
+  if (rc != 0) {
+    errno = rc;
+    return nullptr;
+  }
+  return ptr;
+  #else
   return ::valloc(size);
+  #endif
 }
 int posix_memalign(void** r, size_t a, size_t s) {
   return ::posix_memalign(r, a, s);

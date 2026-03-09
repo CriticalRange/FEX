@@ -18,6 +18,20 @@
 #include <array>
 #include <dlfcn.h>
 #include <elf.h>
+
+// VEXA_FIXES ELF_ST_VISIBILITY macro isn't available in NDK elf.h so implementing it the same as the source here https://gnu.googlesource.com/binutils-gdb/+/938b11989b5a4f20faa57deefb35f75093045f44/include/elf/common.h
+#ifndef ELF_ST_VISIBILITY
+#define ELF_ST_VISIBILITY(o) ((o) & 0x3)
+#endif
+
+#ifndef ELF32_ST_VISIBILITY
+#define ELF32_ST_VISIBILITY(o) ELF_ST_VISIBILITY(o)
+#endif
+
+#ifndef ELF64_ST_VISIBILITY
+#define ELF64_ST_VISIBILITY(o) ELF_ST_VISIBILITY(o)
+#endif
+
 #include <fcntl.h>
 #include <filesystem>
 #include <sys/auxv.h>

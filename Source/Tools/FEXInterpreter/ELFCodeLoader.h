@@ -64,8 +64,8 @@ class ELFCodeLoader final : public FEX::CodeLoader {
       }
 
       had_pt_load = true;
-      min_map_address = std::min(min_map_address, PAGE_START(it.p_vaddr));
-      max_map_address = std::max(max_map_address, it.p_vaddr + it.p_memsz);
+      min_map_address = std::min(min_map_address, static_cast<size_t>(PAGE_START(it.p_vaddr))); // VEXA_FIXES Static cast added
+      max_map_address = std::max(max_map_address, static_cast<size_t>(it.p_vaddr + it.p_memsz)); // VEXA_FIXES Static cast added
     }
 
     if (!had_pt_load) {
@@ -538,7 +538,7 @@ public:
 #define ASLR_LOAD
 #ifdef ASLR_LOAD
       // Only enable ASLR randomization if the personality has it enabled.
-      uint32_t Personality = personality(~0ULL);
+      uint32_t Personality = personality(0xFFFFFFFFu); // VEXA_FIXES ~0ULL was causing errors, same thing
       bool NoRandomize = (Personality & ADDR_NO_RANDOMIZE) == ADDR_NO_RANDOMIZE;
 
       if (!NoRandomize) {

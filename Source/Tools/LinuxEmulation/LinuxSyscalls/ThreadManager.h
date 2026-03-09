@@ -29,7 +29,11 @@ $end_info$
 #include <optional>
 #include <sys/stat.h>
 
-#include <bits/types/sigset_t.h>
+#ifdef __ANDROID__ // VEXA_FIXES sigset type is available in NDK inside signal.h so importing it instead.
+  #include <signal.h>
+#else
+  #include <bits/types/sigset_t.h>
+#endif
 #include <linux/seccomp.h>
 
 namespace FEX::HLE {
@@ -157,6 +161,10 @@ public:
 
     constexpr static int USER_PERMS = S_IRWXU | S_IRWXG | S_IRWXO;
     FEXCore::ForkableUniqueMutex StatMutex;
+
+    #ifdef __ANDROID__ // VEXA_FIXES
+      int StatsFD {-1};
+    #endif
   };
 
   void CleanupForExit() {

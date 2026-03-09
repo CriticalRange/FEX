@@ -8,15 +8,13 @@
 import re
 import sys
 
-def GetCPUFeatures():
-    File = open("/proc/cpuinfo", "r")
-    Lines = File.readlines()
-    File.close()
+def GetCPUFeatures(): # VEXA FIXES
+      with open("/proc/cpuinfo", "r") as file:
+          for line in file:
+              if "Features" in line:
+                  return line.split(":")[1].strip().split()
 
-    for Line in Lines:
-        if "Features" in Line:
-            Features = Line.split(":")[1].strip().split(" ")
-            return Features
+      return []
 
 SnapdragonIDsWithDisabledSVE = {
     # Snapdragon 8 Gen 3

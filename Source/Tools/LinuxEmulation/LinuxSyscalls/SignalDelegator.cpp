@@ -553,6 +553,33 @@ static bool IsAsyncSignal(const siginfo_t* Info, int Signal) {
   return true;
 }
 
+static uint64_t SigSetToU64(const sigset_t& Set) { // VEXA_FIXES Converts host sigset_t to FEX's portable 64-bit mask without libc-specific field access.
+  uint64_t mask {};
+  for (int sig = 1; sig <= 64; ++sig) {
+    int member = ::sigismember(&Set, sig);
+    if (member == 1) {
+      mask |= (1ULL << (sig - 1));
+    } else if (member == -1) {
+      LogMan::Msg::EFmt("[SignalDelegator] sigismember failed for sig {}", sig);
+    }
+  }
+  return mask;
+}
+
+static sigset_t U64ToSigSet(uint64_t mask) { // VEXA_FIXES: Rebuilds host sigset_t from FEX's 64-bit mask using POSIX signal-set APIs.
+  sigset_t set {};
+  ::sigemptyset(&set);
+  const int max_sig = std::min(64, _NSIG - 1);
+  for (int sig = 1; sig <= max_sig; ++sig) {
+    if (mask & (1ULL << (sig - 1))) {
+      if (::sigaddset(&set, sig) == -1) {
+        LogMan::Msg::EFmt("[SignalDelegator] sigaddset failed for sig {}", sig);
+      }
+    }
+  }
+  return set;
+}
+
 uint64_t SignalDelegator::GetNewSigMask(int Signal) const {
   const SignalHandler& Handler = HostHandlers[Signal];
   // Set up a new mask based on this signals signal mask
@@ -617,7 +644,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       Signal = Top.Signal;
       SigInfo = Top.Info;
       // sig mask has been updated at the defer time, recover the original mask
-      memcpy(&_context->uc_sigmask, &Top.SigMask, sizeof(uint64_t));
+      _context->uc_sigmask = U64ToSigSet(Top.SigMask);
       ThreadObject->SignalInfo.DeferredSignalFrames.pop_back();
 
       // Until we re-protect the page to PROT_NONE, FEX will now *permanently* defer signals and /not/ check them.
@@ -648,18 +675,19 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
                        "Deferred signals vector hit "
                        "capacity size. This will "
                        "likely crash! Asserting now!");
-
+    // VEXA_FIXES sigset_t is libc-implementation-defined (__val on glibc, different layout on bionic),
+    // so convert through sigset APIs instead of touching internal fields directly.
     ThreadObject->SignalInfo.DeferredSignalFrames.emplace_back(ThreadStateObject::DeferredSignalState {
       .Info = SigInfo,
       .Signal = Signal,
-      .SigMask = _context->uc_sigmask.__val[0],
+      .SigMask = SigSetToU64(_context->uc_sigmask),
     });
 
     uint64_t NewMask = GetNewSigMask(Signal);
 
     // Update our host signal mask so we don't hit race conditions with signals
     // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
-    memcpy(&_context->uc_sigmask, &NewMask, sizeof(uint64_t));
+    _context->uc_sigmask = U64ToSigSet(NewMask);
 
     // Now update the faulting page permissions so it will fault on write.
     mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
@@ -697,7 +725,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
 
       // Update our host signal mask so we don't hit race conditions with signals
       // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
-      memcpy(&_context->uc_sigmask, &NewMask, sizeof(uint64_t));
+      _context->uc_sigmask = U64ToSigSet(NewMask);
 
       // We handled this signal, continue running
       return;
