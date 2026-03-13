@@ -104,7 +104,10 @@ public:
 
   bool ReplaceEmuFd(int fd, int flags, uint32_t mode);
 
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+// VEXA_FIXES: Keep tracked-FD bookkeeping enabled on Android even when ASSERTIONS are off.
+// VEXA_FIXES: Android production builds still need this to prevent guest close()/close_range()
+// VEXA_FIXES: from tearing down FEX-owned descriptors (RootFSFD, server sockets, log sinks).
+#if defined(__ANDROID__) || (defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED)
   void TrackFEXFD(int FD) noexcept {
     std::lock_guard lk(FEXTrackingFDMutex);
     FEXTrackingFDs.emplace(FD);
@@ -150,7 +153,7 @@ public:
 #endif
 
 private:
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+#if defined(__ANDROID__) || (defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED)
   mutable std::mutex FEXTrackingFDMutex;
   fextl::set<int> FEXTrackingFDs;
 #endif

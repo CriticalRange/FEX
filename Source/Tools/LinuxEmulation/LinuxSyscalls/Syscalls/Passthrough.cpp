@@ -307,9 +307,23 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(timer_getoverrun, SyscallPassthrough1<SYSCALL_DEF(timer_getoverrun)>);
   REGISTER_SYSCALL_IMPL(timer_delete, SyscallPassthrough1<SYSCALL_DEF(timer_delete)>);
   REGISTER_SYSCALL_IMPL(tgkill, SyscallPassthrough3<SYSCALL_DEF(tgkill)>);
+#if defined(__ANDROID__)
+  // VEXA_FIXES: Android seccomp can trap host NUMA policy syscalls.
+  // VEXA_FIXES: Return ENOSYS so guest treats NUMA APIs as unsupported instead of crashing.
+  REGISTER_SYSCALL_IMPL(mbind, [](FEXCore::Core::CpuStateFrame* /*Frame*/, uint64_t /*start*/, uint64_t /*len*/, uint64_t /*mode*/, uint64_t /*nodemask*/, uint64_t /*maxnode*/, uint64_t /*flags*/) -> uint64_t {
+    return -ENOSYS;
+  });
+  REGISTER_SYSCALL_IMPL(set_mempolicy, [](FEXCore::Core::CpuStateFrame* /*Frame*/, uint64_t /*mode*/, uint64_t /*nodemask*/, uint64_t /*maxnode*/) -> uint64_t {
+    return -ENOSYS;
+  });
+  REGISTER_SYSCALL_IMPL(get_mempolicy, [](FEXCore::Core::CpuStateFrame* /*Frame*/, uint64_t /*mode*/, uint64_t /*nodemask*/, uint64_t /*maxnode*/, uint64_t /*addr*/, uint64_t /*flags*/) -> uint64_t {
+    return -ENOSYS;
+  });
+#else
   REGISTER_SYSCALL_IMPL(mbind, SyscallPassthrough6<SYSCALL_DEF(mbind)>);
   REGISTER_SYSCALL_IMPL(set_mempolicy, SyscallPassthrough3<SYSCALL_DEF(set_mempolicy)>);
   REGISTER_SYSCALL_IMPL(get_mempolicy, SyscallPassthrough5<SYSCALL_DEF(get_mempolicy)>);
+#endif
   REGISTER_SYSCALL_IMPL(mq_unlink, SyscallPassthrough1<SYSCALL_DEF(mq_unlink)>);
   REGISTER_SYSCALL_IMPL(add_key, SyscallPassthrough5<SYSCALL_DEF(add_key)>);
   REGISTER_SYSCALL_IMPL(request_key, SyscallPassthrough4<SYSCALL_DEF(request_key)>);
@@ -318,7 +332,15 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(ioprio_get, SyscallPassthrough3<SYSCALL_DEF(ioprio_get)>);
   REGISTER_SYSCALL_IMPL(inotify_add_watch, SyscallPassthrough3<SYSCALL_DEF(inotify_add_watch)>);
   REGISTER_SYSCALL_IMPL(inotify_rm_watch, SyscallPassthrough2<SYSCALL_DEF(inotify_rm_watch)>);
+#if defined(__ANDROID__)
+  // VEXA_FIXES: Android seccomp can trap host migrate_pages.
+  // VEXA_FIXES: Return ENOSYS to keep guest alive when NUMA migration is unavailable.
+  REGISTER_SYSCALL_IMPL(migrate_pages, [](FEXCore::Core::CpuStateFrame* /*Frame*/, uint64_t /*pid*/, uint64_t /*maxnode*/, uint64_t /*old_nodes*/, uint64_t /*new_nodes*/) -> uint64_t {
+    return -ENOSYS;
+  });
+#else
   REGISTER_SYSCALL_IMPL(migrate_pages, SyscallPassthrough4<SYSCALL_DEF(migrate_pages)>);
+#endif
   REGISTER_SYSCALL_IMPL(mkdirat, SyscallPassthrough3<SYSCALL_DEF(mkdirat)>);
   REGISTER_SYSCALL_IMPL(mknodat, SyscallPassthrough4<SYSCALL_DEF(mknodat)>);
   REGISTER_SYSCALL_IMPL(fchownat, SyscallPassthrough5<SYSCALL_DEF(fchownat)>);
@@ -330,7 +352,15 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(unshare, SyscallPassthrough1<SYSCALL_DEF(unshare)>);
   REGISTER_SYSCALL_IMPL(splice, SyscallPassthrough6<SYSCALL_DEF(splice)>);
   REGISTER_SYSCALL_IMPL(tee, SyscallPassthrough4<SYSCALL_DEF(tee)>);
+#if defined(__ANDROID__)
+  // VEXA_FIXES: Android seccomp can trap host move_pages.
+  // VEXA_FIXES: Return ENOSYS to keep guest alive when NUMA migration is unavailable.
+  REGISTER_SYSCALL_IMPL(move_pages, [](FEXCore::Core::CpuStateFrame* /*Frame*/, uint64_t /*pid*/, uint64_t /*count*/, uint64_t /*pages*/, uint64_t /*nodes*/, uint64_t /*status*/, uint64_t /*flags*/) -> uint64_t {
+    return -ENOSYS;
+  });
+#else
   REGISTER_SYSCALL_IMPL(move_pages, SyscallPassthrough6<SYSCALL_DEF(move_pages)>);
+#endif
   REGISTER_SYSCALL_IMPL(timerfd_create, SyscallPassthrough2<SYSCALL_DEF(timerfd_create)>);
   REGISTER_SYSCALL_IMPL(accept4, SyscallPassthrough4<SYSCALL_DEF(accept4)>);
   REGISTER_SYSCALL_IMPL(eventfd2, SyscallPassthrough2<SYSCALL_DEF(eventfd2)>);
@@ -469,8 +499,35 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(waitid, SyscallPassthrough5<SYSCALL_DEF(waitid)>);
     REGISTER_SYSCALL_IMPL_X64(pselect6, SyscallPassthrough6<SYSCALL_DEF(pselect6)>);
     REGISTER_SYSCALL_IMPL_X64(ppoll, SyscallPassthrough5<SYSCALL_DEF(ppoll)>);
+#if defined(__ANDROID__)
+    // VEXA_FIXES: Android host may reject robust-list syscalls in translated guests.
+    // VEXA_FIXES: Keep guest-visible robust-list state inside FEX thread metadata so
+    // VEXA_FIXES: runtimes using pthread robust futexes don't crash on host syscall denial.
+    REGISTER_SYSCALL_IMPL_X64(
+      set_robust_list, [](FEXCore::Core::CpuStateFrame* Frame, struct robust_list_head* head, size_t len) -> uint64_t {
+        if (len != sizeof(*head)) {
+          return -EINVAL;
+        }
+
+        auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+        ThreadObject->ThreadInfo.robust_list_head = reinterpret_cast<uint64_t>(head);
+        return 0;
+      });
+
+    REGISTER_SYSCALL_IMPL_X64(
+      get_robust_list, [](FEXCore::Core::CpuStateFrame* Frame, int /*pid*/, struct robust_list_head** head, size_t* len_ptr) -> uint64_t {
+        FaultSafeUserMemAccess::VerifyIsWritable(head, sizeof(*head));
+        FaultSafeUserMemAccess::VerifyIsWritable(len_ptr, sizeof(*len_ptr));
+
+        auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+        *head = reinterpret_cast<struct robust_list_head*>(ThreadObject->ThreadInfo.robust_list_head);
+        *len_ptr = sizeof(**head);
+        return 0;
+      });
+#else
     REGISTER_SYSCALL_IMPL_X64(set_robust_list, SyscallPassthrough2<SYSCALL_DEF(set_robust_list)>);
     REGISTER_SYSCALL_IMPL_X64(get_robust_list, SyscallPassthrough3<SYSCALL_DEF(get_robust_list)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(sync_file_range, SyscallPassthrough4<SYSCALL_DEF(sync_file_range)>);
     REGISTER_SYSCALL_IMPL_X64(vmsplice, SyscallPassthrough4<SYSCALL_DEF(vmsplice)>);
     REGISTER_SYSCALL_IMPL_X64(utimensat, SyscallPassthrough4<SYSCALL_DEF(utimensat)>);

@@ -41,10 +41,73 @@ $end_info$
 #include <system_error>
 #include <unistd.h>
 #include <utility>
+#include <limits>
+#include <sys/resource.h>
 
 #include <tiny-json.h>
 
+// VEXA_FIXES: Android compatibility helper for close_range().
+// VEXA_FIXES: On Android we must preserve FEX-owned FDs while still honoring guest intent
+// VEXA_FIXES: to close broad FD ranges. This closes non-tracked FDs and skips tracked ones.
+static uint64_t CloseRangeSkipTracked(FEX::HLE::FileManager* FM, unsigned int first, unsigned int last) {
+  if (last != std::numeric_limits<unsigned int>::max() && first > last) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  unsigned int end = last;
+  if (last == std::numeric_limits<unsigned int>::max()) {
+    struct rlimit rl {};
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0) {
+      end = static_cast<unsigned int>(rl.rlim_cur - 1);
+    } else {
+      // Best-effort fallback if RLIMIT lookup fails.
+      end = 65535;
+    }
+  }
+
+  for (unsigned int fd = first; fd <= end; ++fd) {
+    if (!FM->CheckIfFDInTrackedSet(static_cast<int>(fd))) {
+      ::close(static_cast<int>(fd));
+    }
+    if (fd == std::numeric_limits<unsigned int>::max()) {
+      break;
+    }
+  }
+
+  return 0;
+}
+
 namespace FEX::HLE {
+// VEXA_FIXES: Android compatibility shim for openat2.
+// VEXA_FIXES: Some Android policies trap openat2 (SIGSYS). For Android we emulate
+// VEXA_FIXES: supported openat2 behavior with openat and preserve key validations.
+static int OpenAt2Compat(int dirfd, const char* path, const open_how* how, size_t usize) {
+#if defined(__ANDROID__)
+  (void)usize;
+
+  // Keep strictness where possible.
+  constexpr uint64_t kSupportedResolve = RESOLVE_IN_ROOT;
+  if ((how->resolve & ~kSupportedResolve) != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  // openat2 would reject mode unless O_CREAT/O_TMPFILE is set.
+  if (!(how->flags & (O_CREAT | O_TMPFILE)) && how->mode != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  const mode_t mode = static_cast<mode_t>(how->mode & 07777);
+  return static_cast<int>(::syscall(SYSCALL_DEF(openat), dirfd, path, static_cast<int>(how->flags), mode));
+#else
+  return static_cast<int>(::syscall(SYSCALL_DEF(openat2), dirfd, path, how, usize));
+#endif
+}
+
+
+
 bool FileManager::RootFSPathExists(const char* Filepath) const {
   LOGMAN_THROW_A_FMT(Filepath && Filepath[0] == '/', "Filepath needs to be absolute");
   return FHU::Filesystem::ExistsAt(RootFSFD, Filepath + 1);
@@ -663,7 +726,7 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
         .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,    // AT_FDCWD means it's a thunk and not via RootFS
       };
-      fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
+      fd = OpenAt2Compat(Path.FD, Path.Path, &how, sizeof(how)); // VEXA_FIXES: Android-safe openat2 shim.
 
       if (fd == -1 && errno == EXDEV) {
         // This means a magic symlink (/proc/foo) was involved. In this case we
@@ -685,27 +748,49 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
   return fd;
 }
 
+// VEXA_FIXES Android-only compatibility guard:
+// Some guests sweep FDs (close/close_range) and may hit FEX internal descriptors
+// (for example RootFSFD). On Android we block closing tracked internal FDs to keep
+// runtime state alive. Non-Android behavior is unchanged: tracked FDs can still be
+// closed and are removed from the tracking set before close.
 uint64_t FileManager::Close(int fd) {
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   if (CheckIfFDInTrackedSet(fd)) {
+    #if defined(__ANDROID__)
+    #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+      LogMan::Msg::IFmt("{} blocking close of tracked FEX FD {}", __func__, fd);
+    #endif
+      return 0;
+    #else
+    #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+      LogMan::Msg::IFmt("{} closing FEX FD {}", __func__, fd);
+    #endif
     LogMan::Msg::EFmt("{} closing FEX FD {}", __func__, fd);
-    RemoveFEXFD(fd);
-  }
-#endif
+      RemoveFEXFD(fd);
+    #endif
+    }
 
-  return ::close(fd);
+    return ::close(fd);
 }
 
+// See FileManager::Close() comment above.
+// Same Android compatibility policy applies here: when close_range would include
+// tracked internal FDs, we avoid closing those descriptors on Android and close
+// only non-tracked FDs in the requested range.
 uint64_t FileManager::CloseRange(unsigned int first, unsigned int last, unsigned int flags) {
 #ifndef CLOSE_RANGE_CLOEXEC
 #define CLOSE_RANGE_CLOEXEC (1U << 2)
 #endif
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-  if (!(flags & CLOSE_RANGE_CLOEXEC) && CheckIfFDRangeInTrackedSet(first, last)) {
-    LogMan::Msg::EFmt("{} closing FEX FDs in range ({}, {})", __func__, first, last);
-    RemoveFEXFDRange(first, last);
+
+  // VEXA_FIXES: Convert UINT_MAX close_range upper bound into "unbounded" sentinel for set checks.
+  const int tracked_last = (last == std::numeric_limits<unsigned int>::max()) ? -1 : static_cast<int>(last);
+
+  // VEXA_FIXES: On Android, block destructive close_range over tracked FEX FDs.
+  if (!(flags & CLOSE_RANGE_CLOEXEC) && CheckIfFDRangeInTrackedSet(static_cast<int>(first), tracked_last)) {
+    #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+    LogMan::Msg::EFmt("{} blocking close_range over tracked FDs ({} {})", __func__, first, last);
+    #endif
+    return CloseRangeSkipTracked(this, first, last);
   }
-#endif
 
   return ::syscall(SYSCALL_DEF(close_range), first, last, flags);
 }
@@ -917,7 +1002,7 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
         .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this,
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,    // AT_FDCWD means it's a thunk and not via RootFS
       };
-      fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, &how, sizeof(how));
+      fd = OpenAt2Compat(Path.FD, Path.Path, &how, sizeof(how)); // VEXA_FIXES: Android-safe openat2 shim.
       if (fd == -1 && errno == EXDEV) {
         // This means a magic symlink (/proc/foo) was involved. In this case we
         // just punt and do the access without RESOLVE_IN_ROOT.
@@ -949,26 +1034,27 @@ uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_ho
     auto Path = GetEmulatedFDPath(dirfs, SelfPath, false, TmpFilename);
     if (Path.FD != -1 && !(how->resolve & RESOLVE_IN_ROOT)) {
       // AT_FDCWD means it's a thunk and not via RootFS
+      auto LocalHow = *how;
       if (Path.FD != AT_FDCWD) {
-        how->resolve |= RESOLVE_IN_ROOT;
+        LocalHow.resolve |= RESOLVE_IN_ROOT;
       }
-      fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, how, usize);
-      how->resolve &= ~RESOLVE_IN_ROOT;
+      fd = OpenAt2Compat(Path.FD, Path.Path, &LocalHow, usize);
       if (fd == -1 && errno == EXDEV) {
         // This means a magic symlink (/proc/foo) was involved. In this case we
         // just punt and do the access without RESOLVE_IN_ROOT.
-        fd = ::syscall(SYSCALL_DEF(openat2), Path.FD, Path.Path, how, usize);
+        auto FallbackHow = *how;
+        fd = OpenAt2Compat(Path.FD, Path.Path, &FallbackHow, usize);
       }
     }
 
     // Open through RootFS failed (probably nonexistent), so open directly.
     if (fd == -1) {
-      fd = ::syscall(SYSCALL_DEF(openat2), dirfs, SelfPath, how, usize);
+      fd = OpenAt2Compat(dirfs, SelfPath, how, usize);
     }
 
     ReplaceEmuFd(fd, how->flags, how->mode);
   } else {
-    fd = ::syscall(SYSCALL_DEF(openat2), dirfs, SelfPath, how, usize);
+    fd = OpenAt2Compat(dirfs, SelfPath, how, usize);
   }
 
   return fd;
