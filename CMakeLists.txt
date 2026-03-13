@@ -4,6 +4,11 @@ project(FEX C CXX ASM)
 include(CheckIncludeFiles)
 check_include_files("gdb/jit-reader.h" HAVE_GDB_JIT_READER_H)
 
+option(ENABLE_DESKTOP_GL_THUNKS "Build desktop GLX/EGL thunk libs" ON) # VEXA_FIXES Disables desktop GLX/EGL thunk libs for Android
+option(ENABLE_EGL_THUNKS "Build EGL thunk libs" ON) # VEXA_FIXES Disable EGL thunks for Android bring-up; EGL will be replaced by custom runtime path
+option(ENABLE_VULKAN_THUNKS "Build Vulkan thunk libs" ON) # VEXA_FIXES Hytale bring-up is OpenGL-first; Vulkan thunks pull in Linux desktop headers (eg xcb) not present in Android NDK
+option(ENABLE_WAYLAND_THUNKS "Build Wayland thunk libs" ON) # VEXA_FIXES Disable Wayland thunks for Android cross-builds without wayland headers
+option(ENABLE_VDSO_THUNKS "Build VDSO thunk libs" ON) # VEXA_FIXES Temporarily disable VDSO thunk generation in Android bring-up
 option(BUILD_FEX_LINUX_TESTS "Build FEXLinuxTests (requires x86 compiler)" FALSE)
 option(BUILD_THUNKS "Build thunks" FALSE)
 option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
@@ -36,11 +41,21 @@ option(ENABLE_GLIBC_ALLOCATOR_HOOK_FAULT "Enables glibc memory allocation hookin
 option(USE_PDB_DEBUGINFO "Build debug info in PDB format" FALSE)
 option(BUILD_STEAM_SUPPORT "Enable Steam integration" FALSE)
 
+if (ANDROID)
+  # VEXA_FIXES: Android path is using custom runtime integration, not stock EGL thunk.
+  set(ENABLE_EGL_THUNKS OFF CACHE BOOL "Build EGL thunk libs" FORCE)
+  # VEXA_FIXES: Android build environments don't provide Linux desktop Wayland headers/libs.
+  set(ENABLE_WAYLAND_THUNKS OFF CACHE BOOL "Build Wayland thunk libs" FORCE)
+  # VEXA_FIXES: VDSO thunk generation currently conflicts on Android NDK gettimeofday prototype.
+  set(ENABLE_VDSO_THUNKS OFF CACHE BOOL "Build VDSO thunk libs" FORCE)
+endif()
+
 set(X86_32_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_32.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting i686")
 set(X86_64_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_64.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting x86_64")
 set(X86_DEV_ROOTFS "/" CACHE FILEPATH "Path to the sysroot used for cross-compiling for i686 and x86_64")
 set(DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(HOSTLIBS_DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
+set(THUNKGEN_EXECUTABLE "" CACHE FILEPATH "Path to host-built thunkgen for cross builds") # VEXA_FIXES: Android cross-builds cannot execute a target-built thunkgen binary for the guest arch; use a host-built thunkgen path explicitly.
 
 if (NOT DATA_DIRECTORY)
   set(DATA_DIRECTORY "${CMAKE_INSTALL_PREFIX}/share/fex-emu")
@@ -568,55 +583,79 @@ if (BUILD_TESTING)
   add_subdirectory(unittests/)
 endif()
 
+# VEXA_FIXES: Android build flow needs host-built thunkgen + configurable thunk feature gates.
+# This block keeps the native Linux flow unchanged while allowing Android cross-builds
+# to disable unsupported desktop thunk families without patching generated sources each run.
 if (BUILD_THUNKS)
-  set(FEX_PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR})
-  add_subdirectory(ThunkLibs/Generator)
+    set(FEX_PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR})
 
-  # Thunk targets for both host libraries and IDE integration
-  add_subdirectory(ThunkLibs/HostLibs)
+    if (CMAKE_CROSSCOMPILING)
+      # VEXA_FIXES: In cross mode, `$<TARGET_FILE:thunkgen>` points at a binary not runnable on host.
+      # Require an explicit host thunkgen executable so interface generation still works.
+      if (NOT THUNKGEN_EXECUTABLE)
+        message(FATAL_ERROR "THUNKGEN_EXECUTABLE must be set for cross builds when BUILD_THUNKS=ON")
+      endif()
+      set(GENERATOR_EXE "${THUNKGEN_EXECUTABLE}")
+      set(THUNKGEN_DEPENDS "")
+      else()
+        add_subdirectory(ThunkLibs/Generator)
+        set(GENERATOR_EXE "$<TARGET_FILE:thunkgen>")
+        set(THUNKGEN_DEPENDS thunkgen)
+      endif()
 
-  # Thunk targets for IDE integration of guest code, only
-  add_subdirectory(ThunkLibs/GuestLibs)
+    add_subdirectory(ThunkLibs/HostLibs)
+    add_subdirectory(ThunkLibs/GuestLibs)
 
-  # Thunk targets for guest libraries
-  include(ExternalProject)
-  ExternalProject_Add(guest-libs
-    PREFIX guest-libs
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
-    BINARY_DIR "Guest"
-    CMAKE_ARGS
+    include(ExternalProject)
+    # VEXA_FIXES: Pass Android-specific thunk feature toggles into guest thunk sub-builds.
+    ExternalProject_Add(guest-libs
+      PREFIX guest-libs
+      SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
+      BINARY_DIR "Guest"
+      CMAKE_ARGS
       "-DBITNESS=64"
       "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-      "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
-      "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
-      "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_64_TOOLCHAIN_FILE}"
-      "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
-      "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
-      "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
-      "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
-    INSTALL_COMMAND ""
-    BUILD_ALWAYS ON
-    DEPENDS thunkgen)
+      "-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
+        "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
+        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
+        "-DENABLE_EGL_THUNKS=${ENABLE_EGL_THUNKS}"
+        "-DENABLE_VULKAN_THUNKS=${ENABLE_VULKAN_THUNKS}"
+        "-DENABLE_VDSO_THUNKS=${ENABLE_VDSO_THUNKS}"
+        "-DENABLE_WAYLAND_THUNKS=${ENABLE_WAYLAND_THUNKS}"
+  "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_64_TOOLCHAIN_FILE}"
+  "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
+  "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
+        "-DGENERATOR_EXE=${GENERATOR_EXE}"
+        "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+      INSTALL_COMMAND ""
+      BUILD_ALWAYS ON
+      DEPENDS ${THUNKGEN_DEPENDS})
 
-  ExternalProject_Add(guest-libs-32
-    PREFIX guest-libs-32
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
-    BINARY_DIR "Guest_32"
-    CMAKE_ARGS
-      "-DBITNESS=32"
-      "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-      "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
-      "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
-      "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
-      "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
-      "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
-      "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
-      "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
-    INSTALL_COMMAND ""
-    BUILD_ALWAYS ON
-    DEPENDS thunkgen)
+    # VEXA_FIXES: Mirror thunk feature toggles for 32-bit guest thunk sub-build.
+    ExternalProject_Add(guest-libs-32
+      PREFIX guest-libs-32
+      SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
+      BINARY_DIR "Guest_32"
+      CMAKE_ARGS
+        "-DBITNESS=32"
+        "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+"-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
+  "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
+        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
+        "-DENABLE_EGL_THUNKS=${ENABLE_EGL_THUNKS}"
+        "-DENABLE_VULKAN_THUNKS=${ENABLE_VULKAN_THUNKS}"
+        "-DENABLE_VDSO_THUNKS=${ENABLE_VDSO_THUNKS}"
+        "-DENABLE_WAYLAND_THUNKS=${ENABLE_WAYLAND_THUNKS}"
+  "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
+  "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
+  "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
+        "-DGENERATOR_EXE=${GENERATOR_EXE}"
+        "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+      INSTALL_COMMAND ""
+      BUILD_ALWAYS ON
+      DEPENDS ${THUNKGEN_DEPENDS})
 
-  install(
+    install(
     CODE "message(\"-- Installing: guest-libs\")"
     CODE "
       execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
@@ -642,7 +681,7 @@ if (BUILD_THUNKS)
 
   add_dependencies(uninstall uninstall_guest-libs)
   add_dependencies(uninstall uninstall_guest-libs-32)
-endif()
+  endif()
 
 if (BUILD_STEAM_SUPPORT)
   add_subdirectory(Source/Steam/)

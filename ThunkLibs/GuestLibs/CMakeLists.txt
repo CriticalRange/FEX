@@ -43,7 +43,11 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   endif()
 else()
   # We've been included using add_subdirectory, so set up targets for IDE integration using the host toolchain
-  set(GENERATOR_EXE thunkgen)
+# VEXA_FIXES: Allow add_subdirectory users to inject a host-runnable thunkgen binary path.
+# This avoids hard-coding `thunkgen` when cross builds use externally prepared generator artifacts.
+  if (NOT DEFINED GENERATOR_EXE OR GENERATOR_EXE STREQUAL "")
+    set(GENERATOR_EXE thunkgen)
+  endif()
   set(TARGET_TYPE OBJECT)
   set(GENERATE_GUEST_INSTALL_TARGETS FALSE)
   set(BITNESS 64)
@@ -177,8 +181,11 @@ if (BITNESS EQUAL 64)
   #generate(libfex_malloc)
   #add_guest_lib(fex_malloc)
 
-  generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp)
-  add_guest_lib(asound "libasound.so.2")
+  # VEXA_FIXES: Disable ALSA guest thunk for Android bring-up. We will replace it with openal-soft thunk.
+  if (NOT ANDROID)
+    generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp)
+    add_guest_lib(asound "libasound.so.2")
+  endif()
 
   # disabled for now, headers are platform specific
   # find_package(SDL2 REQUIRED)
@@ -188,46 +195,62 @@ if (BITNESS EQUAL 64)
   # target_link_libraries(SDL2-guest PRIVATE GL)
   # target_link_libraries(SDL2-guest PRIVATE dl)
 
-  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
-  target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
-  add_guest_lib(vulkan "libvulkan.so.1")
+  # VEXA_FIXES: Disable Vulkan thunk build when not needed (Hytale is OpenGL-first).
+  # Vulkan thunk path pulls Linux desktop headers from Vulkan-Headers (eg xcb),
+  # which are not available in Android NDK cross-build environments.
+  if (ENABLE_VULKAN_THUNKS)
+    generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
+    target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+    add_guest_lib(vulkan "libvulkan.so.1")
+  endif()
 
-  generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
-  target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
-  target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
-  add_guest_lib(drm "libdrm.so.2")
+  # VEXA_FIXES: Disable DRM guest thunk for Android bring-up.
+  if (NOT ANDROID)
+    generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
+    target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
+    target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
+    add_guest_lib(drm "libdrm.so.2")
+  endif()
 endif()
 
-generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)
-add_guest_lib(wayland-client "libwayland-client.so.0.20.0")
-target_include_directories(libwayland-client-guest-deps INTERFACE /usr/include/wayland)
+  # VEXA_FIXES: Keep Wayland guest thunk optional because Android toolchains/rootfs setups
+  # usually don't provide desktop Wayland headers and SONAME surface expected by Linux guests.
+  if (ENABLE_WAYLAND_THUNKS)
+    generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)
+    add_guest_lib(wayland-client "libwayland-client.so.0.20.0")
+    target_include_directories(libwayland-client-guest-deps INTERFACE /usr/include/wayland)
+  endif()
 
-generate(libVDSO ${CMAKE_CURRENT_SOURCE_DIR}/../libVDSO/libVDSO_interface.cpp)
-add_guest_lib(VDSO "linux-vdso.so.1")
-# Can't use a stack protector because otherwise cross-compiling fails
-# Not necessary anyway because it only trampolines
-target_compile_options(VDSO-guest PRIVATE "-fno-stack-protector")
-target_link_options(VDSO-guest PRIVATE "-nostdlib" "LINKER:--no-undefined" "LINKER:-z,max-page-size=4096" "LINKER:--hash-style=both")
+if (ENABLE_VDSO_THUNKS)
+  # VEXA_FIXES: Make VDSO thunk optional during Android bring-up because Android NDK
+  # libc prototype differences (notably gettimeofday arg2) can conflict with generated aliases.
+  generate(libVDSO ${CMAKE_CURRENT_SOURCE_DIR}/../libVDSO/libVDSO_interface.cpp)
+  add_guest_lib(VDSO "linux-vdso.so.1")
+  # Can't use a stack protector because otherwise cross-compiling fails
+  # Not necessary anyway because it only trampolines
+  target_compile_options(VDSO-guest PRIVATE "-fno-stack-protector")
+  target_link_options(VDSO-guest PRIVATE "-nostdlib" "LINKER:--no-undefined" "LINKER:-z,max-page-size=4096" "LINKER:--hash-style=both")
 
-if (BITNESS EQUAL 32)
-  # 32-bit entrypoint points to __kernel_vsyscall and needs to exist
-  target_link_options(VDSO-guest PRIVATE "LINKER:-e,__kernel_vsyscall")
-  # 32-bit VDSO needs to have PIC disabled.
-  # Otherwise GCC/Clang generates GOT prologues on the functions that corrupt vsyscall.
-  # Correct:
-  # 00000350 <__kernel_vsyscall>:
-  #  350:   cd 80                   int    0x80
-  #  352:   c3                      ret
-  #  353:   0f 0b                   ud2
-  # Incorrect:
-  # 0000032a <__kernel_vsyscall>:
-  #  32a:   e8 0b 00 00 00          call   33a <__x86.get_pc_thunk.ax>
-  #  32f:   05 79 03 00 00          add    eax,0x379
-  #  334:   cd 80                   int    0x80
-  #  336:   c3                      ret
-  #  337:   90                      nop
-  #  338:   0f 0b                   ud2
-  target_compile_options(VDSO-guest PRIVATE "-fno-pic")
+  if (BITNESS EQUAL 32)
+    # 32-bit entrypoint points to __kernel_vsyscall and needs to exist
+    target_link_options(VDSO-guest PRIVATE "LINKER:-e,__kernel_vsyscall")
+    # 32-bit VDSO needs to have PIC disabled.
+    # Otherwise GCC/Clang generates GOT prologues on the functions that corrupt vsyscall.
+    # Correct:
+    # 00000350 <__kernel_vsyscall>:
+    #  350:   cd 80                   int    0x80
+    #  352:   c3                      ret
+    #  353:   0f 0b                   ud2
+    # Incorrect:
+    # 0000032a <__kernel_vsyscall>:
+    #  32a:   e8 0b 00 00 00          call   33a <__x86.get_pc_thunk.ax>
+    #  32f:   05 79 03 00 00          add    eax,0x379
+    #  334:   cd 80                   int    0x80
+    #  336:   c3                      ret
+    #  337:   90                      nop
+    #  338:   0f 0b                   ud2
+    target_compile_options(VDSO-guest PRIVATE "-fno-pic")
+  endif()
 endif()
 
 if (BUILD_FEX_LINUX_TESTS)
@@ -235,15 +258,28 @@ if (BUILD_FEX_LINUX_TESTS)
   add_guest_lib(fex_thunk_test "libfex_thunk_test.so")
 endif()
 
-generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)
-add_guest_lib(GL "libGL.so.1")
+# VEXA_FIXES: Desktop GL guest thunks depend on Linux GL/X11 ABI; keep optional for Android builds.
+if (ENABLE_DESKTOP_GL_THUNKS)
+    generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../
+  libGL/libGL_interface.cpp)
+    add_guest_lib(GL "libGL.so.1")
 
-generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp)
-add_guest_lib(EGL "libEGL.so.1")
-target_link_libraries(EGL-guest PRIVATE GL-guest)
+    if (ENABLE_EGL_THUNKS)
+      # VEXA_FIXES: Keep EGL guest thunk optional for Android-focused bring-up.
+      generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../
+    libEGL/libEGL_interface.cpp)
+      add_guest_lib(EGL "libEGL.so.1")
+      target_link_libraries(EGL-guest PRIVATE GL-guest)
+    endif()
 
-# libGL must pull in libX11.so, so generate a placeholder libX11.so to link against
+    # VEXA_FIXES: libGL guest thunk requires an X11 SONAME during link; keep placeholder scoped to desktop GL path.
+    # libGL must pull in libX11.so, so generate a placeholder libX11.so to link against
 add_library(PlaceholderX11 SHARED ../libX11/libX11_NativeGuest.cpp)
 target_link_options(PlaceholderX11 PRIVATE "LINKER:-soname,libX11.so.6")
 set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
 target_link_libraries(GL-guest PRIVATE PlaceholderX11)
+  else()
+    # VEXA_FIXES: Explicit status log helps confirm desktop GL guest thunk path is intentionally disabled.
+    message(STATUS "Desktop GLX guest thunks
+  disabled")
+  endif()

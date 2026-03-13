@@ -5,6 +5,12 @@ include(${FEX_PROJECT_SOURCE_DIR}/Data/CMake/version_to_variables.cmake)
 set(CMAKE_CXX_STANDARD 20)
 option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
+# VEXA_FIXES: Allow caller to provide a prebuilt host thunkgen path.
+# This is required when the overall build is cross-compiling and target thunkgen binaries can't run on host.
+if (NOT DEFINED GENERATOR_EXE OR GENERATOR_EXE STREQUAL "")
+  set(GENERATOR_EXE thunkgen)
+endif()
+
 if (ENABLE_CLANG_THUNKS)
   set(LD_OVERRIDE "-fuse-ld=lld")
   add_link_options(${LD_OVERRIDE})
@@ -47,11 +53,19 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(BITNESS_FLAGS "-for-32bit-guest")
   endif()
 
+  # VEXA_FIXES: Support both target thunkgen (native builds) and absolute host thunkgen path (cross builds).
+  set(THUNKGEN_INPUT_DEPENDS "")
+  if (TARGET thunkgen)
+    set(THUNKGEN_INPUT_DEPENDS thunkgen)
+  elseif (IS_ABSOLUTE "${GENERATOR_EXE}")
+    set(THUNKGEN_INPUT_DEPENDS "${GENERATOR_EXE}")
+  endif()
+
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${SOURCE_FILE}"
-    DEPENDS thunkgen
-    COMMAND thunkgen "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
+    DEPENDS ${THUNKGEN_INPUT_DEPENDS}
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -104,6 +118,8 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   #generate(libfex_malloc)
   #add_host_lib(fex_malloc ${GUEST_BITNESS})
 
+  # VEXA_FIXES: ALSA/DRM host thunks require Linux desktop headers not provided by Android NDK toolchains.
+  if (NOT ANDROID)
   generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
   add_host_lib(asound ${GUEST_BITNESS})
 
@@ -117,6 +133,7 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
   add_host_lib(drm ${GUEST_BITNESS})
+  endif()
 endforeach()
 
 set(BITNESS_LIST "32;64")
@@ -126,22 +143,37 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
     add_host_lib(fex_thunk_test ${GUEST_BITNESS})
   endif()
 
-  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
-  target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
-  add_host_lib(vulkan ${GUEST_BITNESS})
+  # VEXA_FIXES: Disable Vulkan thunk build when not needed (Hytale is OpenGL-first).
+  # Vulkan thunk path pulls Linux desktop headers from Vulkan-Headers (eg xcb),
+  # which are not available in Android NDK cross-build environments.
+  if (ENABLE_VULKAN_THUNKS)
+    generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
+    target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+    add_host_lib(vulkan ${GUEST_BITNESS})
+  endif()
 
-  generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(wayland-client ${GUEST_BITNESS})
-  target_include_directories(libwayland-client-${GUEST_BITNESS}-deps INTERFACE /usr/include/wayland)
+  # VEXA_FIXES: Disable Wayland host thunk build for Android cross-builds without wayland-client headers.
+  if (ENABLE_WAYLAND_THUNKS AND NOT ANDROID)
+    generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp ${GUEST_BITNESS})
+    add_host_lib(wayland-client ${GUEST_BITNESS})
+    target_include_directories(libwayland-client-${GUEST_BITNESS}-deps INTERFACE /usr/include/wayland)
+  endif()
 
-  generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(EGL ${GUEST_BITNESS})
+  # VEXA_FIXES: Keep EGL host thunk optional for Android-focused bring-up.
+  if (ENABLE_EGL_THUNKS)
+    generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp ${GUEST_BITNESS})
+    add_host_lib(EGL ${GUEST_BITNESS})
+  endif()
 
+  # VEXA_FIXES: Desktop GL host thunk depends on Linux OpenGL/GLX stack, which is unavailable for Android targets.
+  # Keep this behind a feature flag + non-Android guard.
+  if (ENABLE_DESKTOP_GL_THUNKS AND NOT ANDROID) 
   generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp ${GUEST_BITNESS})
   add_host_lib(GL ${GUEST_BITNESS})
 
   find_package(OpenGL REQUIRED)
   target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE OpenGL::GL)
+  endif()
 endforeach()
 
 if (BUILD_FEX_LINUX_TESTS)
