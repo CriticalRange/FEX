@@ -4,6 +4,12 @@ include(${FEX_PROJECT_SOURCE_DIR}/Data/CMake/version_to_variables.cmake)
 
 option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
+# VEXA_FIXES: These prefixes point to Android-built dependency bundles used by
+# the thunk parser/compiler (headers) during cross-build.
+set(VEXA_SDL3_PREFIX "" CACHE PATH "SDL3 Android prefix")
+set(VEXA_SDL3_IMAGE_PREFIX "" CACHE PATH "SDL3_image Android prefix")
+set(VEXA_OPENAL_PREFIX "" CACHE PATH "OpenAL Android prefix")
+
 if (ENABLE_CLANG_THUNKS)
   set(LD_OVERRIDE "-fuse-ld=lld")
   add_link_options(${LD_OVERRIDE})
@@ -186,6 +192,24 @@ if (BITNESS EQUAL 64)
     generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp)
     add_guest_lib(asound "libasound.so.2")
   endif()
+
+  # VEXA_FIXES: Add SDL3 guest thunk so guest SDL3 imports resolve through FEX thunking
+  # to Android host SDL3 implementation.
+  generate(libSDL3 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_interface.cpp)
+  add_guest_lib(SDL3 "libSDL3.so")
+  target_include_directories(libSDL3-guest-deps INTERFACE ${VEXA_SDL3_PREFIX}/include)
+
+  # VEXA_FIXES: Add SDL3_image guest thunk for image-loading API parity used by SDL3 stacks.
+  generate(libSDL3_image ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3_image/libSDL3_image_interface.cpp)
+  add_guest_lib(SDL3_image "libSDL3_image.so")
+  target_include_directories(libSDL3_image-guest-deps INTERFACE
+  ${VEXA_SDL3_PREFIX}/include
+  ${VEXA_SDL3_IMAGE_PREFIX}/include)
+
+  # VEXA_FIXES: Add OpenAL guest thunk to replace ALSA-centric guest audio on Android.
+  generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp)
+  add_guest_lib(openal "libopenal.so.1")
+  target_include_directories(libopenal-guest-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
 
   # disabled for now, headers are platform specific
   # find_package(SDL2 REQUIRED)

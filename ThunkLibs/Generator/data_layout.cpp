@@ -5,6 +5,8 @@
 #include <fmt/format.h>
 
 #include <openssl/sha.h>
+#include <cctype>
+#include <string_view>
 
 constexpr bool enable_debug_output = false;
 
@@ -195,6 +197,33 @@ static std::array<uint8_t, 32> GetSha256(const std::string& function_name) {
   return sha256;
 };
 
+// VEXA_FIXES: Thunk generator sees some C headers as "_Bool" in clang type strings.
+// Generated thunk code is compiled as C++, where "_Bool" can fail in declarations.
+// Normalize standalone "_Bool" tokens to "bool" to keep generated code portable.
+static bool IsIdentChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static std::string NormalizeTypeForCPP(std::string type_name) {
+  static constexpr std::string_view BoolToken {"_Bool"};
+  static constexpr std::string_view CppBool {"bool"};
+
+  size_t pos = 0;
+  while ((pos = type_name.find(BoolToken.data(), pos, BoolToken.size())) != std::string::npos) {
+    const bool left_ok = (pos == 0) || !IsIdentChar(type_name[pos - 1]);
+    const size_t right_idx = pos + BoolToken.size();
+    const bool right_ok = (right_idx == type_name.size()) || !IsIdentChar(type_name[right_idx]);
+    if (left_ok && right_ok) {
+      type_name.replace(pos, BoolToken.size(), CppBool);
+      pos += CppBool.size();
+    } else {
+      pos += BoolToken.size();
+    }
+  }
+
+  return type_name;
+}
+
 std::string GetTypeNameWithFixedSizeIntegers(clang::ASTContext& context, clang::QualType type) {
   if (type->isBuiltinType() && type->isIntegerType()) {
     auto size = context.getTypeSize(type);
@@ -205,7 +234,7 @@ std::string GetTypeNameWithFixedSizeIntegers(clang::ASTContext& context, clang::
     auto size = context.getTypeSize(type->getPointeeType());
     return fmt::format("uint{}_t*", size);
   } else {
-    return type.getAsString();
+    return NormalizeTypeForCPP(type.getAsString());
   }
 }
 
@@ -222,7 +251,7 @@ void AnalyzeDataLayoutAction::OnAnalysisComplete(clang::ASTContext& context) {
     FuncPtrInfo info = {cb_sha256};
 
     // TODO: Also apply GetTypeNameWithFixedSizeIntegers here
-    info.result = func_type->getReturnType().getAsString();
+    info.result = NormalizeTypeForCPP(func_type->getReturnType().getAsString());
 
     for (auto arg : func_type->getParamTypes()) {
       info.args.push_back(GetTypeNameWithFixedSizeIntegers(context, arg));

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <numeric>
 #include <iostream>
+#include <cctype>
 #include <string_view>
 #include <unordered_map>
 #include <variant>
@@ -55,6 +56,32 @@ static std::string format_function_args(const FunctionParams& params, Fn&& forma
   ret.resize(ret.size() > 2 ? ret.size() - 2 : 0);
   return ret;
 };
+
+static bool IsIdentChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+// VEXA_FIXES: Clang can spell C bool as "_Bool" when parsing C-facing headers.
+// VEXA_FIXES: Thunk .inl files are compiled as C++, so normalize that token.
+static std::string NormalizeTypeForCPP(std::string type_name) {
+  static constexpr std::string_view BoolToken {"_Bool"};
+  static constexpr std::string_view CppBool {"bool"};
+
+  size_t pos = 0;
+  while ((pos = type_name.find(BoolToken.data(), pos, BoolToken.size())) != std::string::npos) {
+    const bool left_ok = (pos == 0) || !IsIdentChar(type_name[pos - 1]);
+    const size_t right_idx = pos + BoolToken.size();
+    const bool right_ok = (right_idx == type_name.size()) || !IsIdentChar(type_name[right_idx]);
+    if (left_ok && right_ok) {
+      type_name.replace(pos, BoolToken.size(), CppBool);
+      pos += CppBool.size();
+    } else {
+      pos += BoolToken.size();
+    }
+  }
+
+  return type_name;
+}
 
 // Custom sort algorithm that works with partial orders.
 //
@@ -220,7 +247,7 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
       fmt::print(file, "    data {{\n");
       auto map_field = [&file](clang::FieldDecl* member, bool skip_arrays) {
         auto decl_name = member->getNameAsString();
-        auto type_name = member->getType().getAsString();
+        auto type_name = NormalizeTypeForCPP(member->getType().getAsString());
         auto array_type = llvm::dyn_cast<clang::ConstantArrayType>(member->getType());
         if (!array_type && skip_arrays) {
           if (member->getType()->isFunctionPointerType()) {
@@ -358,7 +385,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       // Function pointer declarations (e.g. void (**callback)()) require
       // the variable name to be prefixed *and* suffixed.
 
-      auto signature = type.getAsString();
+      auto signature = NormalizeTypeForCPP(type.getAsString());
 
       // Search for strings like (*), (**), or (*****). Insert the
       // variable name before the closing parenthesis
@@ -380,7 +407,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         return signature;
       }
     } else {
-      return type.getAsString() + " " + std::string(name);
+      return NormalizeTypeForCPP(type.getAsString()) + " " + std::string(name);
     }
   };
 
@@ -435,9 +462,10 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       }
 
       // Thunk used for guest-side calls to host function pointers
-      file << "  // " << funcptr_signature << "\n";
+      file << "  // " << NormalizeTypeForCPP(funcptr_signature) << "\n";
       auto funcptr_idx = std::distance(thunked_funcptrs.begin(), type_it);
-      fmt::print(file, "  MAKE_CALLBACK_THUNK(callback_{}, {}, \"{:#02x}\");\n", funcptr_idx, funcptr_signature, fmt::join(cb_sha256, ", "));
+      fmt::print(file, "  MAKE_CALLBACK_THUNK(callback_{}, {}, \"{:#02x}\");\n", funcptr_idx, NormalizeTypeForCPP(funcptr_signature),
+                 fmt::join(cb_sha256, ", "));
     }
 
     // Thunks-internal packing functions
@@ -451,7 +479,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         file << (idx == 0 ? "" : ", ") << format_decl(type, fmt::format("a_{}", idx));
       }
       // Using trailing return type as it makes handling function pointer returns much easier
-      file << ") -> " << data.return_type.getAsString() << " {\n";
+      file << ") -> " << NormalizeTypeForCPP(data.return_type.getAsString()) << " {\n";
       file << "  struct __attribute__((packed)) {\n";
       for (std::size_t idx = 0; idx < data.param_types.size(); ++idx) {
         auto& type = data.param_types[idx];
@@ -498,7 +526,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         auto& type = data.param_types[idx];
         file << (idx == 0 ? "" : ", ") << format_decl(type, "a_" + std::to_string(idx));
       }
-      file << ") -> " << data.return_type.getAsString() << ";\n";
+      file << ") -> " << NormalizeTypeForCPP(data.return_type.getAsString()) << ";\n";
     }
     file << "}\n";
 
@@ -526,7 +554,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       const auto& function_name = import.function_name;
       const char* variadic_ellipsis = import.is_variadic ? ", ..." : "";
       file << "using fexldr_type_" << libname << "_" << function_name << " = auto (" << format_function_params(import) << variadic_ellipsis
-           << ") -> " << import.return_type.getAsString() << ";\n";
+           << ") -> " << NormalizeTypeForCPP(import.return_type.getAsString()) << ";\n";
       file << "static fexldr_type_" << libname << "_" << function_name << " *fexldr_ptr_" << libname << "_" << function_name << ";\n";
     }
 
@@ -539,7 +567,8 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         if (cb.is_stub) {
           const char* variadic_ellipsis = cb.is_variadic ? ", ..." : "";
           auto cb_function_name = "fexfn_unpack_" + get_callback_name(function_name, cb_idx) + "_stub";
-          file << "[[noreturn]] static " << cb.return_type.getAsString() << " " << cb_function_name << "(" << format_function_params(cb)
+          file << "[[noreturn]] static " << NormalizeTypeForCPP(cb.return_type.getAsString()) << " " << cb_function_name << "("
+               << format_function_params(cb)
                << variadic_ellipsis << ") {\n";
           file << "  fprintf(stderr, \"FATAL: Attempted to invoke callback stub for " << function_name << "\\n\");\n";
           file << "  std::abort();\n";
@@ -557,7 +586,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
           return fmt::format("{}{}*", type->getPointeeType().isConstQualified() ? "const " : "",
                              get_fixed_size_int_name(type->getPointeeType().getTypePtr(), size));
         } else {
-          return type.getUnqualifiedType().getAsString();
+          return NormalizeTypeForCPP(type.getUnqualifiedType().getAsString());
         }
       };
 
@@ -577,7 +606,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         }
         // Using trailing return type as it makes handling function pointer returns much easier
         bool is_passthrough_ret = thunk.param_annotations[-1].is_passthrough;
-        fmt::print(file, ") -> {}{}{};\n", is_passthrough_ret ? "guest_layout<" : "", thunk.return_type.getAsString(),
+        fmt::print(file, ") -> {}{}{};\n", is_passthrough_ret ? "guest_layout<" : "", NormalizeTypeForCPP(thunk.return_type.getAsString()),
                    is_passthrough_ret ? ">" : "");
       }
 
@@ -685,7 +714,9 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       if (!thunk.return_type->isVoidType()) {
         fmt::print(file, "  args->rv = ");
         if (!thunk.return_type->isFunctionPointerType() && !thunk.param_annotations[-1].is_passthrough) {
-          fmt::print(file, "to_guest(to_host_layout<{}>(", thunk.return_type.getAsString());
+          // VEXA_FIXES: Use the same normalized guest-facing type as the packed rv field.
+          // This avoids signedness/type-alias mismatches (eg ALCboolean char vs int8_t).
+          fmt::print(file, "to_guest(to_host_layout<{}>(", get_guest_type_name(thunk.return_type));
         }
       }
       fmt::print(file, "{}(", function_to_call);
@@ -743,7 +774,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       FuncPtrInfo info = {};
 
       // TODO: Use GetTypeNameWithFixedSizeIntegers
-      info.result = func_type->getReturnType().getAsString();
+      info.result = NormalizeTypeForCPP(func_type->getReturnType().getAsString());
 
       // NOTE: In guest contexts, integer types must be mapped to
       //       fixed-size equivalents. Since this is a host context, this

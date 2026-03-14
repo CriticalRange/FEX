@@ -5,6 +5,12 @@ include(${FEX_PROJECT_SOURCE_DIR}/Data/CMake/version_to_variables.cmake)
 set(CMAKE_CXX_STANDARD 20)
 option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
+# VEXA_FIXES: These prefixes point to Android-built host-side dependency trees.
+# They provide headers/libs for generating and compiling host thunks for SDL3/SDL3_image/OpenAL.
+set(VEXA_SDL3_PREFIX "" CACHE PATH "SDL3 Android prefix")
+set(VEXA_SDL3_IMAGE_PREFIX "" CACHE PATH "SDL3_image Android prefix")
+set(VEXA_OPENAL_PREFIX "" CACHE PATH "OpenAL Android prefix")
+
 # VEXA_FIXES: Allow caller to provide a prebuilt host thunkgen path.
 # This is required when the overall build is cross-compiling and target thunkgen binaries can't run on host.
 if (NOT DEFINED GENERATOR_EXE OR GENERATOR_EXE STREQUAL "")
@@ -120,8 +126,8 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
 
   # VEXA_FIXES: ALSA/DRM host thunks require Linux desktop headers not provided by Android NDK toolchains.
   if (NOT ANDROID)
-  generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(asound ${GUEST_BITNESS})
+    generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
+    add_host_lib(asound ${GUEST_BITNESS})
 
   # disabled for now, headers are platform specific
   # find_package(SDL2 REQUIRED)
@@ -133,6 +139,29 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
   add_host_lib(drm ${GUEST_BITNESS})
+  endif()
+  if (ANDROID)
+    # VEXA_FIXES: Build Android host thunks for SDL3 so guest `libSDL3` imports route
+    # to the Android SDL3 host library through FEX thunk bridge.
+    generate(libSDL3 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_interface.cpp ${GUEST_BITNESS})
+
+    target_include_directories(libSDL3-${GUEST_BITNESS}-deps INTERFACE ${VEXA_SDL3_PREFIX}/include)
+    add_host_lib(SDL3 ${GUEST_BITNESS})
+
+    # VEXA_FIXES: Build SDL3_image host thunk for image API parity expected by SDL3-based guests.
+    generate(libSDL3_image
+      ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3_image/libSDL3_image_interface.cpp ${GUEST_BITNESS})
+
+    target_include_directories(libSDL3_image-${GUEST_BITNESS}-deps INTERFACE
+      ${VEXA_SDL3_PREFIX}/include
+      ${VEXA_SDL3_IMAGE_PREFIX}/include)
+    add_host_lib(SDL3_image ${GUEST_BITNESS})
+
+    # VEXA_FIXES: Build OpenAL host thunk as Android audio path replacement for ALSA-oriented guests.
+    generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp ${GUEST_BITNESS})
+
+    target_include_directories(libopenal-${GUEST_BITNESS}-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
+    add_host_lib(openal ${GUEST_BITNESS})
   endif()
 endforeach()
 

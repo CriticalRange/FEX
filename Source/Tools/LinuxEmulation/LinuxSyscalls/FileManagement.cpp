@@ -553,6 +553,29 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
     dirfd = AT_FDCWD;
   }
 
+  // VEXA_FIXES: Some guests probe library names through openat with a non-AT_FDCWD
+  // dirfd (eg /proc) and a relative filename (eg "SDL3.so").
+  // Resolve "dirfd + relative" and match overlays before the generic early-return.
+  if (pathname[0] != '/' && dirfd != AT_FDCWD) {
+    char DirPath[PATH_MAX + 1] {};
+    const auto DirLen = FEX::get_fdpath(dirfd, DirPath);
+    if (DirLen > 0) {
+      DirPath[DirLen] = '\0';
+      if (DirPath[0] == '/') {
+        fextl::string Combined {DirPath};
+        if (!Combined.ends_with('/')) {
+          Combined.push_back('/');
+        }
+        Combined += pathname;
+
+        auto thunkOverlay = ThunkOverlays.find(Combined);
+        if (thunkOverlay != ThunkOverlays.end()) {
+          return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
+        }
+      }
+    }
+  }
+
   if (pathname[0] != '/' || // If relative
       pathname[1] == 0 ||   // If we are getting root
       dirfd != AT_FDCWD) {  // If dirfd isn't special FDCWD
