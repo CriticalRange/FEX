@@ -823,8 +823,33 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     // This follows how these libraries get loaded in a non-emulated environment,
     // Either by directly linking to the library or a loader (In OpenGL or Vulkan) putting everything in the global namespace.
     file << "  fexldr_ptr_" << libname << "_so = dlopen(\"" << library_filename << "\", RTLD_GLOBAL | RTLD_LAZY);\n";
-
-    file << "  if (!fexldr_ptr_" << libname << "_so) { return false; }\n\n";
+    file << "#if defined(__ANDROID__)\n";
+    file << "  // VEXA_FIXES: Android linker namespaces often don't resolve app-private\n";
+    file << "  // dependency SONAMEs via plain dlopen(\"libX.so\"). Fallback to an\n";
+    file << "  // absolute path beside this host thunk library.\n";
+    file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
+    file << "    Dl_info self_info{};\n";
+    file << "    if (dladdr((void*)&fexldr_init_" << libname << ", &self_info) && self_info.dli_fname) {\n";
+    file << "      const char* slash = strrchr(self_info.dli_fname, '/');\n";
+    file << "      if (slash) {\n";
+    file << "        char abs_path[1024]{};\n";
+    file << "        size_t dir_len = static_cast<size_t>(slash - self_info.dli_fname) + 1;\n";
+    file << "        const char* soname = \"" << library_filename << "\";\n";
+    file << "        size_t soname_len = strlen(soname);\n";
+    file << "        if (dir_len + soname_len + 1 < sizeof(abs_path)) {\n";
+    file << "          memcpy(abs_path, self_info.dli_fname, dir_len);\n";
+    file << "          memcpy(abs_path + dir_len, soname, soname_len + 1);\n";
+    file << "          fexldr_ptr_" << libname << "_so = dlopen(abs_path, RTLD_GLOBAL | RTLD_LAZY);\n";
+    file << "        }\n";
+    file << "      }\n";
+    file << "    }\n";
+    file << "  }\n";
+    file << "#endif\n";
+    file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
+    file << "    fprintf(stderr, \"[VEXA][THUNK] fexldr_init_" << libname << " failed to load " << library_filename
+         << " (soname+android-abs fallback): %s\\n\", dlerror());\n";
+    file << "    return false;\n";
+    file << "  }\n\n";
     for (auto& import : thunked_api) {
       fmt::print(file, "  (void*&)fexldr_ptr_{}_{} = {}(fexldr_ptr_{}_so, \"{}\");\n", libname, import.function_name, import.host_loader,
                  libname, import.function_name);

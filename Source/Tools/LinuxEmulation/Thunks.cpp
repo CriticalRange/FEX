@@ -220,7 +220,10 @@ void ThunkHandler_impl::LoadLib(std::string_view Name) {
 
   auto Handle = dlopen(SOName.c_str(), RTLD_LOCAL | RTLD_NOW);
   if (!Handle) {
-    ERROR_AND_DIE_FMT("LoadLib: Failed to dlopen thunk library {}: {}", SOName, dlerror());
+    const char* DLOpenErr = dlerror();
+    LogMan::Msg::EFmt("LoadLib debug: Name={} SOName={} InitSym=<pending> dlopen_err={}", Name, SOName,
+                      DLOpenErr ? DLOpenErr : "<none>");
+    ERROR_AND_DIE_FMT("LoadLib: Failed to dlopen thunk library {}: {}", SOName, DLOpenErr ? DLOpenErr : "<none>");
   }
 
   // Library names often include dashes, which may not be used in C++ identifiers.
@@ -234,13 +237,19 @@ void ThunkHandler_impl::LoadLib(std::string_view Name) {
   };
 
   ExportEntry* (*InitFN)();
+  // Clear stale dlerror state before dlsym so failures are attributable to this lookup.
+  (void)dlerror();
   (void*&)InitFN = dlsym(Handle, InitSym.c_str());
   if (!InitFN) {
-    ERROR_AND_DIE_FMT("LoadLib: Failed to find export {}", InitSym);
+    const char* DLSymErr = dlerror();
+    LogMan::Msg::EFmt("LoadLib debug: Name={} SOName={} InitSym={} dlsym_err={}", Name, SOName, InitSym,
+                      DLSymErr ? DLSymErr : "<none>");
+    ERROR_AND_DIE_FMT("LoadLib: Failed to find export {}: {}", InitSym, DLSymErr ? DLSymErr : "<none>");
   }
 
   auto Exports = InitFN();
   if (!Exports) {
+    LogMan::Msg::EFmt("LoadLib debug: Name={} SOName={} InitSym={} InitFN returned null", Name, SOName, InitSym);
     ERROR_AND_DIE_FMT("LoadLib: Failed to initialize thunk library {}. "
                       "Check if the corresponding host library is installed "
                       "or disable thunking of this library.",
