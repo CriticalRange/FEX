@@ -714,9 +714,13 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       if (!thunk.return_type->isVoidType()) {
         fmt::print(file, "  args->rv = ");
         if (!thunk.return_type->isFunctionPointerType() && !thunk.param_annotations[-1].is_passthrough) {
-          // VEXA_FIXES: Use the same normalized guest-facing type as the packed rv field.
-          // This avoids signedness/type-alias mismatches (eg ALCboolean char vs int8_t).
-          fmt::print(file, "to_guest(to_host_layout<{}>(", get_guest_type_name(thunk.return_type));
+          // VEXA_FIXES Keep guest-type normalization for scalars (fixes ALCboolean-style signedness issues),
+          // but use host-declared type for char* returns to avoid const char* -> const int8_t* mismatch.
+          if (thunk.return_type->isPointerType() && thunk.return_type->getPointeeType()->isAnyCharacterType()) {
+            fmt::print(file, "to_guest(to_host_layout<{}>(", NormalizeTypeForCPP(thunk.return_type.getAsString()));
+          } else {
+            fmt::print(file, "to_guest(to_host_layout<{}>(", get_guest_type_name(thunk.return_type));
+          }
         }
       }
       fmt::print(file, "{}(", function_to_call);
@@ -850,10 +854,46 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
          << " (soname+android-abs fallback): %s\\n\", dlerror());\n";
     file << "    return false;\n";
     file << "  }\n\n";
+
+    file << "  // VEXA_FIXES: Track unresolved imports and fail init after logging\n";
+    file << "  // each missing symbol so thunk startup errors are explicit.\n";
+    file << "  bool fexldr_missing_symbol = false;\n";
+    file << "  auto fexldr_resolve_default = [&](const char* symbol) -> void* {\n";
+    file << "    void* ptr = dlsym_default(fexldr_ptr_" << libname << "_so, symbol);\n";
+    file << "#if defined(__ANDROID__)\n";
+    file << "    if (!ptr) {\n";
+    file << "      // VEXA_FIXES: Android namespaces may hide app-private symbols from RTLD_DEFAULT.\n";
+    file << "      ptr = dlsym(fexldr_ptr_" << libname << "_so, symbol);\n";
+    file << "    }\n";
+    file << "#endif\n";
+    file << "    return ptr;\n";
+    file << "  };\n\n";
+
     for (auto& import : thunked_api) {
-      fmt::print(file, "  (void*&)fexldr_ptr_{}_{} = {}(fexldr_ptr_{}_so, \"{}\");\n", libname, import.function_name, import.host_loader,
-                 libname, import.function_name);
+      if (import.host_loader == "dlsym_default") {
+        fmt::print(file, "  (void*&)fexldr_ptr_{}_{} = fexldr_resolve_default(\"{}\");\n", libname, import.function_name, import.function_name);
+      } else {
+        fmt::print(file, "  (void*&)fexldr_ptr_{}_{} = {}(fexldr_ptr_{}_so, \"{}\");\n", libname, import.function_name, import.host_loader, libname,
+                   import.function_name);
+        file << "#if defined(__ANDROID__)\n";
+        file << "  // VEXA_FIXES: Retry direct dlsym(handle, symbol) when helper\n";
+        file << "  // lookup misses namespaced exports on Android.\n";
+        fmt::print(file, "  if (!fexldr_ptr_{}_{}) {{\n", libname, import.function_name);
+        fmt::print(file, "    (void*&)fexldr_ptr_{}_{} = dlsym(fexldr_ptr_{}_so, \"{}\");\n", libname, import.function_name, libname,
+                   import.function_name);
+        file << "  }\n";
+        file << "#endif\n";
+      }
+
+      fmt::print(file, "  if (!fexldr_ptr_{}_{}) {{\n", libname, import.function_name);
+      fmt::print(file, "    fprintf(stderr, \"[VEXA][THUNK] fexldr_init_{} missing symbol: {}\\n\");\n", libname, import.function_name);
+      file << "    fexldr_missing_symbol = true;\n";
+      file << "  }\n";
     }
+
+    file << "  if (fexldr_missing_symbol) {\n";
+    file << "    return false;\n";
+    file << "  }\n";
     file << "  return true;\n";
     file << "}\n";
   }

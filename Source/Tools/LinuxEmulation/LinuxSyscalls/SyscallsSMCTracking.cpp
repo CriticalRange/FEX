@@ -13,6 +13,8 @@ $end_info$
 #include "Common/FileMappingBaseAddress.h"
 
 #include <filesystem>
+#include <array>
+#include <cstring>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/personality.h>
@@ -203,14 +205,41 @@ FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXC
 }
 
 static fextl::vector<Elf64_Phdr> ReadELFHeaders(int FD, std::span<std::byte> HeaderData = {}) {
-  std::string_view ELFMagic = ELFMAG;
-  if (HeaderData.data()) {
-    if (HeaderData.size_bytes() < ELFMagic.size() || std::memcmp(ELFMagic.data(), HeaderData.data(), ELFMagic.size()) != 0) {
-      // Not an ELF file
+  // VEXA_FIXES: Read and validate ELF ident/class/machine first so Android host
+  // arm64 mappings are ignored by guest executable tracking.
+  std::array<std::byte, sizeof(Elf64_Ehdr)> EHRaw {};
+
+  if (HeaderData.data() && HeaderData.size_bytes() >= EHRaw.size()) {
+    std::memcpy(EHRaw.data(), HeaderData.data(), EHRaw.size());
+  } else {
+    if (pread(FD, EHRaw.data(), EHRaw.size(), 0) != static_cast<ssize_t>(EHRaw.size())) {
+      return {};
+    }
+  }
+
+  const auto* Ident = reinterpret_cast<const unsigned char*>(EHRaw.data());
+  if (Ident[EI_MAG0] != ELFMAG0 || Ident[EI_MAG1] != ELFMAG1 || Ident[EI_MAG2] != ELFMAG2 || Ident[EI_MAG3] != ELFMAG3) {
+    // Not an ELF file.
+    return {};
+  }
+
+  // VEXA_FIXES: Ignore non-x86 ELF files for guest executable section tracking.
+  // Android process maps (app_process64, linker64, arm64 host thunk libs) are
+  // valid executable mappings but not guest-x86 ELFs.
+  if (Ident[EI_CLASS] == ELFCLASS32) {
+    Elf32_Ehdr EH32 {};
+    std::memcpy(&EH32, EHRaw.data(), sizeof(EH32));
+    if (EH32.e_machine != EM_386) {
+      return {};
+    }
+  } else if (Ident[EI_CLASS] == ELFCLASS64) {
+    Elf64_Ehdr EH64 {};
+    std::memcpy(&EH64, EHRaw.data(), sizeof(EH64));
+    if (EH64.e_machine != EM_X86_64) {
       return {};
     }
   } else {
-    // Read from FD in case the caller didn't have a mapped header available
+    return {};
   }
 
   ELFParser Parser;

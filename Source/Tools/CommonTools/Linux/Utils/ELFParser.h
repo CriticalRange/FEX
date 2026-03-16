@@ -5,6 +5,7 @@
 #include <FEXCore/fextl/vector.h>
 
 #include <elf.h>
+#include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -17,6 +18,22 @@
 */
 
 struct ELFParser {
+  // VEXA_FIXES: Resolve FD target paths so ELF machine-mismatch logs identify
+  // which mapped file was rejected during Android guest/host map triage.
+  static fextl::string ResolveFDPath(int FD) {
+    char ProcPath[64] {};
+    snprintf(ProcPath, sizeof(ProcPath), "/proc/self/fd/%d", FD);
+
+    char LinkPath[4096] {};
+    const auto Size = readlink(ProcPath, LinkPath, sizeof(LinkPath) - 1);
+    if (Size <= 0) {
+      return "<unresolved>";
+    }
+
+    LinkPath[Size] = 0;
+    return LinkPath;
+  }
+
   Elf64_Ehdr ehdr;
   fextl::vector<Elf64_Phdr> phdrs;
   ::ELFLoader::ELFContainer::ELFType type {::ELFLoader::ELFContainer::TYPE_NONE};
@@ -105,7 +122,7 @@ struct ELFParser {
 #undef COPY
 
       if (ehdr.e_machine != EM_386) {
-        LogMan::Msg::EFmt("Invalid e_machine from '{}'", fd);
+        LogMan::Msg::EFmt("Invalid e_machine from fd {} (e_machine={}, path='{}')", fd, ehdr.e_machine, ResolveFDPath(fd));
         return false;
       }
 
@@ -131,7 +148,7 @@ struct ELFParser {
       }
 
       if (ehdr.e_machine != EM_X86_64) {
-        LogMan::Msg::EFmt("Invalid e_machine64 from '{}'", fd);
+        LogMan::Msg::EFmt("Invalid e_machine64 from fd {} (e_machine={}, path='{}')", fd, ehdr.e_machine, ResolveFDPath(fd));
         return false;
       }
 

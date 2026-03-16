@@ -209,6 +209,8 @@ constexpr static uint64_t ESR1_WNR = 1 << 6;
 constexpr static uint64_t ESR1_DataAbort_DFSC = 0b111111;
 constexpr static uint64_t ESR1_DataAbort_TranslationFault_EL0 = 0b000111;
 constexpr static uint64_t ESR1_DataAbort_PermissionFault_EL0 = 0b001111;
+constexpr static uint64_t ESR1_EC_InstructionAbort = 0b100000U << 26; // VEXA_FIXES: Treat instruction-abort EC as execute fault.
+constexpr static uint64_t ESR1_EC_InstructionAbortNoEL = 0b1000001U << 26; // VEXA_FIXES: Handle no-EL variant seen on some kernels.
 constexpr static uint64_t ESR1_DataAbort_Level = 0b11;
 constexpr static uint64_t ESR1_DataAbort_Level_EL3 = 0b00;
 constexpr static uint64_t ESR1_DataAbort_Level_EL2 = 0b01;
@@ -219,10 +221,30 @@ std::string_view GetESRName(uint64_t ESR);
 
 static inline uint32_t GetProtectFlags(void* ucontext) {
   uint64_t ESR = GetArmESR(ucontext);
+  uint64_t EC = ESR & ESR1_EC;
+
+  uint32_t ProtectFlags {};
+  // VEXA_FIXES: Keep EL0 faults marked as user faults before EC-specific handling.
+  if ((ESR & ESR1_DataAbort_Level) == ESR1_DataAbort_Level_EL0) {
+    ProtectFlags |= FEXCore::X86State::X86_PF_USER;
+  }
+
+  if (EC == ESR1_EC_DataAbort) {
+    if (ESR & ESR1_WNR) {
+      ProtectFlags |= FEXCore::X86State::X86_PF_WRITE;
+    }
+    return ProtectFlags;
+  }
+
+  if (EC == ESR1_EC_InstructionAbort || EC == ESR1_EC_InstructionAbortNoEL) {
+    // VEXA_FIXES: Map ARM instruction-abort to x86 execute-fault semantics.
+    ProtectFlags |= FEXCore::X86State::X86_PF_INSTR;
+    return ProtectFlags;
+  }
+
   LOGMAN_THROW_A_FMT((ESR & ESR1_EC) == ESR1_EC_DataAbort, "Unknown ESR1 EC type: 0x{:x} != 0x{:x}. Received '{}'", ESR & ESR1_EC,
                      ESR1_EC_DataAbort, GetESRName(ESR));
 
-  uint32_t ProtectFlags {};
   if ((ESR & ESR1_DataAbort_Level) == ESR1_DataAbort_Level_EL0) {
     // Always a user error for us.
     ProtectFlags |= FEXCore::X86State::X86_PF_USER;

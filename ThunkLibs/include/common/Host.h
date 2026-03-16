@@ -448,6 +448,17 @@ struct host_to_guest_convertible {
     return (guest_layout<uint8_t*>)reinterpret_cast<const host_to_guest_convertible<uint8_t*>&>(*this);
   }
 
+  // VEXA_FIXES Make guest_layout of "char" and "int8_t" interoperable
+  operator guest_layout<const int8_t*>() const requires (std::is_same_v<T, const char*>)
+  {
+    return (guest_layout<const int8_t*>)reinterpret_cast<const host_to_guest_convertible<const int8_t*>&>(*this);
+  }
+
+  operator guest_layout<int8_t*>() const requires (std::is_same_v<T, char*>)
+  {
+    return (guest_layout<int8_t*>)reinterpret_cast<const host_to_guest_convertible<int8_t*>&>(*this);
+  }
+
   // Make guest_layout of "wchar_t" and "uint32_t" interoperable
   operator guest_layout<uint32_t*>() const requires (std::is_same_v<T, wchar_t*>)
   {
