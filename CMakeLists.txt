@@ -42,8 +42,9 @@ option(USE_PDB_DEBUGINFO "Build debug info in PDB format" FALSE)
 option(BUILD_STEAM_SUPPORT "Enable Steam integration" FALSE)
 
 if (ANDROID)
-  # VEXA_FIXES: Android path is using custom runtime integration, not stock EGL thunk.
-  set(ENABLE_EGL_THUNKS OFF CACHE BOOL "Build EGL thunk libs" FORCE)
+  # VEXA_FIXES: Force Android thunk-mode macros so libGL/libEGL thunkgen + source branches
+  # take Android-specific code paths even when guest artifacts are generated for Linux targets.
+  add_compile_definitions(BUILD_ANDROID=1)
   # VEXA_FIXES: Android build environments don't provide Linux desktop Wayland headers/libs.
   set(ENABLE_WAYLAND_THUNKS OFF CACHE BOOL "Build Wayland thunk libs" FORCE)
   # VEXA_FIXES: VDSO thunk generation currently conflicts on Android NDK gettimeofday prototype.
@@ -615,6 +616,7 @@ if (BUILD_THUNKS)
       CMAKE_ARGS
       "-DBITNESS=64"
       "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+      "-DBUILD_ANDROID=1"
       "-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
       # VEXA_FIXES: Propagate Android dependency prefixes so guest thunk parsing/build
       # can locate SDL3/SDL3_image/OpenAL includes in the external guest sub-build.
@@ -644,6 +646,7 @@ if (BUILD_THUNKS)
       CMAKE_ARGS
         "-DBITNESS=32"
         "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+"-DBUILD_ANDROID=1"
 "-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
   "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
         "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"

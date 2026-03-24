@@ -3,6 +3,19 @@
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
 
+// VEXA_FIXES: Android interface parse path avoids desktop GLX headers and uses
+// Android GL surface declarations + proc list shims for thunk generation.
+#ifdef BUILD_ANDROID
+#include <GL/gl.h>
+#include <GL/glext.h>
+
+#undef GL_ARB_viewport_array
+#include "glcorearb.h"
+#include "android_gl_proc_list.h"
+
+extern "C" using __GLXextFuncPtr = void (*)(void);
+extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
+#else
 #include <GL/glx.h>
 #include <GL/glxext.h>
 #include <GL/gl.h>
@@ -10,6 +23,11 @@
 
 #undef GL_ARB_viewport_array
 #include "glcorearb.h"
+#include "android_gl_proc_list.h"
+#endif
+
+// VEXA_FIXES: Explicit shader-source bridge symbol used by Android host thunk path.
+extern "C" void FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length);
 
 #include <type_traits>
 
@@ -18,10 +36,14 @@ struct fex_gen_config {
   unsigned version = 1;
 };
 
+// VEXA_FIXES: glXGetProcAddress is always thunk-routed to keep Android proc
+// resolution and guest trampoline linkage deterministic.
 template<>
 struct fex_gen_config<glXGetProcAddress> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint, fexgen::returns_guest_pointer {};
 
 // internal use
+// VEXA_FIXES: Host callback setters are runtime wiring hooks populated from
+// guest side during libGL thunk initialization.
 void GL_SetGuestMalloc(uintptr_t, uintptr_t);
 void GL_SetGuestXSync(uintptr_t, uintptr_t);
 void GL_SetGuestXGetVisualInfo(uintptr_t, uintptr_t);
@@ -43,6 +65,11 @@ struct fex_gen_type {};
 template<>
 struct fex_gen_type<void> : fexgen::opaque_type {};
 
+#ifdef BUILD_ANDROID
+// VEXA_FIXES: Android path only needs GLsync as opaque thunked pointer type.
+template<>
+struct fex_gen_type<std::remove_pointer_t<GLsync>> : fexgen::opaque_type {};
+#else
 template<>
 struct fex_gen_type<std::remove_pointer_t<GLXContext>> : fexgen::opaque_type {};
 // NOTE: The data layout of this is almost the same between 64-bit and 32-bit,
@@ -68,6 +95,7 @@ template<>
 struct fex_gen_type<XVisualInfo> : fexgen::emit_layout_wrappers {};
 template<>
 struct fex_gen_type<Visual> : fexgen::opaque_type {}; // Used in XVisualInfo; treat as opaque
+#endif
 
 // Symbols queryable through glXGetProcAddr
 namespace internal {
@@ -78,6 +106,22 @@ struct fex_gen_config : fexgen::generate_guest_symtable, fexgen::indirect_guest_
 template<auto, int, typename = void>
 struct fex_gen_param {};
 
+template<>
+struct fex_gen_config<FEX_glShaderSource> : fexgen::custom_host_impl {};
+
+#ifdef BUILD_ANDROID
+// VEXA_FIXES: Generate custom config entries from Android proc allowlist to keep
+// thunkgen and host/guest proc maps aligned with android_gl_proc_list.h.
+template<>
+struct fex_gen_param<glTransformFeedbackVaryings, 2, const GLchar* const*> : fexgen::assume_compatible_data_layout {};
+
+#define FEX_ANDROID_GL_CONFIG(name) \
+template<> \
+struct fex_gen_config<name> {};
+FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN(FEX_ANDROID_GL_CONFIG)
+#undef FEX_ANDROID_GL_CONFIG
+
+#else
 template<>
 struct fex_gen_config<glXQueryCurrentRendererStringMESA> {};
 template<>
@@ -455,9 +499,9 @@ struct fex_gen_config<glWindowPos3s> {};
 template<>
 struct fex_gen_config<glWindowPos3sv> {};
 template<>
-struct fex_gen_config<glGetString> {};
+struct fex_gen_config<glGetString> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<glGetStringi> {};
+struct fex_gen_config<glGetStringi> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glQueryMatrixxOES> {};
 template<>
@@ -1277,8 +1321,10 @@ template<>
 struct fex_gen_config<glCompileCommandListNV> {};
 template<>
 struct fex_gen_config<glCompileShaderARB> {};
+#ifndef BUILD_ANDROID
 template<>
 struct fex_gen_config<glCompileShader> {};
+#endif
 template<>
 struct fex_gen_config<glCompileShaderIncludeARB> : fexgen::custom_host_impl {};
 template<>
@@ -3087,8 +3133,10 @@ template<>
 struct fex_gen_config<glLineWidthxOES> {};
 template<>
 struct fex_gen_config<glLinkProgramARB> {};
+#ifndef BUILD_ANDROID
 template<>
 struct fex_gen_config<glLinkProgram> {};
+#endif
 template<>
 struct fex_gen_config<glListBase> {};
 #ifndef IS_32BIT_THUNK
@@ -4683,11 +4731,13 @@ struct fex_gen_config<glShaderOp2EXT> {};
 template<>
 struct fex_gen_config<glShaderOp3EXT> {};
 template<>
-struct fex_gen_config<glShaderSource> : fexgen::custom_host_impl {};
+// VEXA_FIXES: ShaderSource uses custom guest entrypoint so guest string pointers
+// are bridged through FEX_glShaderSource instead of raw host callback calling.
+struct fex_gen_config<glShaderSource> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
 template<>
 struct fex_gen_param<glShaderSource, 2, const GLchar* const*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<glShaderSourceARB> : fexgen::custom_host_impl {};
+struct fex_gen_config<glShaderSourceARB> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
 template<>
 struct fex_gen_param<glShaderSourceARB, 2, const GLcharARB**> : fexgen::ptr_passthrough {};
 template<>
@@ -6524,5 +6574,6 @@ struct fex_gen_config<glXCushionSGI> {};
 // TODO: 32-bit support
 template<>
 struct fex_gen_config<glXGetTransparentIndexSUN> {};
+#endif
 #endif
 } // namespace internal

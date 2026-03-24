@@ -1,5 +1,8 @@
 #pragma once
 #include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <type_traits>
 
 #include "PackedArguments.h"
@@ -83,7 +86,29 @@ MAKE_THUNK(fex, allocate_host_trampoline_for_guest_function,
 #define LOAD_LIB(name) LOAD_LIB_BASE(name, nullptr)
 #define LOAD_LIB_INIT(name, init_fn) LOAD_LIB_BASE(name, init_fn)
 
+[[noreturn]] inline void VexaGuestAbortThunkNullTarget(const char* where, uintptr_t target,
+                                                        uintptr_t aux0 = 0, uintptr_t aux1 = 0) {
+  const char* symname = "<unknown>";
+  Dl_info info {};
+  if (target != 0 && dladdr(reinterpret_cast<void*>(target), &info) && info.dli_sname) {
+    symname = info.dli_sname;
+  }
+
+  std::fprintf(stderr,
+               "[VEXA][THUNK][GUEST] fatal null target at %s target=0x%llx sym=%s aux0=0x%llx aux1=0x%llx\n",
+               where ? where : "<unknown>",
+               static_cast<unsigned long long>(target),
+               symname,
+               static_cast<unsigned long long>(aux0),
+               static_cast<unsigned long long>(aux1));
+  std::fflush(stderr);
+  __builtin_trap();
+}
+
 inline void LinkAddressToFunction(uintptr_t addr, uintptr_t target) {
+  if (!addr || !target) {
+    VexaGuestAbortThunkNullTarget("LinkAddressToFunction", target, addr, target);
+  }
   struct args_t {
     uint64_t original_callee;
     uint64_t target_addr; // Function to call when branching to replaced_addr
@@ -143,6 +168,16 @@ inline Result CallHostFunction(Args... args) {
   uintptr_t host_addr = 0;
 #endif
 
+  if (host_addr == 0) {
+    VexaGuestAbortThunkNullTarget("CallHostFunction(host_addr)", host_addr, reinterpret_cast<uintptr_t>(Thunk));
+  }
+
+  #if __SIZEOF_POINTER__ == 8
+    if (host_addr < 0x100000000ULL) {
+      VexaGuestAbortThunkNullTarget("CallHostFunction(host_addr_below_4gb)", host_addr,reinterpret_cast<uintptr_t>(Thunk));
+    }
+  #endif
+
   PackedArguments<Result, Args..., uint64_t> packed_args = {
     args..., host_addr
     // Return value not explicitly initialized since an initializer would fail to compile for the void case
@@ -165,6 +200,10 @@ static auto GetCallerForHostFunction(Result (*host_func)(Args...)) -> Result (*)
 // Ensures the given host function can safely be called from guest code.
 template<typename Result, typename... Args>
 inline void MakeHostFunctionGuestCallable(THUNK_ABI Result (*host_func)(Args...)) {
+  if (!host_func) {
+    VexaGuestAbortThunkNullTarget("MakeHostFunctionGuestCallable(host_func)", 0);
+  }
+
   auto caller = (uintptr_t)GetCallerForHostFunction(host_func);
   LinkAddressToFunction((uintptr_t)host_func, (uintptr_t)caller);
 }
@@ -183,6 +222,10 @@ inline Target* AllocateHostTrampolineForGuestFunction(void THUNK_ABI (*GuestUnpa
 
   fexthunks_fex_allocate_host_trampoline_for_guest_function((void*)&argsrv);
 
+  if (argsrv.rv == 0) {
+    VexaGuestAbortThunkNullTarget("AllocateHostTrampolineForGuestFunction(rv)", argsrv.rv, (uintptr_t)GuestUnpacker, (uintptr_t)GuestTarget);
+  }
+
   return (Target*)argsrv.rv;
 }
 
@@ -194,6 +237,10 @@ struct CallbackUnpack<Result(Args...)> {
   static void THUNK_ABI Unpack(uintptr_t cb, void* argsv) {
     using fn_t = Result(Args...);
     auto callback = reinterpret_cast<fn_t*>(cb);
+    if (!callback) {
+      VexaGuestAbortThunkNullTarget("CallbackUnpack::Unpack(callback)", cb, reinterpret_cast<uintptr_t>(argsv));
+    }
+
     auto args = reinterpret_cast<PackedArguments<Result, Args...>*>(argsv);
     Invoke(callback, *args);
   }

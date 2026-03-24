@@ -53,6 +53,49 @@ struct ExportEntry {
 
 typedef void fex_call_callback_t(uintptr_t callback, void* arg0, void* arg1);
 
+// VEXA_FIXES: Optional runtime thunk event bridge used by Android GL/EGL thunk bring-up.
+// Kept weak so upstream-style builds without VEXA runtime hooks still link and run.
+extern "C" {
+__attribute__((weak)) void Vexa_RecordThunkEvent(const char* name, uint32_t phase, uint64_t thunkId,
+                                                 uint64_t v0, uint64_t v1, uint64_t v2,
+                                                 uint64_t v3, uint64_t v4, uint64_t v5);
+}
+
+// VEXA_FIXES: Shared event phase IDs consumed by Vexa_RecordThunkEvent.
+constexpr uint32_t VEXA_THUNK_EVENT_ENTER = 1;
+constexpr uint32_t VEXA_THUNK_EVENT_EXIT = 2;
+constexpr uint32_t VEXA_THUNK_EVENT_LOOKUP_FUNCTION = 3;
+constexpr uint32_t VEXA_THUNK_EVENT_LOOKUP_DATA = 4;
+constexpr uint32_t VEXA_THUNK_EVENT_LOOKUP_MISS = 5;
+
+// VEXA_FIXES: Lightweight helper that emits thunk diagnostics only when runtime hook is present.
+inline void VexaTraceThunkEvent(const char* name, uint32_t phase, uint64_t thunkId,
+                                uint64_t v0 = 0, uint64_t v1 = 0, uint64_t v2 = 0,
+                                uint64_t v3 = 0, uint64_t v4 = 0, uint64_t v5 = 0) {
+  if (Vexa_RecordThunkEvent) {
+    Vexa_RecordThunkEvent(name, phase, thunkId, v0, v1, v2, v3, v4, v5);
+  }
+}
+
+// VEXA_FIXES: Fatal guard used in Android thunk ports when a required trampoline/target is missing.
+[[noreturn]] inline void VexaAbortThunkNullTarget(const char* name, const char* reason, uint64_t thunkId,
+                                                   uint64_t v0 = 0, uint64_t v1 = 0, uint64_t v2 = 0,
+                                                   uint64_t v3 = 0, uint64_t v4 = 0, uint64_t v5 = 0) {
+  VexaTraceThunkEvent(name, VEXA_THUNK_EVENT_LOOKUP_MISS, thunkId, v0, v1, v2, v3, v4, v5);
+  std::fprintf(stderr,
+               "[VEXA thunk] fatal null target: %s (%s) v0=0x%llx v1=0x%llx v2=0x%llx v3=0x%llx v4=0x%llx v5=0x%llx\n",
+               name ? name : "<null>",
+               reason ? reason : "unknown",
+               static_cast<unsigned long long>(v0),
+               static_cast<unsigned long long>(v1),
+               static_cast<unsigned long long>(v2),
+               static_cast<unsigned long long>(v3),
+               static_cast<unsigned long long>(v4),
+               static_cast<unsigned long long>(v5));
+  std::fflush(stderr);
+  std::abort();
+}
+
 #define EXPORTS(name)                       \
   extern "C" {                              \
   ExportEntry* fexthunks_exports_##name() { \
@@ -532,10 +575,20 @@ auto Projection(guest_layout<T>& data) {
  * restored.
  */
 class GuestStackBumpAllocator final {
-  uintptr_t Top = reinterpret_cast<uintptr_t>(FEX::HLE::GetGuestStack());
-  uintptr_t Next = Top;
+  uintptr_t Top {};
+  uintptr_t Next {};
 
 public:
+  GuestStackBumpAllocator() {
+    if (!FEX::HLE::GetGuestStack || !FEX::HLE::MoveGuestStack) {
+      VexaAbortThunkNullTarget("GuestStackBumpAllocator", "FEX::HLE guest stack API unavailable", 0x564558414753544BULL,
+                               reinterpret_cast<uint64_t>(FEX::HLE::GetGuestStack),
+                               reinterpret_cast<uint64_t>(FEX::HLE::MoveGuestStack));
+    }
+    Top = reinterpret_cast<uintptr_t>(FEX::HLE::GetGuestStack());
+    Next = Top;
+  }
+
   ~GuestStackBumpAllocator() {
     FEX::HLE::MoveGuestStack(Top);
   }
@@ -555,6 +608,24 @@ struct CallbackUnpack<Result(Args...)> {
   static Result CallGuestPtr(Args... args) {
     GuestcallInfo* guestcall;
     LOAD_INTERNAL_GUESTPTR_VIA_CUSTOM_ABI(guestcall);
+
+    if (!guestcall) {
+      VexaAbortThunkNullTarget("CallbackUnpack::CallGuestPtr", "guestcall is null", 0x5645584143423031ULL);
+    }
+    if (!guestcall->CallCallback) {
+      VexaAbortThunkNullTarget("CallbackUnpack::CallGuestPtr", "CallCallback is null", 0x5645584143423032ULL,
+                               reinterpret_cast<uint64_t>(guestcall));
+    }
+    if (!guestcall->GuestUnpacker) {
+      VexaAbortThunkNullTarget("CallbackUnpack::CallGuestPtr", "GuestUnpacker is null", 0x5645584143423033ULL,
+                               reinterpret_cast<uint64_t>(guestcall),
+                               static_cast<uint64_t>(guestcall->GuestTarget));
+    }
+    if (!guestcall->GuestTarget) {
+      VexaAbortThunkNullTarget("CallbackUnpack::CallGuestPtr", "GuestTarget is null", 0x5645584143423034ULL,
+                               reinterpret_cast<uint64_t>(guestcall),
+                               static_cast<uint64_t>(guestcall->GuestUnpacker));
+    }
 
 #ifndef IS_32BIT_THUNK
     PackedArguments<Result, guest_layout<Args>...> packed_args = {to_guest(to_host_layout(args))...};
@@ -587,6 +658,11 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
 
     auto args =
       reinterpret_cast<PackedArguments<as_guest_layout_if<!std::is_void_v<Result>, Result, Result>, guest_layout<GuestArgs>..., uintptr_t>*>(argsv);
+    if (!args) {
+      VexaAbortThunkNullTarget("GuestWrapperForHostFunction::Call", "packed args pointer is null",
+                               0x5645584147573031ULL);
+    }
+
     constexpr auto CBIndex = sizeof...(GuestArgs);
     uintptr_t cb;
     static_assert(CBIndex <= 18 || CBIndex == 23);
@@ -632,6 +708,25 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
       cb = args->a23;
     }
 
+    if (!cb) {
+      VexaAbortThunkNullTarget("GuestWrapperForHostFunction::Call", "callback target is null",
+                               0x5645584147573032ULL,
+                               static_cast<uint64_t>(CBIndex),
+                               reinterpret_cast<uint64_t>(argsv));
+    }
+
+    #if INTPTR_MAX == INT64_MAX
+      if (cb < 0x100000000ULL) {
+        VexaAbortThunkNullTarget(
+            "GuestWrapperForHostFunction::Call",
+            "callback target below 4GB (likely truncated/garbage)",
+            0x5645584147573033ULL,
+            static_cast<uint64_t>(cb),
+            static_cast<uint64_t>(CBIndex),
+            reinterpret_cast<uint64_t>(argsv));
+      }
+  #endif
+
     // This is almost the same type as "Result func(Args..., uintptr_t)", but
     // individual types annotated as passthrough are wrapped in guest_layout<>
     auto callback = reinterpret_cast<as_guest_layout_if<RetAnnotations.is_passthrough, Result, Result> (*)(
@@ -653,17 +748,61 @@ struct GuestWrapperForHostFunction<Result(Args...), GuestArgs...> {
 
 template<typename FuncType>
 void MakeHostTrampolineForGuestFunctionAt(uintptr_t GuestTarget, uintptr_t GuestUnpacker, FuncType** Func) {
-  *Func = (FuncType*)FEX::HLE::MakeHostTrampolineForGuestFunction((void*)&CallbackUnpack<FuncType>::CallGuestPtr, GuestTarget, GuestUnpacker);
+  if (!Func) {
+    VexaAbortThunkNullTarget("MakeHostTrampolineForGuestFunctionAt", "output function pointer is null", 0x564558414D4B3031ULL,
+                             GuestTarget, GuestUnpacker);
+  }
+
+  if (!GuestTarget) {
+    *Func = nullptr;
+    return;
+  }
+
+  if (!GuestUnpacker) {
+    VexaAbortThunkNullTarget("MakeHostTrampolineForGuestFunctionAt", "GuestUnpacker is null", 0x564558414D4B3032ULL,
+                             GuestTarget);
+  }
+
+  if (!FEX::HLE::MakeHostTrampolineForGuestFunction) {
+    VexaAbortThunkNullTarget("MakeHostTrampolineForGuestFunctionAt", "MakeHostTrampolineForGuestFunction unresolved",
+                             0x564558414D4B3033ULL, GuestTarget, GuestUnpacker);
+  }
+
+  auto* Trampoline = FEX::HLE::MakeHostTrampolineForGuestFunction((void*)&CallbackUnpack<FuncType>::CallGuestPtr, GuestTarget, GuestUnpacker);
+  if (!Trampoline) {
+    VexaAbortThunkNullTarget("MakeHostTrampolineForGuestFunctionAt", "trampoline allocation failed", 0x564558414D4B3034ULL,
+                             GuestTarget, GuestUnpacker);
+  }
+
+  *Func = reinterpret_cast<FuncType*>(Trampoline);
 }
 
 template<typename F>
 void FinalizeHostTrampolineForGuestFunction(F* PreallocatedTrampolineForGuestFunction) {
+  if (!PreallocatedTrampolineForGuestFunction) {
+    return;
+  }
+  if (!FEX::HLE::FinalizeHostTrampolineForGuestFunction) {
+    VexaAbortThunkNullTarget("FinalizeHostTrampolineForGuestFunction", "FinalizeHostTrampolineForGuestFunction unresolved",
+                             0x56455841464E3031ULL,
+                             reinterpret_cast<uint64_t>(PreallocatedTrampolineForGuestFunction));
+  }
+
   FEX::HLE::FinalizeHostTrampolineForGuestFunction((FEX::HLE::HostToGuestTrampolinePtr*)PreallocatedTrampolineForGuestFunction,
                                                    (void*)&CallbackUnpack<F>::CallGuestPtr);
 }
 
 template<typename F>
 void FinalizeHostTrampolineForGuestFunction(guest_layout<F*> PreallocatedTrampolineForGuestFunction) {
+  if (!PreallocatedTrampolineForGuestFunction.data) {
+    return;
+  }
+  if (!FEX::HLE::FinalizeHostTrampolineForGuestFunction) {
+    VexaAbortThunkNullTarget("FinalizeHostTrampolineForGuestFunction", "FinalizeHostTrampolineForGuestFunction unresolved",
+                             0x56455841464E3032ULL,
+                             static_cast<uint64_t>(PreallocatedTrampolineForGuestFunction.data));
+  }
+
   FEX::HLE::FinalizeHostTrampolineForGuestFunction((FEX::HLE::HostToGuestTrampolinePtr*)PreallocatedTrampolineForGuestFunction.data,
                                                    (void*)&CallbackUnpack<F>::CallGuestPtr);
 }

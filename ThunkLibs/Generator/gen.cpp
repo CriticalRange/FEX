@@ -711,6 +711,15 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         }
       }
 
+      if (!thunk.custom_host_impl) {
+        // VEXA_FIXES: Guard host thunk dispatch pointers at call sites to avoid
+        // null-function dereferences and to expose the exact failing symbol.
+        fmt::print(file, "  if ({} == nullptr) {{\n", function_to_call);
+        fmt::print(file, "    fprintf(stderr, \"[VEXA][THUNK] null call target: {}::{} args=%p\\n\", (void*)args);\n", libname, function_name);
+        file << "    __builtin_trap();\n";
+        file << "  }\n";
+      }
+
       if (!thunk.return_type->isVoidType()) {
         fmt::print(file, "  args->rv = ");
         if (!thunk.return_type->isFunctionPointerType() && !thunk.param_annotations[-1].is_passthrough) {
@@ -891,6 +900,35 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       file << "  }\n";
     }
 
+    if (libname == "libSDL3") {
+      file << "#if defined(__ANDROID__)\n";
+      file << "  // VEXA_FIXES: SDL3 on Android relies on custom host bridge exports,\n";
+      file << "  // so unresolved FEX_SDL_* loader symbols are expected here.\n";
+      file << "  if (fexldr_missing_symbol) {\n";
+      file << "    fprintf(stderr, \"[VEXA][THUNK] fexldr_init_" << libname
+           << " continuing on Android despite missing FEX_SDL_* symbols\\n\");\n";
+      file << "    return true;\n";
+      file << "  }\n";
+      file << "#endif\n";
+    }
+    if (libname == "libGL") {
+      file << "#if defined(__ANDROID__)\n";
+      file << "  // VEXA_FIXES: On Android, many GL extension symbols are resolved lazily via\n";
+      file << "  // glXGetProcAddress. Missing eager dlsym imports should not hard-fail init\n";
+      file << "  // unless strict mode is explicitly requested.\n";
+      file << "  if (fexldr_missing_symbol) {\n";
+      file << "    const char* strict = getenv(\"VEXA_GL_STRICT_INIT\");\n";
+      file << "    if (strict && strict[0] == 49) {\n";
+      file << "      fprintf(stderr, \"[VEXA][THUNK] fexldr_init_" << libname
+           << " fatal: unresolved GL symbols on Android (strict mode)\\n\");\n";
+      file << "      return false;\n";
+      file << "    }\n";
+      file << "    fprintf(stderr, \"[VEXA][THUNK] fexldr_init_" << libname
+           << " continuing on Android despite missing GL symbols (lazy proc path)\\n\");\n";
+      file << "    return true;\n";
+      file << "  }\n";
+      file << "#endif\n";
+    }
     file << "  if (fexldr_missing_symbol) {\n";
     file << "    return false;\n";
     file << "  }\n";

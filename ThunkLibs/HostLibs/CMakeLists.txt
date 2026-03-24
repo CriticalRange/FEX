@@ -11,6 +11,11 @@ set(VEXA_SDL3_PREFIX "" CACHE PATH "SDL3 Android prefix")
 set(VEXA_SDL3_IMAGE_PREFIX "" CACHE PATH "SDL3_image Android prefix")
 set(VEXA_OPENAL_PREFIX "" CACHE PATH "OpenAL Android prefix")
 
+# VEXA_FIXES: Enable/Disable runtime shader translation for GL host thunk 
+# and third party directory that contains shaderc and spirv cross
+option(VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR "Enable runtime GLSL->SPIR-V->ESSL translation for GL host thunk" ON)
+set(VEXA_THIRD_PARTY_DIR "" CACHE PATH "Path to VEXA third_party (contains shaderc and spirv-cross)")
+
 # VEXA_FIXES: Allow caller to provide a prebuilt host thunkgen path.
 # This is required when the overall build is cross-compiling and target thunkgen binaries can't run on host.
 if (NOT DEFINED GENERATOR_EXE OR GENERATOR_EXE STREQUAL "")
@@ -20,6 +25,40 @@ endif()
 if (ENABLE_CLANG_THUNKS)
   set(LD_OVERRIDE "-fuse-ld=lld")
   add_link_options(${LD_OVERRIDE})
+endif()
+
+if (ANDROID AND VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR)
+  if (VEXA_THIRD_PARTY_DIR STREQUAL "")
+    message(FATAL_ERROR "Set -DVEXA_THIRD_PARTY_DIR=<.../third_party>")
+  endif()
+
+  set(VEXA_SHADERC_DIR "${VEXA_THIRD_PARTY_DIR}/shaderc")
+  set(VEXA_SPIRVCROSS_DIR "${VEXA_THIRD_PARTY_DIR}/spirv-cross")
+
+  if (EXISTS "${VEXA_SHADERC_DIR}/CMakeLists.txt" AND EXISTS "${VEXA_SPIRVCROSS_DIR}/CMakeLists.txt")
+    set(SHADERC_SKIP_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SHADERC_SKIP_TESTS ON CACHE BOOL "" FORCE)
+    set(SHADERC_SKIP_EXAMPLES ON CACHE BOOL "" FORCE)
+    set(SHADERC_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+    set(SHADERC_SKIP_COPYRIGHT_CHECK ON CACHE BOOL "" FORCE)
+    set(GLSLANG_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
+    set(SKIP_SPIRV_TOOLS_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+    if (NOT TARGET shaderc_combined)
+      add_subdirectory("${VEXA_SHADERC_DIR}" "${CMAKE_BINARY_DIR}/vexa-thirdparty-shaderc" EXCLUDE_FROM_ALL)
+    endif()
+
+    set(SPIRV_CROSS_SHARED OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_STATIC ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SKIP_INSTALL ON CACHE BOOL "" FORCE)
+    if (NOT TARGET spirv-cross-core)
+      add_subdirectory("${VEXA_SPIRVCROSS_DIR}" "${CMAKE_BINARY_DIR}/vexa-thirdparty-spirv-cross" EXCLUDE_FROM_ALL)
+    endif()
+  else()
+    message(FATAL_ERROR "shaderc/spirv-cross not found under ${VEXA_THIRD_PARTY_DIR}")
+  endif()
 endif()
 
 # Syntax: generate(libxyz libxyz-interface.cpp)
@@ -38,6 +77,11 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
   # This is not evaluated directly, hence directories added after return are still picked up
   set(prop "$<TARGET_PROPERTY:${NAME}-${GUEST_BITNESS}-deps,INTERFACE_INCLUDE_DIRECTORIES>")
   set(compile_prop "$<TARGET_PROPERTY:${NAME}-${GUEST_BITNESS}-deps,INTERFACE_COMPILE_DEFINITIONS>")
+  # VEXA_FIXES: Thunkgen parsing for guest-facing interfaces may still use Linux targets;
+  # force Android runtime intent so BUILD_ANDROID branches are generated consistently.
+  if (ANDROID)
+    list(APPEND compile_prop BUILD_ANDROID=1)
+  endif()
   if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     list(APPEND compile_prop ARCHITECTURE_x86_64=1)
   elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
@@ -67,10 +111,18 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(THUNKGEN_INPUT_DEPENDS "${GENERATOR_EXE}")
   endif()
 
+  # VEXA_FIXES: Keep Android GL proc allowlist header in thunkgen dependencies
+  # so edits in android_gl_proc_list.h always regenerate libGL host stubs.
+  set(THUNKGEN_EXTRA_DEPS "")
+  if (NAME STREQUAL "libGL")
+    list(APPEND THUNKGEN_EXTRA_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/../libGL/android_gl_proc_list.h")
+  endif()
+
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${SOURCE_FILE}"
     DEPENDS ${THUNKGEN_INPUT_DEPENDS}
+    DEPENDS ${THUNKGEN_EXTRA_DEPS}
     COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
@@ -147,6 +199,9 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
 
     target_include_directories(libSDL3-${GUEST_BITNESS}-deps INTERFACE ${VEXA_SDL3_PREFIX}/include)
     add_host_lib(SDL3 ${GUEST_BITNESS})
+    # VEXA_FIXES: SDL3 host thunk embeds EGL + ANativeWindow + log usage for
+    # managed context creation and diagnostics on Android.
+    target_link_libraries(SDL3-host-${GUEST_BITNESS} PRIVATE EGL GLESv3 log android)
 
     # VEXA_FIXES: Build SDL3_image host thunk for image API parity expected by SDL3-based guests.
     generate(libSDL3_image
@@ -192,16 +247,30 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   if (ENABLE_EGL_THUNKS)
     generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp ${GUEST_BITNESS})
     add_host_lib(EGL ${GUEST_BITNESS})
+    # VEXA_FIXES: Android GL host thunk stack resolves through system EGL, not desktop OpenGL.
+    if (ANDROID)
+      target_link_libraries(EGL-host-${GUEST_BITNESS} PRIVATE EGL)
+    endif()
   endif()
 
-  # VEXA_FIXES: Desktop GL host thunk depends on Linux OpenGL/GLX stack, which is unavailable for Android targets.
-  # Keep this behind a feature flag + non-Android guard.
-  if (ENABLE_DESKTOP_GL_THUNKS AND NOT ANDROID) 
-  generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp ${GUEST_BITNESS})
-  add_host_lib(GL ${GUEST_BITNESS})
+  # VEXA_FIXES: Build GL host thunk on Android and map it to EGL/GLES runtime libs.
+  if (ENABLE_DESKTOP_GL_THUNKS)
+    generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp ${GUEST_BITNESS})
+    add_host_lib(GL ${GUEST_BITNESS})
 
-  find_package(OpenGL REQUIRED)
-  target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE OpenGL::GL)
+    if (ANDROID)
+      target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE EGL GLESv3 log)
+      if (VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR AND TARGET shaderc_combined AND TARGET spirv-cross-core AND TARGET spirv-cross-glsl)
+        target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE shaderc_combined spirv-cross-core spirv-cross-glsl)
+        target_include_directories(GL-host-${GUEST_BITNESS} PRIVATE
+          "${VEXA_SHADERC_DIR}/libshaderc/include"
+          "${VEXA_SPIRVCROSS_DIR}")
+        target_compile_definitions(GL-host-${GUEST_BITNESS} PRIVATE VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR=1)
+      endif()
+    else()
+      find_package(OpenGL REQUIRED)
+      target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE OpenGL::GL)
+    endif()
   endif()
 endforeach()
 

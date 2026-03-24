@@ -74,6 +74,11 @@ function(generate NAME SOURCE_FILE)
   # This is not evaluated directly, hence directories added after return are still picked up
   set(prop "$<TARGET_PROPERTY:${NAME}-guest-deps,INTERFACE_INCLUDE_DIRECTORIES>")
   set(compile_prop "$<TARGET_PROPERTY:${NAME}-guest-deps,INTERFACE_COMPILE_DEFINITIONS>")
+  # VEXA_FIXES: Guest thunkgen runs with Linux guest targets; inject Android mode so
+  # BUILD_ANDROID branches in guest thunk sources/interfaces are selected intentionally.
+  if (ANDROID OR BUILD_ANDROID)
+    list(APPEND compile_prop BUILD_ANDROID=1)
+  endif()
 
   # Run thunk generator for each of the given output files
   set(OUTFOLDER "${CMAKE_CURRENT_BINARY_DIR}/gen")
@@ -89,10 +94,18 @@ function(generate NAME SOURCE_FILE)
     set(BITNESS_FLAGS2 "--target=x86_64-linux-gnu" "-isystem" "/usr/x86_64-linux-gnu/include/")
   endif()
 
+  # VEXA_FIXES: Keep Android GL proc allowlist header in thunkgen dependencies
+  # so edits in android_gl_proc_list.h always regenerate libGL guest stubs.
+  set(THUNKGEN_EXTRA_DEPS "")
+  if (NAME STREQUAL "libGL")
+    list(APPEND THUNKGEN_EXTRA_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/../libGL/android_gl_proc_list.h")
+  endif()
+
   add_custom_command(
     OUTPUT "${OUTFILE}"
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
+    DEPENDS ${THUNKGEN_EXTRA_DEPS}
     COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
@@ -126,6 +139,9 @@ function(add_guest_lib NAME SONAME)
   add_library(${NAME}-guest ${TARGET_TYPE} ${SOURCE_FILE} ${GEN_lib${NAME}})
   target_include_directories(${NAME}-guest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen/")
   target_compile_definitions(${NAME}-guest PRIVATE GUEST_THUNK_LIBRARY)
+  if (ANDROID OR BUILD_ANDROID)
+    target_compile_definitions(${NAME}-guest PRIVATE BUILD_ANDROID=1)
+  endif()
   target_link_libraries(${NAME}-guest PRIVATE lib${NAME}-guest-deps)
 
   ## Make signed overflow well defined 2's complement overflow
