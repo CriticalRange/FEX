@@ -1065,7 +1065,7 @@ void SignalDelegator::RegisterTLSState(FEX::HLE::ThreadStateObject* Thread) {
   if (Thread->Thread) {
     // Reserve a small amount of deferred signal frames. Usually the stack won't be utilized beyond
     // 1 or 2 signals but add a few more just in case.
-    Thread->SignalInfo.DeferredSignalFrames.reserve(8);
+    Thread->SignalInfo.DeferredSignalFrames.reserve(256);
   }
 }
 

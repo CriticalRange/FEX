@@ -52,6 +52,7 @@ extern "C" {
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -375,34 +376,83 @@ void TraceGLProcLookup(const char* proc, const void* resolved, const char* sourc
   }
 }
 
-// VEXA_FIXES: Resolve glXGetProcAddress lazily so loading libSDL3-guest.so
-// doesn't require libGL symbols to be pre-exported in the current namespace.
-void* SDL3ResolveGLProc(const GLubyte* procname) {
-  const char* procname_str = reinterpret_cast<const char*>(procname);
-  if (!procname_str || !*procname_str) {
-    return nullptr;
-  }
+enum class ProcResolverInitState : uint32_t {
+  Uninitialized = 0,
+  Initializing = 1,
+  Ready = 2,
+  Failed = 3,
+};
 
-  using GLXGetProcAddressFn = void* (*)(const GLubyte*);
-  static GLXGetProcAddressFn glx_get_proc = nullptr;
-  static bool resolver_initialized = false;
-  static bool resolver_missing_logged = false;
-  static void* gl_handle = nullptr;
-  static const char* gl_handle_name = nullptr;
-  static bool gl_dlopen_failures_logged = false;
-  static bool glx_dlsym_failure_logged = false;
-  static bool gl_symbol_dlsym_failure_logged = false;
+struct SDL3GLResolverState {
+  std::atomic<uint32_t> InitState {static_cast<uint32_t>(ProcResolverInitState::Uninitialized)};
+  void* GLHandle {};
+  const char* GLHandleName {};
+  void* (*GLXGetProc)(const GLubyte*) {};
+  bool ResolverMissingLogged {};
+  bool DlopenFailureLogged {};
+  bool GLXDlsymFailureLogged {};
+  bool SymbolDlsymFailureLogged {};
+};
 
-  if (!resolver_initialized) {
-    resolver_initialized = true;
-    glx_get_proc = reinterpret_cast<GLXGetProcAddressFn>(dlsym(RTLD_DEFAULT, "glXGetProcAddress"));
-    if (!glx_get_proc) {
-      glx_get_proc = reinterpret_cast<GLXGetProcAddressFn>(dlsym(RTLD_DEFAULT, "glXGetProcAddressARB"));
+struct SDL3EGLResolverState {
+  std::atomic<uint32_t> InitState {static_cast<uint32_t>(ProcResolverInitState::Uninitialized)};
+  void* EGLHandle {};
+  const char* EGLHandleName {};
+  void* (*EGLGetProc)(const char*) {};
+  bool ResolverMissingLogged {};
+  bool DlopenFailureLogged {};
+  bool EGLProcDlsymFailureLogged {};
+  bool SymbolDlsymFailureLogged {};
+};
+
+SDL3GLResolverState& GetSDL3GLResolverState() {
+  static SDL3GLResolverState State {};
+  return State;
+}
+
+SDL3EGLResolverState& GetSDL3EGLResolverState() {
+  static SDL3EGLResolverState State {};
+  return State;
+}
+
+bool SDL3EnsureGLResolverInitialized() {
+  auto& state = GetSDL3GLResolverState();
+  static thread_local bool InGLResolverInitialization = false;
+
+  while (true) {
+    const auto init_state = static_cast<ProcResolverInitState>(state.InitState.load(std::memory_order_acquire));
+    if (init_state == ProcResolverInitState::Ready) {
+      return state.GLXGetProc != nullptr;
+    }
+    if (init_state == ProcResolverInitState::Failed) {
+      return false;
+    }
+    if (init_state == ProcResolverInitState::Initializing) {
+      if (InGLResolverInitialization) {
+        return false;
+      }
+      std::this_thread::yield();
+      continue;
     }
 
-    // Prefer explicitly loading the VEXA GL guest thunk so proc resolution
-    // does not depend on global namespace ordering.
-    if (!glx_get_proc) {
+    uint32_t expected = static_cast<uint32_t>(ProcResolverInitState::Uninitialized);
+    if (!state.InitState.compare_exchange_strong(
+          expected,
+          static_cast<uint32_t>(ProcResolverInitState::Initializing),
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+      continue;
+    }
+
+    InGLResolverInitialization = true;
+    state.GLXGetProc = reinterpret_cast<void* (*)(const GLubyte*)>(dlsym(RTLD_DEFAULT, "glXGetProcAddress"));
+    if (!state.GLXGetProc) {
+      state.GLXGetProc = reinterpret_cast<void* (*)(const GLubyte*)>(dlsym(RTLD_DEFAULT, "glXGetProcAddressARB"));
+    }
+
+    if (!state.GLXGetProc) {
+      // Prefer explicitly loading the VEXA GL guest thunk so proc resolution
+      // does not depend on global namespace ordering.
       constexpr const char* GLHandleCandidates[] = {
         "/data/user/0/com.critical.vexaemulator/files/thunks/guest/libGL-guest.so",
         "/data/data/com.critical.vexaemulator/files/thunks/guest/libGL-guest.so",
@@ -415,51 +465,151 @@ void* SDL3ResolveGLProc(const GLubyte* procname) {
         dlerror();
         void* handle = dlopen(candidate, RTLD_NOW | RTLD_GLOBAL);
         if (handle) {
-          gl_handle = handle;
-          gl_handle_name = candidate;
+          state.GLHandle = handle;
+          state.GLHandleName = candidate;
           fprintf(stderr, "[SDL3 thunk] gl resolver handle loaded: %s => %p\n", candidate, handle);
           break;
         }
 
-        if (!gl_dlopen_failures_logged) {
+        if (!state.DlopenFailureLogged) {
           const char* err = dlerror();
           fprintf(stderr,
                   "[SDL3 thunk] dlopen('%s') failed while probing GL resolver: %s\n",
                   candidate,
                   err ? err : "<no dlerror>");
-          gl_dlopen_failures_logged = true;
+          state.DlopenFailureLogged = true;
         }
       }
 
-      if (gl_handle) {
+      if (state.GLHandle) {
         dlerror();
-        glx_get_proc = reinterpret_cast<GLXGetProcAddressFn>(dlsym(gl_handle, "glXGetProcAddress"));
-        if (!glx_get_proc) {
-          if (!glx_dlsym_failure_logged) {
+        state.GLXGetProc = reinterpret_cast<void* (*)(const GLubyte*)>(dlsym(state.GLHandle, "glXGetProcAddress"));
+        if (!state.GLXGetProc) {
+          if (!state.GLXDlsymFailureLogged) {
             const char* err = dlerror();
             fprintf(stderr,
                     "[SDL3 thunk] dlsym(%s,'glXGetProcAddress') failed: %s\n",
-                    gl_handle_name ? gl_handle_name : "<unknown>",
+                    state.GLHandleName ? state.GLHandleName : "<unknown>",
                     err ? err : "<no dlerror>");
           }
           dlerror();
-          glx_get_proc = reinterpret_cast<GLXGetProcAddressFn>(dlsym(gl_handle, "glXGetProcAddressARB"));
-          if (!glx_get_proc && !glx_dlsym_failure_logged) {
+          state.GLXGetProc = reinterpret_cast<void* (*)(const GLubyte*)>(dlsym(state.GLHandle, "glXGetProcAddressARB"));
+          if (!state.GLXGetProc && !state.GLXDlsymFailureLogged) {
             const char* err = dlerror();
             fprintf(stderr,
                     "[SDL3 thunk] dlsym(%s,'glXGetProcAddressARB') failed: %s\n",
-                    gl_handle_name ? gl_handle_name : "<unknown>",
+                    state.GLHandleName ? state.GLHandleName : "<unknown>",
                     err ? err : "<no dlerror>");
-            glx_dlsym_failure_logged = true;
+            state.GLXDlsymFailureLogged = true;
           }
         }
       }
     }
+
+    InGLResolverInitialization = false;
+    const bool initialized = state.GLXGetProc != nullptr;
+    state.InitState.store(
+      static_cast<uint32_t>(initialized ? ProcResolverInitState::Ready : ProcResolverInitState::Failed),
+      std::memory_order_release);
+    return initialized;
+  }
+}
+
+bool SDL3EnsureEGLResolverInitialized() {
+  auto& state = GetSDL3EGLResolverState();
+  static thread_local bool InEGLResolverInitialization = false;
+
+  while (true) {
+    const auto init_state = static_cast<ProcResolverInitState>(state.InitState.load(std::memory_order_acquire));
+    if (init_state == ProcResolverInitState::Ready) {
+      return state.EGLGetProc != nullptr || state.EGLHandle != nullptr;
+    }
+    if (init_state == ProcResolverInitState::Failed) {
+      return false;
+    }
+    if (init_state == ProcResolverInitState::Initializing) {
+      if (InEGLResolverInitialization) {
+        return false;
+      }
+      std::this_thread::yield();
+      continue;
+    }
+
+    uint32_t expected = static_cast<uint32_t>(ProcResolverInitState::Uninitialized);
+    if (!state.InitState.compare_exchange_strong(
+          expected,
+          static_cast<uint32_t>(ProcResolverInitState::Initializing),
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+      continue;
+    }
+
+    InEGLResolverInitialization = true;
+    state.EGLGetProc = reinterpret_cast<void* (*)(const char*)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
+
+    if (!state.EGLHandle) {
+      constexpr const char* EGLHandleCandidates[] = {
+        "/apex/com.android.opengl/lib64/libEGL.so",
+        "/system/lib64/libEGL.so",
+        "libEGL.so",
+      };
+
+      for (const char* candidate : EGLHandleCandidates) {
+        dlerror();
+        void* handle = dlopen(candidate, RTLD_NOW | RTLD_GLOBAL);
+        if (handle) {
+          state.EGLHandle = handle;
+          state.EGLHandleName = candidate;
+          break;
+        }
+
+        if (!state.DlopenFailureLogged) {
+          const char* err = dlerror();
+          fprintf(stderr,
+                  "[SDL3 thunk] dlopen('%s') failed while probing EGL resolver: %s\n",
+                  candidate,
+                  err ? err : "<no dlerror>");
+          state.DlopenFailureLogged = true;
+        }
+      }
+    }
+
+    if (!state.EGLGetProc && state.EGLHandle) {
+      dlerror();
+      state.EGLGetProc = reinterpret_cast<void* (*)(const char*)>(dlsym(state.EGLHandle, "eglGetProcAddress"));
+      if (!state.EGLGetProc && !state.EGLProcDlsymFailureLogged) {
+        const char* err = dlerror();
+        fprintf(stderr,
+                "[SDL3 thunk] dlsym(%s,'eglGetProcAddress') failed: %s\n",
+                state.EGLHandleName ? state.EGLHandleName : "<unknown>",
+                err ? err : "<no dlerror>");
+        state.EGLProcDlsymFailureLogged = true;
+      }
+    }
+
+    InEGLResolverInitialization = false;
+    const bool initialized = state.EGLGetProc != nullptr || state.EGLHandle != nullptr;
+    state.InitState.store(
+      static_cast<uint32_t>(initialized ? ProcResolverInitState::Ready : ProcResolverInitState::Failed),
+      std::memory_order_release);
+    return initialized;
+  }
+}
+
+// VEXA_FIXES: Resolve glXGetProcAddress with one-time guarded initialization so
+// we don't race/re-enter dlopen(libGL-guest.so) from multiple probing threads.
+void* SDL3ResolveGLProc(const GLubyte* procname) {
+  const char* procname_str = reinterpret_cast<const char*>(procname);
+  if (!procname_str || !*procname_str) {
+    return nullptr;
   }
 
-  if (!glx_get_proc) {
-    if (!resolver_missing_logged) {
-      resolver_missing_logged = true;
+  auto& state = GetSDL3GLResolverState();
+  (void)SDL3EnsureGLResolverInitialized();
+
+  if (!state.GLXGetProc) {
+    if (!state.ResolverMissingLogged) {
+      state.ResolverMissingLogged = true;
       fprintf(stderr, "[SDL3 thunk] missing glXGetProcAddress resolver while looking up '%s'\n", procname_str);
     }
 
@@ -471,27 +621,27 @@ void* SDL3ResolveGLProc(const GLubyte* procname) {
       return direct;
     }
 
-    if (gl_handle) {
+    if (state.GLHandle) {
       dlerror();
-      if (void* direct = dlsym(gl_handle, procname_str)) {
+      if (void* direct = dlsym(state.GLHandle, procname_str)) {
         fprintf(stderr, "[SDL3 thunk] direct dlsym fallback('%s') => %p via libGL handle\n",
                      procname_str, direct);
         return direct;
       }
-      if (!gl_symbol_dlsym_failure_logged) {
+      if (!state.SymbolDlsymFailureLogged) {
         const char* err = dlerror();
         fprintf(stderr,
                 "[SDL3 thunk] dlsym(%s,'%s') failed in direct fallback: %s\n",
-                gl_handle_name ? gl_handle_name : "<unknown>",
+                state.GLHandleName ? state.GLHandleName : "<unknown>",
                 procname_str,
                 err ? err : "<no dlerror>");
-        gl_symbol_dlsym_failure_logged = true;
+        state.SymbolDlsymFailureLogged = true;
       }
     }
     return nullptr;
   }
 
-  if (void* resolved = glx_get_proc(procname)) {
+  if (void* resolved = state.GLXGetProc(procname)) {
     return resolved;
   }
 
@@ -501,23 +651,65 @@ void* SDL3ResolveGLProc(const GLubyte* procname) {
                  procname_str, direct);
     return direct;
   }
-  if (gl_handle) {
+  if (state.GLHandle) {
     dlerror();
-    if (void* direct = dlsym(gl_handle, procname_str)) {
+    if (void* direct = dlsym(state.GLHandle, procname_str)) {
       fprintf(stderr, "[SDL3 thunk] secondary dlsym fallback('%s') => %p via libGL handle\n",
                    procname_str, direct);
       return direct;
     }
-    if (!gl_symbol_dlsym_failure_logged) {
+    if (!state.SymbolDlsymFailureLogged) {
       const char* err = dlerror();
       fprintf(stderr,
               "[SDL3 thunk] dlsym(%s,'%s') failed in secondary fallback: %s\n",
-              gl_handle_name ? gl_handle_name : "<unknown>",
+              state.GLHandleName ? state.GLHandleName : "<unknown>",
               procname_str,
               err ? err : "<no dlerror>");
-      gl_symbol_dlsym_failure_logged = true;
+      state.SymbolDlsymFailureLogged = true;
     }
   }
+  return nullptr;
+}
+
+// VEXA_FIXES: Keep EGL entry-point resolution independent from glX bridge
+// setup to avoid pulling libGL-guest initialization into EGL lookups.
+void* SDL3ResolveEGLProc(const char* procname) {
+  if (!procname || !*procname) {
+    return nullptr;
+  }
+
+  auto& state = GetSDL3EGLResolverState();
+  (void)SDL3EnsureEGLResolverInitialized();
+
+  if (state.EGLGetProc) {
+    if (void* resolved = state.EGLGetProc(procname)) {
+      return resolved;
+    }
+  } else if (!state.ResolverMissingLogged) {
+    state.ResolverMissingLogged = true;
+    fprintf(stderr, "[SDL3 thunk] missing eglGetProcAddress resolver while looking up '%s'\n", procname);
+  }
+
+  if (void* direct = dlsym(RTLD_DEFAULT, procname)) {
+    return direct;
+  }
+
+  if (state.EGLHandle) {
+    dlerror();
+    if (void* direct = dlsym(state.EGLHandle, procname)) {
+      return direct;
+    }
+    if (!state.SymbolDlsymFailureLogged) {
+      const char* err = dlerror();
+      fprintf(stderr,
+              "[SDL3 thunk] dlsym(%s,'%s') failed in EGL fallback: %s\n",
+              state.EGLHandleName ? state.EGLHandleName : "<unknown>",
+              procname,
+              err ? err : "<no dlerror>");
+      state.SymbolDlsymFailureLogged = true;
+    }
+  }
+
   return nullptr;
 }
 
@@ -2415,6 +2607,8 @@ extern "C" SDL_GLContext SDL_GL_CreateContext(SDL_Window* window) {
     CurrentGLContextPointer.store(reinterpret_cast<uintptr_t>(context), std::memory_order_release);
     CurrentGLWindowPointer.store(reinterpret_cast<uintptr_t>(window), std::memory_order_release);
     GLLibraryLoaded.store(true, std::memory_order_release);
+    (void)SDL3EnsureGLResolverInitialized();
+    (void)SDL3EnsureEGLResolverInitialized();
   }
   return context;
 }
@@ -2433,6 +2627,8 @@ extern "C" void SDL_GL_DeleteContext(SDL_GLContext context) {
 extern "C" bool SDL_GL_LoadLibrary(const char*) {
   fprintf(stderr, "[SDL3 thunk] SDL_GL_LoadLibrary()\n");
   GLLibraryLoaded.store(true, std::memory_order_release);
+  (void)SDL3EnsureGLResolverInitialized();
+  (void)SDL3EnsureEGLResolverInitialized();
   return true;
 }
 
@@ -2712,8 +2908,17 @@ extern "C" SDL_FunctionPointer SDL_GL_GetProcAddress(const char* proc) {
     return ReturnResolved(reinterpret_cast<void*>(GLCompatGetTexImage), "compat(glReadPixels)");
   }
 
-  const bool is_gl_or_egl_proc = proc_name.rfind("gl", 0) == 0 || proc_name.rfind("egl", 0) == 0;
-  if (is_gl_or_egl_proc) {
+  const bool is_gl_proc = proc_name.rfind("gl", 0) == 0;
+  const bool is_egl_proc = proc_name.rfind("egl", 0) == 0;
+  if (is_egl_proc) {
+    if (void* resolved = SDL3ResolveEGLProc(proc)) {
+      return ReturnResolved(resolved, "eglGetProcAddress");
+    }
+    TraceGLProcLookup(proc, nullptr, "egl-miss");
+    return nullptr;
+  }
+
+  if (is_gl_proc) {
     if (void* resolved = SDL3ResolveGLProc(reinterpret_cast<const GLubyte*>(proc))) {
       return ReturnResolved(resolved, "glXGetProcAddress");
     }
@@ -2731,7 +2936,7 @@ extern "C" SDL_FunctionPointer SDL_GL_GetProcAddress(const char* proc) {
   // If the GL thunk couldn't bridge a GL/EGL entry point then falling back to
   // RTLD_DEFAULT only returns the guest-side export, which can still point at a
   // null host function pointer.
-  if (is_gl_or_egl_proc) {
+  if (is_gl_proc) {
     TraceGLProcLookup(proc, nullptr, "gl-miss");
     return nullptr;
   }

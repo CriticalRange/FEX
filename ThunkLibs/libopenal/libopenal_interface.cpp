@@ -1,8 +1,10 @@
 #define AL_DISABLE_NOEXCEPT
+#define AL_ALEXT_PROTOTYPES
 #include <common/GeneratorInterface.h>
 
 #include <AL/al.h>
 #include <AL/alc.h>
+#include <AL/efx.h>
 
 template<auto> struct fex_gen_config {};
 template<typename> struct fex_gen_type {};
@@ -105,3 +107,40 @@ template<> struct fex_gen_config<alDopplerFactor> {};
 template<> struct fex_gen_config<alDopplerVelocity> {};
 template<> struct fex_gen_config<alSpeedOfSound> {};
 template<> struct fex_gen_config<alDistanceModel> {};
+
+// AL EFX
+template<> struct fex_gen_config<alGenEffects> {};
+template<> struct fex_gen_config<alDeleteEffects> {};
+template<> struct fex_gen_config<alIsEffect> {};
+template<> struct fex_gen_config<alEffecti> {};
+template<> struct fex_gen_config<alEffectiv> {};
+template<> struct fex_gen_config<alEffectf> {};
+template<> struct fex_gen_config<alEffectfv> {};
+template<> struct fex_gen_config<alGetEffecti> {};
+template<> struct fex_gen_config<alGetEffectiv> {};
+template<> struct fex_gen_config<alGetEffectf> {};
+template<> struct fex_gen_config<alGetEffectfv> {};
+
+template<> struct fex_gen_config<alGenFilters> {};
+template<> struct fex_gen_config<alDeleteFilters> {};
+template<> struct fex_gen_config<alIsFilter> {};
+template<> struct fex_gen_config<alFilteri> {};
+template<> struct fex_gen_config<alFilteriv> {};
+template<> struct fex_gen_config<alFilterf> {};
+template<> struct fex_gen_config<alFilterfv> {};
+template<> struct fex_gen_config<alGetFilteri> {};
+template<> struct fex_gen_config<alGetFilteriv> {};
+template<> struct fex_gen_config<alGetFilterf> {};
+template<> struct fex_gen_config<alGetFilterfv> {};
+
+template<> struct fex_gen_config<alGenAuxiliaryEffectSlots> {};
+template<> struct fex_gen_config<alDeleteAuxiliaryEffectSlots> {};
+template<> struct fex_gen_config<alIsAuxiliaryEffectSlot> {};
+template<> struct fex_gen_config<alAuxiliaryEffectSloti> {};
+template<> struct fex_gen_config<alAuxiliaryEffectSlotiv> {};
+template<> struct fex_gen_config<alAuxiliaryEffectSlotf> {};
+template<> struct fex_gen_config<alAuxiliaryEffectSlotfv> {};
+template<> struct fex_gen_config<alGetAuxiliaryEffectSloti> {};
+template<> struct fex_gen_config<alGetAuxiliaryEffectSlotiv> {};
+template<> struct fex_gen_config<alGetAuxiliaryEffectSlotf> {};
+template<> struct fex_gen_config<alGetAuxiliaryEffectSlotfv> {};

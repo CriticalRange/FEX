@@ -300,24 +300,24 @@ endif()
 
 # VEXA_FIXES: Desktop GL guest thunks depend on Linux GL/X11 ABI; keep optional for Android builds.
 if (ENABLE_DESKTOP_GL_THUNKS)
-    generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../
-  libGL/libGL_interface.cpp)
+    generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)
     add_guest_lib(GL "libGL.so.1")
 
     if (ENABLE_EGL_THUNKS)
       # VEXA_FIXES: Keep EGL guest thunk optional for Android-focused bring-up.
-      generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../
-    libEGL/libEGL_interface.cpp)
+      generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp)
       add_guest_lib(EGL "libEGL.so.1")
       target_link_libraries(EGL-guest PRIVATE GL-guest)
     endif()
 
     # VEXA_FIXES: libGL guest thunk requires an X11 SONAME during link; keep placeholder scoped to desktop GL path.
     # libGL must pull in libX11.so, so generate a placeholder libX11.so to link against
-add_library(PlaceholderX11 SHARED ../libX11/libX11_NativeGuest.cpp)
-target_link_options(PlaceholderX11 PRIVATE "LINKER:-soname,libX11.so.6")
-set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
-target_link_libraries(GL-guest PRIVATE PlaceholderX11)
+    if (NOT ANDROID AND NOT BUILD_ANDROID)
+        add_library(PlaceholderX11 SHARED ../libX11/libX11_NativeGuest.cpp)
+        target_link_options(PlaceholderX11 PRIVATE "LINKER:-soname,libX11.so.6")
+        set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
+        target_link_libraries(GL-guest PRIVATE PlaceholderX11)
+    endif()
   else()
     # VEXA_FIXES: Explicit status log helps confirm desktop GL guest thunk path is intentionally disabled.
     message(STATUS "Desktop GLX guest thunks
