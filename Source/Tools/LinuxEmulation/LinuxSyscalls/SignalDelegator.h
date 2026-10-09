@@ -294,4 +294,9 @@ private:
 
 fextl::unique_ptr<FEX::HLE::SignalDelegator>
 CreateSignalDelegator(FEXCore::Context::Context* CTX, const std::string_view ApplicationName, bool SupportsAVX);
+
+// Runs at the start of the host signal thunk, before the alt-stack thread
+// pointer is read. The hook must be async-signal-safe. Null disables it.
+using EarlyHostSignalHook = void (*)(int Signal, void* Info, void* UContext);
+__attribute__((visibility("default"))) void SetEarlyHostSignalHook(EarlyHostSignalHook Hook);
 } // namespace FEX::HLE

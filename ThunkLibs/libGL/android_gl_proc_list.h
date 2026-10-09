@@ -189,7 +189,6 @@
   OP(glClearDepthf) \
   OP(glClearDepthfOES) \
   OP(glClearDepth) \
-  OP(glViewport) \
   OP(glEnable) \
   OP(glDisable) \
   OP(glBlendFunc) \
@@ -198,7 +197,6 @@
   OP(glColorMask) \
   OP(glDepthFunc) \
   OP(glDepthMask) \
-  OP(glScissor) \
   OP(glStencilFunc) \
   OP(glStencilMask) \
   OP(glStencilOp) \
@@ -368,6 +366,8 @@ void glRenderbufferStorageMultisampleEXT(GLenum target, GLsizei samples, GLenum 
                                          GLsizei width, GLsizei height);
 void glPushGroupMarkerEXT(GLsizei length, const GLchar* marker);
 void glPopGroupMarkerEXT(void);
+void glClearDepthfOES(GLfloat depth);
+void glDisableClientState(GLenum array);
 }
 #endif
 

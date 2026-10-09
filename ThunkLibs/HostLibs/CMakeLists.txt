@@ -10,6 +10,7 @@ option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 set(VEXA_SDL3_PREFIX "" CACHE PATH "SDL3 Android prefix")
 set(VEXA_SDL3_IMAGE_PREFIX "" CACHE PATH "SDL3_image Android prefix")
 set(VEXA_OPENAL_PREFIX "" CACHE PATH "OpenAL Android prefix")
+set(ANDROID_NDK_SYSROOT "" CACHE PATH "Android NDK sysroot used when parsing host thunks")
 
 # VEXA_FIXES: Enable/Disable runtime shader translation for GL host thunk 
 # and third party directory that contains shaderc and spirv cross
@@ -103,6 +104,13 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     set(BITNESS_FLAGS "-for-32bit-guest")
   endif()
 
+  # Thunkgen itself runs on Windows. The host thunk is compiled for Android,
+  # so the host parse must see the NDK's LP64 Android headers.
+  set(HOST_ABI_FLAGS "")
+  if (ANDROID AND NOT ANDROID_NDK_SYSROOT STREQUAL "")
+    list(APPEND HOST_ABI_FLAGS "--target=aarch64-linux-android30" "--sysroot=${ANDROID_NDK_SYSROOT}")
+  endif()
+
   # VEXA_FIXES: Support both target thunkgen (native builds) and absolute host thunkgen path (cross builds).
   set(THUNKGEN_INPUT_DEPENDS "")
   if (TARGET thunkgen)
@@ -123,7 +131,7 @@ function(generate NAME SOURCE_FILE GUEST_BITNESS)
     DEPENDS "${SOURCE_FILE}"
     DEPENDS ${THUNKGEN_INPUT_DEPENDS}
     DEPENDS ${THUNKGEN_EXTRA_DEPS}
-    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-host" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${HOST_ABI_FLAGS}
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -152,7 +160,10 @@ function(add_host_lib NAME GUEST_BITNESS)
   target_include_directories(${NAME}-host-${GUEST_BITNESS} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen_${GUEST_BITNESS}/")
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE dl)
   target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE lib${NAME}-${GUEST_BITNESS}-deps)
-  target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE FEX)
+  # The Android FEX executable is not a host library. Thunk entry points are weak.
+  if (NOT ANDROID)
+    target_link_libraries(${NAME}-host-${GUEST_BITNESS} PRIVATE FEX)
+  endif()
   ## Make signed overflow well defined 2's complement overflow
   target_compile_options(${NAME}-host-${GUEST_BITNESS} PRIVATE -fwrapv)
 
@@ -192,7 +203,7 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
   add_host_lib(drm ${GUEST_BITNESS})
   endif()
-  if (ANDROID)
+  if (ANDROID AND NOT VEXA_SDL3_PREFIX STREQUAL "")
     # VEXA_FIXES: Build Android host thunks for SDL3 so guest `libSDL3` imports route
     # to the Android SDL3 host library through FEX thunk bridge.
     generate(libSDL3 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_interface.cpp ${GUEST_BITNESS})
@@ -220,7 +231,11 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   endif()
 endforeach()
 
-set(BITNESS_LIST "32;64")
+if (ANDROID)
+  set(BITNESS_LIST "64")
+else()
+  set(BITNESS_LIST "32;64")
+endif()
 foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   if (BUILD_FEX_LINUX_TESTS)
     generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp ${GUEST_BITNESS})
@@ -249,17 +264,21 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
     add_host_lib(EGL ${GUEST_BITNESS})
     # VEXA_FIXES: Android GL host thunk stack resolves through system EGL, not desktop OpenGL.
     if (ANDROID)
-      target_link_libraries(EGL-host-${GUEST_BITNESS} PRIVATE EGL)
+      target_link_libraries(EGL-host-${GUEST_BITNESS} PRIVATE EGL android log)
+      generate(libGLESv2 ${CMAKE_CURRENT_SOURCE_DIR}/../libGLESv2/libGLESv2_interface.cpp ${GUEST_BITNESS})
+      add_host_lib(GLESv2 ${GUEST_BITNESS})
+      target_link_libraries(GLESv2-host-${GUEST_BITNESS} PRIVATE GLESv3 log android)
     endif()
   endif()
 
   # VEXA_FIXES: Build GL host thunk on Android and map it to EGL/GLES runtime libs.
   if (ENABLE_DESKTOP_GL_THUNKS)
     generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp ${GUEST_BITNESS})
+    target_include_directories(libGL-${GUEST_BITNESS}-deps BEFORE INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../libGL/include")
     add_host_lib(GL ${GUEST_BITNESS})
 
     if (ANDROID)
-      target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE EGL GLESv3 log)
+      target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE EGL GLESv3 log android)
       if (VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR AND TARGET shaderc_combined AND TARGET spirv-cross-core AND TARGET spirv-cross-glsl)
         target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE shaderc_combined spirv-cross-core spirv-cross-glsl)
         target_include_directories(GL-host-${GUEST_BITNESS} PRIVATE

@@ -4,7 +4,7 @@
 
 #include <fmt/format.h>
 
-#include <openssl/sha.h>
+#include "sha256_compat.h"
 #include <cctype>
 #include <string_view>
 

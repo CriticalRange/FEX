@@ -15,6 +15,13 @@
 
 extern "C" using __GLXextFuncPtr = void (*)(void);
 extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
+extern "C" int VEXA_BindGlxSurface(void);
+extern "C" void VEXA_SwapGlxBuffers(void);
+// One host transition uploads or draws a baked fixed-function mesh.
+extern "C" unsigned VEXA_FFUpload(const float* vertices, int float_count);
+extern "C" void VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp);
+extern "C" void VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color);
+extern "C" void VEXA_FFDelete(unsigned buffer);
 #else
 #include <GL/glx.h>
 #include <GL/glxext.h>
@@ -40,6 +47,21 @@ struct fex_gen_config {
 // resolution and guest trampoline linkage deterministic.
 template<>
 struct fex_gen_config<glXGetProcAddress> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint, fexgen::returns_guest_pointer {};
+
+#ifdef BUILD_ANDROID
+template<>
+struct fex_gen_config<VEXA_BindGlxSurface> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_SwapGlxBuffers> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_FFUpload> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_FFDrawList> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_FFDrawImmediate> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_FFDelete> : fexgen::custom_host_impl {};
+#endif
 
 // internal use
 // VEXA_FIXES: Host callback setters are runtime wiring hooks populated from
@@ -120,6 +142,11 @@ template<> \
 struct fex_gen_config<name> {};
 FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN(FEX_ANDROID_GL_CONFIG)
 #undef FEX_ANDROID_GL_CONFIG
+
+template<>
+struct fex_gen_config<glViewport> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glScissor> : fexgen::custom_host_impl {};
 
 #else
 template<>

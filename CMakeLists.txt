@@ -605,9 +605,14 @@ if (BUILD_THUNKS)
       endif()
 
     add_subdirectory(ThunkLibs/HostLibs)
-    add_subdirectory(ThunkLibs/GuestLibs)
+    # The Android build cross-compiles guest thunks with ExternalProject.
+    # Compiling them again with the Android compiler only produces unused objects.
+    if (NOT ANDROID)
+      add_subdirectory(ThunkLibs/GuestLibs)
+    endif()
 
     include(ExternalProject)
+    file(TO_CMAKE_PATH "${CMAKE_MAKE_PROGRAM}" VEXA_GUEST_NINJA)
     # VEXA_FIXES: Pass Android-specific thunk feature toggles into guest thunk sub-builds.
     ExternalProject_Add(guest-libs
       PREFIX guest-libs
@@ -630,14 +635,19 @@ if (BUILD_THUNKS)
       "-DENABLE_VDSO_THUNKS=${ENABLE_VDSO_THUNKS}"
       "-DENABLE_WAYLAND_THUNKS=${ENABLE_WAYLAND_THUNKS}"
       "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_64_TOOLCHAIN_FILE}"
+      "-DCMAKE_MAKE_PROGRAM=${VEXA_GUEST_NINJA}"
       "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
       "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
         "-DGENERATOR_EXE=${GENERATOR_EXE}"
         "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+        "-DVEXA_GUEST_CC=${VEXA_GUEST_CC}"
+        "-DVEXA_GUEST_CXX=${VEXA_GUEST_CXX}"
       INSTALL_COMMAND ""
       BUILD_ALWAYS ON
       DEPENDS ${THUNKGEN_DEPENDS})
 
+    # 32-bit guest thunks are not shipped on Android.
+    if (NOT ANDROID)
     # VEXA_FIXES: Mirror thunk feature toggles for 32-bit guest thunk sub-build.
     ExternalProject_Add(guest-libs-32
       PREFIX guest-libs-32
@@ -668,14 +678,6 @@ if (BUILD_THUNKS)
       BUILD_ALWAYS ON
       DEPENDS ${THUNKGEN_DEPENDS})
 
-    install(
-    CODE "message(\"-- Installing: guest-libs\")"
-    CODE "
-      execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)"
-    DEPENDS guest-libs
-    COMPONENT Runtime)
-
   install(
     CODE "message(\"-- Installing: guest-libs-32\")"
     CODE "
@@ -684,16 +686,26 @@ if (BUILD_THUNKS)
     DEPENDS guest-libs-32
     COMPONENT Runtime)
 
-  add_custom_target(uninstall_guest-libs
-    COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)
-
   add_custom_target(uninstall_guest-libs-32
     COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)
 
-  add_dependencies(uninstall uninstall_guest-libs)
   add_dependencies(uninstall uninstall_guest-libs-32)
+  endif()
+
+    install(
+    CODE "message(\"-- Installing: guest-libs\")"
+    CODE "
+      execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)"
+    DEPENDS guest-libs
+    COMPONENT Runtime)
+
+  add_custom_target(uninstall_guest-libs
+    COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)
+
+  add_dependencies(uninstall uninstall_guest-libs)
   endif()
 
 if (BUILD_STEAM_SUPPORT)

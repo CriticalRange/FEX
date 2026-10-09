@@ -66,6 +66,10 @@ static int VexaGLGuestFprintf(FILE* stream, const char* fmt, ...) {
 
 #include "thunkgen_guest_libGL.inl"
 
+#ifdef BUILD_ANDROID
+#include "android_fixed_function.h"
+#endif
+
 typedef void voidFunc();
 
 #ifdef BUILD_ANDROID
@@ -196,12 +200,60 @@ void* glXGetCurrentContext();
 unsigned long glXGetCurrentDrawable();
 int glXMakeCurrent(void* display, unsigned long drawable, void* context);
 void glXSwapBuffers(void* display, unsigned long drawable);
+void glXQueryDrawable(void* display, unsigned long drawable, int attribute, unsigned int* value);
+void glBegin(GLenum mode);
+void glEnd(void);
+void glVertex3f(GLfloat x, GLfloat y, GLfloat z);
+void glNormal3f(GLfloat x, GLfloat y, GLfloat z);
+void glMatrixMode(GLenum mode);
+void glLoadIdentity(void);
+void glTranslatef(GLfloat x, GLfloat y, GLfloat z);
+void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z);
+void glTranslated(GLdouble x, GLdouble y, GLdouble z);
+void glPushMatrix(void);
+void glPopMatrix(void);
+void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble znear, GLdouble zfar);
+GLuint glGenLists(GLsizei range);
+void glNewList(GLuint list, GLenum mode);
+void glEndList(void);
+void glCallList(GLuint list);
+void glDeleteLists(GLuint list, GLsizei range);
+void glShadeModel(GLenum mode);
+void glLightfv(GLenum light, GLenum pname, const GLfloat* params);
+void glMaterialfv(GLenum face, GLenum pname, const GLfloat* params);
 const char* glXQueryExtensionsString(void* display, int screen);
 void* glXGetCurrentDisplay();
 void* glXChooseFBConfig(void* display, int screen, const int* attributes, int* num_items);
 unsigned long glXCreatePbuffer(void* display, void* config, const int* attrib_list);
 void glXDestroyPbuffer(void* display, unsigned long pbuffer);
 void* glXGetVisualFromFBConfig(void* display, void* config);
+int glXQueryVersion(void* display, int* major, int* minor);
+int glXGetConfig(void* display, void* visual, int attribute, int* value);
+int glXIsDirect(void* display, void* context);
+const char* glXGetClientString(void* display, int name);
+const char* glXQueryServerString(void* display, int screen, int name);
+void* glXCreateNewContext(void* display, void* config, int render_type, void* share_list, int direct);
+int glXGetFBConfigAttrib(void* display, void* config, int attribute, int* value);
+void* glXGetFBConfigs(void* display, int screen, int* nelements);
+int glXMakeContextCurrent(void* display, unsigned long draw, unsigned long read, void* context);
+int glXQueryExtension(void* display, int* error_base, int* event_base);
+void glXCopyContext(void* display, void* src, void* dst, unsigned long mask);
+unsigned long glXCreateGLXPixmap(void* display, void* visual, unsigned long pixmap);
+void glXDestroyGLXPixmap(void* display, unsigned long pixmap);
+void glXUseXFont(unsigned long font, int first, int count, int list_base);
+void glXWaitGL(void);
+void glXWaitX(void);
+unsigned long glXCreatePixmap(void* display, void* config, unsigned long pixmap, const int* attribs);
+unsigned long glXCreateWindow(void* display, void* config, unsigned long window, const int* attribs);
+void glXDestroyPixmap(void* display, unsigned long pixmap);
+void glXDestroyWindow(void* display, unsigned long window);
+unsigned long glXGetCurrentReadDrawable(void);
+int glXQueryContext(void* display, void* context, int attribute, int* value);
+void glXSelectEvent(void* display, unsigned long drawable, unsigned long mask);
+void glXGetSelectedEvent(void* display, unsigned long drawable, unsigned long* mask);
+void glXSwapIntervalEXT(void* display, unsigned long drawable, int interval);
+int glXGetSwapIntervalMESA(void);
+int glXSwapIntervalMESA(unsigned int interval);
 void glLineWidth(GLfloat width);
 void glPolygonMode(GLenum face, GLenum mode);
 void glTexParameteriv(GLenum target, GLenum pname, const GLint* params);
@@ -403,6 +455,12 @@ uintptr_t ResolveAndroidDirectGuestProc(std::string_view procname) {
   if (procname == "glClearDepth") {
     return reinterpret_cast<uintptr_t>(fexfn_pack_glClearDepth);
   }
+  if (procname == "glViewport") {
+    return reinterpret_cast<uintptr_t>(fexfn_pack_glViewport);
+  }
+  if (procname == "glScissor") {
+    return reinterpret_cast<uintptr_t>(fexfn_pack_glScissor);
+  }
   return 0;
 }
 
@@ -415,12 +473,40 @@ uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
   if (procname == "glXGetCurrentDrawable") return reinterpret_cast<uintptr_t>(glXGetCurrentDrawable);
   if (procname == "glXMakeCurrent") return reinterpret_cast<uintptr_t>(glXMakeCurrent);
   if (procname == "glXSwapBuffers") return reinterpret_cast<uintptr_t>(glXSwapBuffers);
+  if (procname == "glXQueryDrawable") return reinterpret_cast<uintptr_t>(glXQueryDrawable);
   if (procname == "glXQueryExtensionsString") return reinterpret_cast<uintptr_t>(glXQueryExtensionsString);
   if (procname == "glXGetCurrentDisplay") return reinterpret_cast<uintptr_t>(glXGetCurrentDisplay);
   if (procname == "glXChooseFBConfig") return reinterpret_cast<uintptr_t>(glXChooseFBConfig);
   if (procname == "glXCreatePbuffer") return reinterpret_cast<uintptr_t>(glXCreatePbuffer);
   if (procname == "glXDestroyPbuffer") return reinterpret_cast<uintptr_t>(glXDestroyPbuffer);
   if (procname == "glXGetVisualFromFBConfig") return reinterpret_cast<uintptr_t>(glXGetVisualFromFBConfig);
+  if (procname == "glXQueryVersion") return reinterpret_cast<uintptr_t>(glXQueryVersion);
+  if (procname == "glXGetConfig") return reinterpret_cast<uintptr_t>(glXGetConfig);
+  if (procname == "glXIsDirect") return reinterpret_cast<uintptr_t>(glXIsDirect);
+  if (procname == "glXGetClientString") return reinterpret_cast<uintptr_t>(glXGetClientString);
+  if (procname == "glXQueryServerString") return reinterpret_cast<uintptr_t>(glXQueryServerString);
+  if (procname == "glXCreateNewContext") return reinterpret_cast<uintptr_t>(glXCreateNewContext);
+  if (procname == "glXGetFBConfigAttrib") return reinterpret_cast<uintptr_t>(glXGetFBConfigAttrib);
+  if (procname == "glXGetFBConfigs") return reinterpret_cast<uintptr_t>(glXGetFBConfigs);
+  if (procname == "glXMakeContextCurrent") return reinterpret_cast<uintptr_t>(glXMakeContextCurrent);
+  if (procname == "glXQueryExtension") return reinterpret_cast<uintptr_t>(glXQueryExtension);
+  if (procname == "glXCopyContext") return reinterpret_cast<uintptr_t>(glXCopyContext);
+  if (procname == "glXCreateGLXPixmap") return reinterpret_cast<uintptr_t>(glXCreateGLXPixmap);
+  if (procname == "glXDestroyGLXPixmap") return reinterpret_cast<uintptr_t>(glXDestroyGLXPixmap);
+  if (procname == "glXUseXFont") return reinterpret_cast<uintptr_t>(glXUseXFont);
+  if (procname == "glXWaitGL") return reinterpret_cast<uintptr_t>(glXWaitGL);
+  if (procname == "glXWaitX") return reinterpret_cast<uintptr_t>(glXWaitX);
+  if (procname == "glXCreatePixmap") return reinterpret_cast<uintptr_t>(glXCreatePixmap);
+  if (procname == "glXCreateWindow") return reinterpret_cast<uintptr_t>(glXCreateWindow);
+  if (procname == "glXDestroyPixmap") return reinterpret_cast<uintptr_t>(glXDestroyPixmap);
+  if (procname == "glXDestroyWindow") return reinterpret_cast<uintptr_t>(glXDestroyWindow);
+  if (procname == "glXGetCurrentReadDrawable") return reinterpret_cast<uintptr_t>(glXGetCurrentReadDrawable);
+  if (procname == "glXQueryContext") return reinterpret_cast<uintptr_t>(glXQueryContext);
+  if (procname == "glXSelectEvent") return reinterpret_cast<uintptr_t>(glXSelectEvent);
+  if (procname == "glXGetSelectedEvent") return reinterpret_cast<uintptr_t>(glXGetSelectedEvent);
+  if (procname == "glXSwapIntervalEXT") return reinterpret_cast<uintptr_t>(glXSwapIntervalEXT);
+  if (procname == "glXGetSwapIntervalMESA") return reinterpret_cast<uintptr_t>(glXGetSwapIntervalMESA);
+  if (procname == "glXSwapIntervalMESA") return reinterpret_cast<uintptr_t>(glXSwapIntervalMESA);
   if (procname == "glLineWidth") return reinterpret_cast<uintptr_t>(glLineWidth);
   if (procname == "glPolygonMode") return reinterpret_cast<uintptr_t>(glPolygonMode);
   if (procname == "glTexParameteriv") return reinterpret_cast<uintptr_t>(glTexParameteriv);
@@ -442,6 +528,26 @@ uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
   if (procname == "glCopyTexSubImage1D") return reinterpret_cast<uintptr_t>(glCopyTexSubImage1D);
   if (procname == "glTexSubImage1D") return reinterpret_cast<uintptr_t>(glTexSubImage1D);
   if (procname == "glIsTexture") return reinterpret_cast<uintptr_t>(glIsTexture);
+  if (procname == "glBegin") return reinterpret_cast<uintptr_t>(glBegin);
+  if (procname == "glEnd") return reinterpret_cast<uintptr_t>(glEnd);
+  if (procname == "glVertex3f") return reinterpret_cast<uintptr_t>(glVertex3f);
+  if (procname == "glNormal3f") return reinterpret_cast<uintptr_t>(glNormal3f);
+  if (procname == "glMatrixMode") return reinterpret_cast<uintptr_t>(glMatrixMode);
+  if (procname == "glLoadIdentity") return reinterpret_cast<uintptr_t>(glLoadIdentity);
+  if (procname == "glTranslatef") return reinterpret_cast<uintptr_t>(glTranslatef);
+  if (procname == "glRotatef") return reinterpret_cast<uintptr_t>(glRotatef);
+  if (procname == "glTranslated") return reinterpret_cast<uintptr_t>(glTranslated);
+  if (procname == "glPushMatrix") return reinterpret_cast<uintptr_t>(glPushMatrix);
+  if (procname == "glPopMatrix") return reinterpret_cast<uintptr_t>(glPopMatrix);
+  if (procname == "glFrustum") return reinterpret_cast<uintptr_t>(glFrustum);
+  if (procname == "glGenLists") return reinterpret_cast<uintptr_t>(glGenLists);
+  if (procname == "glNewList") return reinterpret_cast<uintptr_t>(glNewList);
+  if (procname == "glEndList") return reinterpret_cast<uintptr_t>(glEndList);
+  if (procname == "glCallList") return reinterpret_cast<uintptr_t>(glCallList);
+  if (procname == "glDeleteLists") return reinterpret_cast<uintptr_t>(glDeleteLists);
+  if (procname == "glShadeModel") return reinterpret_cast<uintptr_t>(glShadeModel);
+  if (procname == "glLightfv") return reinterpret_cast<uintptr_t>(glLightfv);
+  if (procname == "glMaterialfv") return reinterpret_cast<uintptr_t>(glMaterialfv);
 #else
   (void)procname;
 #endif
@@ -655,12 +761,13 @@ constexpr uintptr_t kCompatVisual = 0x47585649ULL;   // "GXVI"
 constexpr uintptr_t kCompatFBConfig = 0x47584642ULL; // "GXFB"
 constexpr unsigned long kCompatDrawable = 1UL;
 constexpr unsigned long kCompatPbuffer = 1UL;
+static void* g_vexa_current_context = nullptr;
 
 #define VEXA_GL_GUEST_EXPORT __attribute__((visibility("default")))
 
 VEXA_GL_GUEST_EXPORT void* glXChooseVisual(void* /*display*/, int /*screen*/, int* /*attributes*/) {
   fprintf(stderr, "[libGL thunk] compat glXChooseVisual\n");
-  return reinterpret_cast<void*>(kCompatVisual);
+  return std::calloc(1, 256);
 }
 
 VEXA_GL_GUEST_EXPORT void* glXCreateContext(void* /*display*/, void* /*visual*/, void* /*share_list*/, int /*direct*/) {
@@ -673,7 +780,7 @@ VEXA_GL_GUEST_EXPORT void glXDestroyContext(void* /*display*/, void* context) {
 }
 
 VEXA_GL_GUEST_EXPORT void* glXGetCurrentContext() {
-  return reinterpret_cast<void*>(kCompatContext);
+  return g_vexa_current_context;
 }
 
 VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentDrawable() {
@@ -682,12 +789,30 @@ VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentDrawable() {
 
 VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawable, void* context) {
   fprintf(stderr, "[libGL thunk] compat glXMakeCurrent drawable=%lu context=%p\n", drawable, context);
-  return 1;
+  g_vexa_current_context = context;
+  vexa_ff::init_matrices();
+  if (!context) {
+    return 1;
+  }
+  return fexfn_pack_VEXA_BindGlxSurface();
 }
 
 VEXA_GL_GUEST_EXPORT void glXSwapBuffers(void* /*display*/, unsigned long drawable) {
   fprintf(stderr, "[libGL thunk] compat glXSwapBuffers drawable=%lu\n", drawable);
-  glFlush();
+  fexfn_pack_VEXA_SwapGlxBuffers();
+}
+
+VEXA_GL_GUEST_EXPORT void glXQueryDrawable(void* /*display*/, unsigned long /*drawable*/, int attribute, unsigned int* value) {
+  if (!value) {
+    return;
+  }
+  if (attribute == 0x801D) {
+    *value = 1280;
+  } else if (attribute == 0x801E) {
+    *value = 720;
+  } else {
+    *value = 0;
+  }
 }
 
 VEXA_GL_GUEST_EXPORT const char* glXQueryExtensionsString(void* /*display*/, int /*screen*/) {
@@ -699,9 +824,12 @@ VEXA_GL_GUEST_EXPORT void* glXGetCurrentDisplay() {
 }
 
 VEXA_GL_GUEST_EXPORT void* glXChooseFBConfig(void* /*display*/, int /*screen*/, const int* /*attributes*/, int* num_items) {
-  static void* configs[1] {reinterpret_cast<void*>(kCompatFBConfig)};
+  auto* configs = static_cast<void**>(std::malloc(sizeof(void*)));
+  if (configs) {
+    configs[0] = reinterpret_cast<void*>(kCompatFBConfig);
+  }
   if (num_items) {
-    *num_items = 1;
+    *num_items = configs ? 1 : 0;
   }
   return configs;
 }
@@ -715,8 +843,104 @@ VEXA_GL_GUEST_EXPORT void glXDestroyPbuffer(void* /*display*/, unsigned long pbu
 }
 
 VEXA_GL_GUEST_EXPORT void* glXGetVisualFromFBConfig(void* /*display*/, void* /*config*/) {
-  return reinterpret_cast<void*>(kCompatVisual);
+  return std::calloc(1, 256);
 }
+
+static int vexa_glx_attrib(int attribute, int* value) {
+  if (!value) {
+    return 1;
+  }
+  switch (attribute) {
+    case 1: *value = 1; break;
+    case 2: *value = 32; break;
+    case 4: *value = 1; break;
+    case 5: *value = 1; break;
+    case 8:
+    case 9:
+    case 10:
+    case 11: *value = 8; break;
+    case 12: *value = 24; break;
+    case 13: *value = 0; break;
+    case 0x20: *value = 0x8000; break;
+    case 0x22: *value = 0x8002; break;
+    case 0x800B: *value = 1; break;
+    case 0x8010: *value = 1; break;
+    case 0x8011: *value = 1; break;
+    case 0x8012: *value = 1; break;
+    case 0x8013: *value = 1; break;
+    default: *value = 0; break;
+  }
+  return 0;
+}
+
+VEXA_GL_GUEST_EXPORT int glXQueryVersion(void*, int* major, int* minor) {
+  if (major) *major = 1;
+  if (minor) *minor = 4;
+  return 1;
+}
+
+VEXA_GL_GUEST_EXPORT int glXGetConfig(void*, void*, int attribute, int* value) {
+  return vexa_glx_attrib(attribute, value);
+}
+
+VEXA_GL_GUEST_EXPORT int glXIsDirect(void*, void*) {
+  return 1;
+}
+
+VEXA_GL_GUEST_EXPORT const char* glXGetClientString(void*, int name) {
+  if (name == 1) return "VEXA";
+  if (name == 2) return "1.4";
+  return kCompatGLXExts;
+}
+
+VEXA_GL_GUEST_EXPORT const char* glXQueryServerString(void*, int, int name) {
+  return glXGetClientString(nullptr, name);
+}
+
+VEXA_GL_GUEST_EXPORT void* glXCreateNewContext(void*, void*, int, void*, int) {
+  fprintf(stderr, "[libGL thunk] compat glXCreateNewContext\n");
+  return reinterpret_cast<void*>(kCompatContext);
+}
+
+VEXA_GL_GUEST_EXPORT int glXGetFBConfigAttrib(void*, void*, int attribute, int* value) {
+  return vexa_glx_attrib(attribute, value);
+}
+
+VEXA_GL_GUEST_EXPORT void* glXGetFBConfigs(void* display, int screen, int* nelements) {
+  return glXChooseFBConfig(display, screen, nullptr, nelements);
+}
+
+VEXA_GL_GUEST_EXPORT int glXMakeContextCurrent(void* display, unsigned long draw, unsigned long, void* context) {
+  return glXMakeCurrent(display, draw, context);
+}
+
+VEXA_GL_GUEST_EXPORT int glXQueryExtension(void*, int* error_base, int* event_base) {
+  if (error_base) *error_base = 0;
+  if (event_base) *event_base = 0;
+  return 1;
+}
+
+VEXA_GL_GUEST_EXPORT void glXCopyContext(void*, void*, void*, unsigned long) {}
+VEXA_GL_GUEST_EXPORT unsigned long glXCreateGLXPixmap(void*, void*, unsigned long) { return 1; }
+VEXA_GL_GUEST_EXPORT void glXDestroyGLXPixmap(void*, unsigned long) {}
+VEXA_GL_GUEST_EXPORT void glXUseXFont(unsigned long, int, int, int) {}
+VEXA_GL_GUEST_EXPORT void glXWaitGL(void) {}
+VEXA_GL_GUEST_EXPORT void glXWaitX(void) {}
+VEXA_GL_GUEST_EXPORT unsigned long glXCreatePixmap(void*, void*, unsigned long, const int*) { return 1; }
+VEXA_GL_GUEST_EXPORT unsigned long glXCreateWindow(void*, void*, unsigned long, const int*) { return kCompatDrawable; }
+VEXA_GL_GUEST_EXPORT void glXDestroyPixmap(void*, unsigned long) {}
+VEXA_GL_GUEST_EXPORT void glXDestroyWindow(void*, unsigned long) {}
+VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentReadDrawable(void) { return kCompatDrawable; }
+VEXA_GL_GUEST_EXPORT int glXQueryContext(void*, void*, int attribute, int* value) {
+  return vexa_glx_attrib(attribute, value);
+}
+VEXA_GL_GUEST_EXPORT void glXSelectEvent(void*, unsigned long, unsigned long) {}
+VEXA_GL_GUEST_EXPORT void glXGetSelectedEvent(void*, unsigned long, unsigned long* mask) {
+  if (mask) *mask = 0;
+}
+VEXA_GL_GUEST_EXPORT void glXSwapIntervalEXT(void*, unsigned long, int) {}
+VEXA_GL_GUEST_EXPORT int glXGetSwapIntervalMESA(void) { return 0; }
+VEXA_GL_GUEST_EXPORT int glXSwapIntervalMESA(unsigned int) { return 0; }
 
 VEXA_GL_GUEST_EXPORT void glLineWidth(GLfloat width) {
   fprintf(stderr, "[libGL thunk] compat glLineWidth width=%f (no-op)\n", static_cast<double>(width));
@@ -826,6 +1050,34 @@ VEXA_GL_GUEST_EXPORT void glTexSubImage1D(GLenum target, GLint level, GLint xoff
 VEXA_GL_GUEST_EXPORT GLboolean glIsTexture(GLuint texture) {
   fprintf(stderr, "[libGL thunk] compat glIsTexture texture=%u -> GL_TRUE\n", texture);
   return texture != 0 ? GL_TRUE : GL_FALSE;
+}
+
+VEXA_GL_GUEST_EXPORT void glBegin(GLenum mode) { vexa_ff::begin(mode); }
+VEXA_GL_GUEST_EXPORT void glEnd(void) { vexa_ff::end(); }
+VEXA_GL_GUEST_EXPORT void glVertex3f(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::vertex(x, y, z); }
+VEXA_GL_GUEST_EXPORT void glNormal3f(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::normal(x, y, z); }
+VEXA_GL_GUEST_EXPORT void glMatrixMode(GLenum mode) { vexa_ff::matrix_mode(mode); }
+VEXA_GL_GUEST_EXPORT void glLoadIdentity(void) { vexa_ff::load_identity(); }
+VEXA_GL_GUEST_EXPORT void glTranslatef(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::translate(x, y, z); }
+VEXA_GL_GUEST_EXPORT void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z) { vexa_ff::rotate(angle, x, y, z); }
+VEXA_GL_GUEST_EXPORT void glTranslated(GLdouble x, GLdouble y, GLdouble z) {
+  vexa_ff::translate(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+}
+VEXA_GL_GUEST_EXPORT void glPushMatrix(void) { vexa_ff::push_matrix(); }
+VEXA_GL_GUEST_EXPORT void glPopMatrix(void) { vexa_ff::pop_matrix(); }
+VEXA_GL_GUEST_EXPORT void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble znear, GLdouble zfar) {
+  vexa_ff::frustum(static_cast<float>(left), static_cast<float>(right), static_cast<float>(bottom), static_cast<float>(top),
+                   static_cast<float>(znear), static_cast<float>(zfar));
+}
+VEXA_GL_GUEST_EXPORT GLuint glGenLists(GLsizei range) { return vexa_ff::gen_lists(range); }
+VEXA_GL_GUEST_EXPORT void glNewList(GLuint list, GLenum mode) { vexa_ff::new_list(list, mode); }
+VEXA_GL_GUEST_EXPORT void glEndList(void) { vexa_ff::end_list(); }
+VEXA_GL_GUEST_EXPORT void glCallList(GLuint list) { vexa_ff::call_list(list); }
+VEXA_GL_GUEST_EXPORT void glDeleteLists(GLuint list, GLsizei range) { vexa_ff::delete_lists(list, range); }
+VEXA_GL_GUEST_EXPORT void glShadeModel(GLenum /*mode*/) {}
+VEXA_GL_GUEST_EXPORT void glLightfv(GLenum /*light*/, GLenum /*pname*/, const GLfloat* /*params*/) {}
+VEXA_GL_GUEST_EXPORT void glMaterialfv(GLenum /*face*/, GLenum pname, const GLfloat* params) {
+  vexa_ff::material(pname, params);
 }
 
 #undef VEXA_GL_GUEST_EXPORT

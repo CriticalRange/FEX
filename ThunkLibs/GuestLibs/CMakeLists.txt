@@ -204,13 +204,13 @@ if (BITNESS EQUAL 64)
   #add_guest_lib(fex_malloc)
 
   # VEXA_FIXES: Disable ALSA guest thunk for Android bring-up. We will replace it with openal-soft thunk.
-  if (NOT ANDROID)
+  if (NOT ANDROID AND NOT BUILD_ANDROID)
     generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp)
     add_guest_lib(asound "libasound.so.2")
   endif()
 
-  # VEXA_FIXES: Add SDL3 guest thunk so guest SDL3 imports resolve through FEX thunking
-  # to Android host SDL3 implementation.
+  # SDL and OpenAL need headers. Android graphics builds leave those prefixes empty.
+  if ((NOT ANDROID AND NOT BUILD_ANDROID) OR NOT VEXA_SDL3_PREFIX STREQUAL "")
   generate(libSDL3 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_interface.cpp)
   add_guest_lib(SDL3 "libSDL3.so")
   target_include_directories(libSDL3-guest-deps INTERFACE ${VEXA_SDL3_PREFIX}/include)
@@ -226,6 +226,7 @@ if (BITNESS EQUAL 64)
   generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp)
   add_guest_lib(openal "libopenal.so.1")
   target_include_directories(libopenal-guest-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
+  endif()
 
   # disabled for now, headers are platform specific
   # find_package(SDL2 REQUIRED)
@@ -245,7 +246,7 @@ if (BITNESS EQUAL 64)
   endif()
 
   # VEXA_FIXES: Disable DRM guest thunk for Android bring-up.
-  if (NOT ANDROID)
+  if (NOT ANDROID AND NOT BUILD_ANDROID)
     generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
     target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
     target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
@@ -301,6 +302,7 @@ endif()
 # VEXA_FIXES: Desktop GL guest thunks depend on Linux GL/X11 ABI; keep optional for Android builds.
 if (ENABLE_DESKTOP_GL_THUNKS)
     generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)
+    target_include_directories(libGL-guest-deps BEFORE INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../libGL/include")
     add_guest_lib(GL "libGL.so.1")
 
     if (ENABLE_EGL_THUNKS)
@@ -308,6 +310,10 @@ if (ENABLE_DESKTOP_GL_THUNKS)
       generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp)
       add_guest_lib(EGL "libEGL.so.1")
       target_link_libraries(EGL-guest PRIVATE GL-guest)
+      if (ANDROID OR BUILD_ANDROID)
+        generate(libGLESv2 ${CMAKE_CURRENT_SOURCE_DIR}/../libGLESv2/libGLESv2_interface.cpp)
+        add_guest_lib(GLESv2 "libGLESv2.so.2")
+      endif()
     endif()
 
     # VEXA_FIXES: libGL guest thunk requires an X11 SONAME during link; keep placeholder scoped to desktop GL path.

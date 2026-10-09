@@ -50,6 +50,12 @@ __attribute__((naked)) static void sigrestore() {
 
 constexpr static uint32_t X86_MINSIGSTKSZ = 0x2000U;
 
+static std::atomic<EarlyHostSignalHook> EarlyHostSignalHookPtr {nullptr};
+
+void SetEarlyHostSignalHook(EarlyHostSignalHook Hook) {
+  EarlyHostSignalHookPtr.store(Hook, std::memory_order_release);
+}
+
 static FEX::HLE::ThreadStateObject* GetThreadFromAltStack(const stack_t& alt_stack) {
   // The thread object lives just before the alt-stack begin.
   FEX::HLE::ThreadStateObject* ThreadObject {};
@@ -57,9 +63,49 @@ static FEX::HLE::ThreadStateObject* GetThreadFromAltStack(const stack_t& alt_sta
   return ThreadObject;
 }
 
+// FEX places the thread pointer 8 bytes before ss_sp and read-protects that page.
+// A thread without that stack (a driver thread, or a thread whose alt stack was
+// removed) faults inside this thunk. SIGSEGV is already masked, so the nested
+// fault kills the process before any crash logger runs.
+static bool HostAltStackUsable(const ucontext_t* Context) {
+  if (!Context) {
+    return false;
+  }
+  const uintptr_t Sp = reinterpret_cast<uintptr_t>(Context->uc_stack.ss_sp);
+  if (Sp < 0x10000 || (Sp & 7u) != 0) {
+    return false;
+  }
+  if (Context->uc_stack.ss_size < 16) {
+    return false;
+  }
+  if (Context->uc_stack.ss_flags & SS_DISABLE) {
+    return false;
+  }
+  return true;
+}
+
+static void ReraiseDefault(int Signal) {
+  ::signal(Signal, SIG_DFL);
+  FHU::Syscalls::tgkill(::getpid(), FHU::Syscalls::gettid(), Signal);
+}
+
 static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
+  if (const auto Hook = EarlyHostSignalHookPtr.load(std::memory_order_acquire)) {
+    Hook(Signal, Info, UContext);
+  }
+
   ucontext_t* _context = (ucontext_t*)UContext;
+  if (!HostAltStackUsable(_context)) {
+    ReraiseDefault(Signal);
+    return;
+  }
+
   auto ThreadObject = GetThreadFromAltStack(_context->uc_stack);
+  if (!ThreadObject || !ThreadObject->Thread || !ThreadObject->SignalInfo.Delegator) {
+    ReraiseDefault(Signal);
+    return;
+  }
+
   FEXCORE_PROFILE_ACCUMULATION(ThreadObject->Thread, AccumulatedSignalTime);
   ThreadObject->SignalInfo.Delegator->HandleSignal(ThreadObject, Signal, Info, UContext);
 }

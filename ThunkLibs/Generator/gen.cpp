@@ -16,7 +16,7 @@
 #include <fmt/ostream.h>
 #include <fmt/ranges.h>
 
-#include <openssl/sha.h>
+#include "sha256_compat.h"
 
 class GenerateThunkLibsAction : public DataLayoutCompareAction {
 public:
@@ -857,6 +857,41 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     file << "      }\n";
     file << "    }\n";
     file << "  }\n";
+    file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
+    file << "    const char* android_sonames[] = {\n";
+    std::string unversioned = library_filename;
+    const auto ver_dot = unversioned.rfind('.');
+    if (ver_dot != std::string::npos && ver_dot + 1 < unversioned.size()) {
+      bool all_digits = true;
+      for (size_t i = ver_dot + 1; i < unversioned.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(unversioned[i]))) {
+          all_digits = false;
+          break;
+        }
+      }
+      if (all_digits) {
+        unversioned.resize(ver_dot);
+      }
+    }
+    file << "      \"" << unversioned << "\",\n";
+    if (libname == "libGL" || libname == "libGLESv2") {
+      file << "      \"libGLESv3.so\",\n";
+      file << "      \"libGLESv2.so\",\n";
+    } else if (libname == "libEGL") {
+      file << "      \"libEGL.so\",\n";
+    } else if (libname == "libvulkan") {
+      file << "      \"libvulkan.so\",\n";
+    }
+    file << "      nullptr\n";
+    file << "    };\n";
+    file << "    for (int android_i = 0; android_sonames[android_i] != nullptr; ++android_i) {\n";
+    file << "      fexldr_ptr_" << libname << "_so = dlopen(android_sonames[android_i], RTLD_GLOBAL | RTLD_LAZY);\n";
+    file << "      if (fexldr_ptr_" << libname << "_so) {\n";
+    file << "        fprintf(stderr, \"[VEXA][THUNK] fexldr_init_" << libname << " loaded %s\\n\", android_sonames[android_i]);\n";
+    file << "        break;\n";
+    file << "      }\n";
+    file << "    }\n";
+    file << "  }\n";
     file << "#endif\n";
     file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
     file << "    fprintf(stderr, \"[VEXA][THUNK] fexldr_init_" << libname << " failed to load " << library_filename
@@ -911,11 +946,10 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       file << "  }\n";
       file << "#endif\n";
     }
-    if (libname == "libGL") {
+    if (libname == "libGL" || libname == "libEGL" || libname == "libGLESv2" || libname == "libvulkan") {
       file << "#if defined(__ANDROID__)\n";
-      file << "  // VEXA_FIXES: On Android, many GL extension symbols are resolved lazily via\n";
-      file << "  // glXGetProcAddress. Missing eager dlsym imports should not hard-fail init\n";
-      file << "  // unless strict mode is explicitly requested.\n";
+      file << "  // VEXA_FIXES: Android system libraries do not export every desktop symbol the\n";
+      file << "  // guest interface lists. Keep the thunk loaded and let unused entry points stay null.\n";
       file << "  if (fexldr_missing_symbol) {\n";
       file << "    const char* strict = getenv(\"VEXA_GL_STRICT_INIT\");\n";
       file << "    if (strict && strict[0] == 49) {\n";

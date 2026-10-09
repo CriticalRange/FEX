@@ -31,6 +31,7 @@ $end_info$
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES3/gl3ext.h>
+#include "common/AndroidWindow.h"
 #if __has_include(<android/log.h>)
 #include <android/log.h>
 #define VEXA_HAS_ANDROID_LOG 1
@@ -1107,6 +1108,299 @@ static void fexfn_impl_libGL_GL_SetGuestXSync(uintptr_t GuestTarget, uintptr_t G
 static void fexfn_impl_libGL_GL_SetGuestXDisplayString(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   GLHOST_TRACE_SCOPE();
   MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXDisplayString);
+}
+#endif
+
+#if defined(BUILD_ANDROID)
+struct VexaGlxState {
+  EGLDisplay display = EGL_NO_DISPLAY;
+  EGLSurface surface = EGL_NO_SURFACE;
+  EGLContext context = EGL_NO_CONTEXT;
+  ANativeWindow* window = nullptr;
+  bool ready = false;
+};
+
+static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
+
+static VexaGlxState g_vexa_glx;
+
+static bool VexaEnsureGlx() {
+  if (g_vexa_glx.ready && g_vexa_glx.display != EGL_NO_DISPLAY && g_vexa_glx.context != EGL_NO_CONTEXT &&
+      g_vexa_glx.surface != EGL_NO_SURFACE) {
+    return eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, g_vexa_glx.context) == EGL_TRUE;
+  }
+  ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
+  if (!window) {
+    return false;
+  }
+  EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  if (display == EGL_NO_DISPLAY || eglInitialize(display, nullptr, nullptr) != EGL_TRUE) {
+    ANativeWindow_release(window);
+    fprintf(stderr, "[VEXA][GLX] eglInitialize failed 0x%x\n", eglGetError());
+    return false;
+  }
+  const EGLint config_attribs[] = {
+    EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+    EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+    EGL_RED_SIZE, 8,
+    EGL_GREEN_SIZE, 8,
+    EGL_BLUE_SIZE, 8,
+    EGL_ALPHA_SIZE, 8,
+    EGL_DEPTH_SIZE, 16,
+    EGL_NONE
+  };
+  EGLConfig config = nullptr;
+  EGLint count = 0;
+  if (eglChooseConfig(display, config_attribs, &config, 1, &count) != EGL_TRUE || count < 1) {
+    ANativeWindow_release(window);
+    fprintf(stderr, "[VEXA][GLX] eglChooseConfig failed 0x%x\n", eglGetError());
+    return false;
+  }
+  EGLint format = 0;
+  if (eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format) == EGL_TRUE && format != 0) {
+    ANativeWindow_setBuffersGeometry(window, 0, 0, format);
+  }
+  EGLSurface surface = eglCreateWindowSurface(display, config, window, nullptr);
+  const EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+  EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
+  if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
+      eglMakeCurrent(display, surface, surface, context) != EGL_TRUE) {
+    fprintf(stderr, "[VEXA][GLX] context setup failed 0x%x\n", eglGetError());
+    ANativeWindow_release(window);
+    return false;
+  }
+  g_vexa_glx = {display, surface, context, window, true};
+  fprintf(stderr, "[VEXA][GLX] surface ready %p\n", surface);
+  fexfn_impl_libGL_glViewport(0, 0, 300, 300);
+  return true;
+}
+
+static auto fexfn_impl_libGL_VEXA_BindGlxSurface() -> int {
+  return VexaEnsureGlx() ? 1 : 0;
+}
+
+static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
+  if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
+    return;
+  }
+  if (eglSwapBuffers(g_vexa_glx.display, g_vexa_glx.surface) != EGL_TRUE) {
+    fprintf(stderr, "[VEXA][GLX] eglSwapBuffers failed 0x%x\n", eglGetError());
+  }
+}
+
+struct VexaVisibleRect {
+  bool ok = false;
+  GLint x = 0;
+  GLint y = 0;
+  GLsizei width = 0;
+  GLsizei height = 0;
+  int surface_w = 0;
+  int surface_h = 0;
+};
+
+static VexaVisibleRect VexaVisibleRectFor(GLsizei width, GLsizei height) {
+  static int surface_w = 0;
+  static int surface_h = 0;
+  if (surface_w <= 0 || surface_h <= 0) {
+    ANativeWindow* window = VexaAcquireRuntimeWindow(0);
+    if (window) {
+      surface_w = ANativeWindow_getWidth(window);
+      surface_h = ANativeWindow_getHeight(window);
+      ANativeWindow_release(window);
+    }
+  }
+  VexaVisibleRect rect {};
+  rect.surface_w = surface_w;
+  rect.surface_h = surface_h;
+  if (surface_w <= 0 || surface_h <= 0 || width <= 0 || height <= 0) {
+    return rect;
+  }
+  GLsizei side = width < surface_w / 2 ? surface_w : width;
+  if (side > surface_w) {
+    side = surface_w;
+  }
+  GLsizei view_h = static_cast<GLsizei>((static_cast<int64_t>(side) * height) / width);
+  if (view_h > surface_h / 2) {
+    view_h = surface_h / 2;
+    side = static_cast<GLsizei>((static_cast<int64_t>(view_h) * width) / height);
+  }
+  GLint bottom = surface_h - view_h - surface_h / 10;
+  if (bottom < surface_h / 3) {
+    bottom = surface_h / 3;
+  }
+  if (bottom + view_h > surface_h) {
+    view_h = surface_h - bottom;
+  }
+  rect.ok = true;
+  rect.x = 0;
+  rect.y = bottom;
+  rect.width = side;
+  rect.height = view_h;
+  return rect;
+}
+
+static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+  static bool logged = false;
+  VexaVisibleRect rect = VexaVisibleRectFor(width, height);
+  if (rect.ok) {
+    glViewport(rect.x, rect.y, rect.width, rect.height);
+    if (!logged) {
+      logged = true;
+      fprintf(stderr, "[VEXA][GL] glViewport %d,%d %dx%d -> %d,%d %dx%d on %dx%d\n",
+              x, y, width, height, rect.x, rect.y, rect.width, rect.height, rect.surface_w, rect.surface_h);
+    }
+    return;
+  }
+  glViewport(x, y, width, height);
+}
+
+static void fexfn_impl_libGL_glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+  static bool logged = false;
+  VexaVisibleRect rect = VexaVisibleRectFor(width, height);
+  if (rect.ok) {
+    glScissor(rect.x, rect.y, rect.width, rect.height);
+    if (!logged) {
+      logged = true;
+      fprintf(stderr, "[VEXA][GL] glScissor %d,%d %dx%d -> %d,%d %dx%d on %dx%d\n",
+              x, y, width, height, rect.x, rect.y, rect.width, rect.height, rect.surface_w, rect.surface_h);
+    }
+    return;
+  }
+  glScissor(x, y, width, height);
+}
+
+struct VexaFFMesh {
+  GLuint vbo = 0;
+  GLsizei vertex_count = 0;
+};
+
+static GLuint g_vexa_ff_program = 0;
+static GLint g_vexa_ff_mvp = -1;
+static GLint g_vexa_ff_color = -1;
+static GLuint g_vexa_ff_next = 1;
+static GLuint g_vexa_ff_immediate_vbo = 0;
+static std::unordered_map<GLuint, VexaFFMesh> g_vexa_ff_meshes;
+
+static bool VexaFFEnsureProgram() {
+  if (g_vexa_ff_program != 0) {
+    return true;
+  }
+  const char* vertex =
+    "attribute vec3 aPos;\n"
+    "attribute vec3 aNrm;\n"
+    "uniform mat4 uMvp;\n"
+    "varying vec3 vNrm;\n"
+    "void main() {\n"
+    "  gl_Position = uMvp * vec4(aPos, 1.0);\n"
+    "  vNrm = aNrm;\n"
+    "}\n";
+  const char* fragment =
+    "precision mediump float;\n"
+    "varying vec3 vNrm;\n"
+    "uniform vec4 uColor;\n"
+    "void main() {\n"
+    "  vec3 n = normalize(vNrm);\n"
+    "  float light = max(dot(n, normalize(vec3(0.25, 0.45, 0.85))), 0.18);\n"
+    "  gl_FragColor = vec4(uColor.rgb * light, uColor.a);\n"
+    "}\n";
+  const GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+  const GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+  glShaderSource(vs, 1, &vertex, nullptr);
+  glShaderSource(fs, 1, &fragment, nullptr);
+  glCompileShader(vs);
+  glCompileShader(fs);
+  g_vexa_ff_program = glCreateProgram();
+  glAttachShader(g_vexa_ff_program, vs);
+  glAttachShader(g_vexa_ff_program, fs);
+  glBindAttribLocation(g_vexa_ff_program, 0, "aPos");
+  glBindAttribLocation(g_vexa_ff_program, 1, "aNrm");
+  glLinkProgram(g_vexa_ff_program);
+  glDeleteShader(vs);
+  glDeleteShader(fs);
+  GLint linked = 0;
+  glGetProgramiv(g_vexa_ff_program, GL_LINK_STATUS, &linked);
+  if (g_vexa_ff_program == 0 || linked != GL_TRUE) {
+    char log[512] {};
+    if (g_vexa_ff_program != 0) {
+      glGetProgramInfoLog(g_vexa_ff_program, sizeof(log), nullptr, log);
+    }
+    fprintf(stderr, "[VEXA][FF] program link failed %s\n", log);
+    g_vexa_ff_program = 0;
+    return false;
+  }
+  g_vexa_ff_mvp = glGetUniformLocation(g_vexa_ff_program, "uMvp");
+  g_vexa_ff_color = glGetUniformLocation(g_vexa_ff_program, "uColor");
+  glGenBuffers(1, &g_vexa_ff_immediate_vbo);
+  fprintf(stderr, "[VEXA][FF] program %u mvp %d color %d\n", g_vexa_ff_program, g_vexa_ff_mvp, g_vexa_ff_color);
+  return true;
+}
+
+static void VexaFFBindMeshAttribs() {
+  glEnableVertexAttribArray(0);
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void*>(0));
+  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+}
+
+static auto fexfn_impl_libGL_VEXA_FFUpload(const float* vertices, int float_count) -> unsigned {
+  if (!vertices || float_count < 18 || (float_count % 6) != 0 || !VexaFFEnsureProgram()) {
+    return 0;
+  }
+  const GLuint id = g_vexa_ff_next++;
+  VexaFFMesh mesh;
+  mesh.vertex_count = float_count / 6;
+  glGenBuffers(1, &mesh.vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+  glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(float_count) * static_cast<GLsizeiptr>(sizeof(float)), vertices, GL_STATIC_DRAW);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  g_vexa_ff_meshes.emplace(id, mesh);
+  fprintf(stderr, "[VEXA][FF] mesh %u verts %d\n", id, mesh.vertex_count);
+  return id;
+}
+
+static auto fexfn_impl_libGL_VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp) -> void {
+  if (!buffers || !counts || !colors || !mvp || item_count <= 0 || !VexaFFEnsureProgram()) {
+    return;
+  }
+  if (item_count > 256) {
+    item_count = 256;
+  }
+  glUseProgram(g_vexa_ff_program);
+  glUniformMatrix4fv(g_vexa_ff_mvp, 1, GL_FALSE, mvp);
+  for (int i = 0; i < item_count; ++i) {
+    const auto mesh = g_vexa_ff_meshes.find(buffers[i]);
+    if (mesh == g_vexa_ff_meshes.end() || counts[i] <= 0) {
+      continue;
+    }
+    glUniform4fv(g_vexa_ff_color, 1, colors + (i * 4));
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->second.vbo);
+    VexaFFBindMeshAttribs();
+    glDrawArrays(GL_TRIANGLES, 0, counts[i]);
+  }
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+static auto fexfn_impl_libGL_VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color) -> void {
+  if (!vertices || !mvp || !color || float_count < 18 || (float_count % 6) != 0 || !VexaFFEnsureProgram()) {
+    return;
+  }
+  glBindBuffer(GL_ARRAY_BUFFER, g_vexa_ff_immediate_vbo);
+  glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(float_count) * static_cast<GLsizeiptr>(sizeof(float)), vertices, GL_DYNAMIC_DRAW);
+  VexaFFBindMeshAttribs();
+  glUseProgram(g_vexa_ff_program);
+  glUniformMatrix4fv(g_vexa_ff_mvp, 1, GL_FALSE, mvp);
+  glUniform4fv(g_vexa_ff_color, 1, color);
+  glDrawArrays(GL_TRIANGLES, 0, float_count / 6);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+static auto fexfn_impl_libGL_VEXA_FFDelete(unsigned buffer) -> void {
+  const auto mesh = g_vexa_ff_meshes.find(buffer);
+  if (mesh == g_vexa_ff_meshes.end()) {
+    return;
+  }
+  glDeleteBuffers(1, &mesh->second.vbo);
+  g_vexa_ff_meshes.erase(mesh);
 }
 #endif
 

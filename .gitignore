@@ -12,3 +12,4 @@ out/
 .vs/
 *.pyc
 .cache
+/.hosttools/
