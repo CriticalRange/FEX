@@ -89,12 +89,84 @@ static void ReraiseDefault(int Signal) {
   FHU::Syscalls::tgkill(::getpid(), FHU::Syscalls::gettid(), Signal);
 }
 
+// VEXA: FEX shares the process with ART. ART threads use SIGSEGV for implicit
+// suspend/null checks, so signals from non-FEX threads must reach the previous
+// (sigchain) handler. FEX threads are identified by their registered alt stack
+// so the thunk never dereferences memory near a foreign alt stack.
+constexpr size_t kMaxFexAltStacks = 1024;
+static std::atomic<uintptr_t> FexAltStacks[kMaxFexAltStacks] {};
+static std::atomic<uintptr_t> PrevHostHandler[FEX::HLE::SignalDelegator::MAX_SIGNALS + 1] {};
+static std::atomic<uint64_t> PrevHostFlags[FEX::HLE::SignalDelegator::MAX_SIGNALS + 1] {};
+
+static void RegisterFexAltStack(const void* Sp) {
+  for (auto& Slot : FexAltStacks) {
+    uintptr_t Expected = 0;
+    if (Slot.compare_exchange_strong(Expected, reinterpret_cast<uintptr_t>(Sp), std::memory_order_acq_rel)) {
+      return;
+    }
+  }
+  LogMan::Msg::EFmt("VEXA: FEX alt stack registry full");
+}
+
+static void UnregisterFexAltStack(const void* Sp) {
+  for (auto& Slot : FexAltStacks) {
+    uintptr_t Expected = reinterpret_cast<uintptr_t>(Sp);
+    if (Slot.compare_exchange_strong(Expected, 0, std::memory_order_acq_rel)) {
+      return;
+    }
+  }
+}
+
+static bool IsFexAltStack(const ucontext_t* Context) {
+  if (!Context || (Context->uc_stack.ss_flags & SS_DISABLE)) {
+    return false;
+  }
+  const auto Sp = reinterpret_cast<uintptr_t>(Context->uc_stack.ss_sp);
+  for (const auto& Slot : FexAltStacks) {
+    if (Sp && Slot.load(std::memory_order_acquire) == Sp) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Returns false when the previous disposition is SIG_DFL (caller should reraise).
+static bool ForwardToPreviousHandler(int Signal, siginfo_t* Info, void* UContext) {
+  if (Signal <= 0 || Signal > static_cast<int>(FEX::HLE::SignalDelegator::MAX_SIGNALS)) {
+    return false;
+  }
+  const auto Handler = PrevHostHandler[Signal].load(std::memory_order_acquire);
+  if (Handler == reinterpret_cast<uintptr_t>(SIG_IGN)) {
+    return true;
+  }
+  if (Handler == reinterpret_cast<uintptr_t>(SIG_DFL)) {
+    return false;
+  }
+  if (PrevHostFlags[Signal].load(std::memory_order_relaxed) & SA_SIGINFO) {
+    reinterpret_cast<void (*)(int, siginfo_t*, void*)>(Handler)(Signal, Info, UContext);
+  } else {
+    reinterpret_cast<void (*)(int)>(Handler)(Signal);
+  }
+  return true;
+}
+
 static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
+  ucontext_t* _context = (ucontext_t*)UContext;
+  if (!IsFexAltStack(_context)) {
+    if (ForwardToPreviousHandler(Signal, Info, UContext)) {
+      return;
+    }
+    if (const auto Hook = EarlyHostSignalHookPtr.load(std::memory_order_acquire)) {
+      Hook(Signal, Info, UContext);
+    }
+    ReraiseDefault(Signal);
+    return;
+  }
+
   if (const auto Hook = EarlyHostSignalHookPtr.load(std::memory_order_acquire)) {
     Hook(Signal, Info, UContext);
   }
 
-  ucontext_t* _context = (ucontext_t*)UContext;
   if (!HostAltStackUsable(_context)) {
     ReraiseDefault(Signal);
     return;
@@ -906,6 +978,11 @@ bool SignalDelegator::UpdateHostThunk(int Signal) {
     return false;
   }
 
+  if (!SignalHandler.Installed) {
+    PrevHostFlags[Signal].store(SignalHandler.OldAction.sa_flags, std::memory_order_relaxed);
+    PrevHostHandler[Signal].store(reinterpret_cast<uintptr_t>(SignalHandler.OldAction.handler), std::memory_order_release);
+  }
+
   return true;
 }
 
@@ -1075,6 +1152,7 @@ SignalDelegator::~SignalDelegator() {
     }
     ::syscall(SYS_rt_sigaction, i, &HostHandlers[i].OldAction, nullptr, 8);
     HostHandlers[i].Installed = false;
+    PrevHostHandler[i].store(reinterpret_cast<uintptr_t>(SIG_DFL), std::memory_order_release);
   }
 }
 
@@ -1103,6 +1181,8 @@ void SignalDelegator::RegisterTLSState(FEX::HLE::ThreadStateObject* Thread) {
   const int Result = sigaltstack(&altstack, nullptr);
   if (Result == -1) {
     LogMan::Msg::EFmt("Failed to install alternative signal stack {}", strerror(errno));
+  } else {
+    RegisterFexAltStack(altstack.ss_sp);
   }
 
   // Get the current host signal mask
@@ -1116,6 +1196,7 @@ void SignalDelegator::RegisterTLSState(FEX::HLE::ThreadStateObject* Thread) {
 }
 
 void SignalDelegator::UninstallTLSState(FEX::HLE::ThreadStateObject* Thread) {
+  UnregisterFexAltStack(reinterpret_cast<void*>(reinterpret_cast<uint64_t>(Thread->SignalInfo.AltStackPtr) + 8));
   FEXCore::Allocator::munmap(Thread->SignalInfo.AltStackPtr, SIGSTKSZ * 16);
 
   Thread->SignalInfo.AltStackPtr = nullptr;
