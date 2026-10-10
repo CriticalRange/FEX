@@ -10,6 +10,10 @@ $end_info$
 #define VK_USE_PLATFORM_XLIB_KHR
 #define VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_WAYLAND_KHR
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: vkCreateAndroidSurfaceKHR must be declared for HostPtrInvokers.
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 #include "common/Guest.h"
@@ -64,6 +68,17 @@ static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFuncti
 }
 
 PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
+#if defined(BUILD_ANDROID)
+  // VEXA_FIXES: These two are custom_guest_entrypoint, so HostPtrInvokers has no
+  // entry and MakeGuestCallable would return null. vulkan.hpp queries them by
+  // name through GDPA. Return the guest entry points, matching GIPA's GDPA case.
+  if (a_1 && a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
+  }
+  if (a_1 && a_1 == std::string_view {"vkGetInstanceProcAddr"}) {
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetInstanceProcAddr);
+  }
+#endif
   auto Ret = fexfn_pack_vkGetDeviceProcAddr(a_0, a_1);
   if (!Ret) {
     return nullptr;
@@ -85,11 +100,13 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 }
 
 void OnInit() {
+#if !defined(BUILD_ANDROID)
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);
   fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
   fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
   fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+#endif
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)

@@ -621,7 +621,7 @@ if (BUILD_THUNKS)
       CMAKE_ARGS
       "-DBITNESS=64"
       "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-      "-DBUILD_ANDROID=1"
+      "-DBUILD_ANDROID=${ANDROID}"
       "-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
       # VEXA_FIXES: Propagate Android dependency prefixes so guest thunk parsing/build
       # can locate SDL3/SDL3_image/OpenAL includes in the external guest sub-build.
@@ -656,7 +656,7 @@ if (BUILD_THUNKS)
       CMAKE_ARGS
         "-DBITNESS=32"
         "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-"-DBUILD_ANDROID=1"
+        "-DBUILD_ANDROID=${ANDROID}"
 "-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
   "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
         "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
