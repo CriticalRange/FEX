@@ -248,7 +248,14 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   if (ENABLE_VULKAN_THUNKS)
     generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
     target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+    # VEXA_FIXES: Minimal X11/xcb stub headers so vulkan.h platform sections
+    # parse on NDK (and in the guest rootfs which lacks Xrandr.h).
+    target_include_directories(libvulkan-${GUEST_BITNESS}-deps BEFORE INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/include")
     add_host_lib(vulkan ${GUEST_BITNESS})
+    if (ANDROID)
+      # VEXA_FIXES: ANativeWindow surface bridge for Vulkan WSI on Android.
+      target_link_libraries(vulkan-host-${GUEST_BITNESS} PRIVATE android log)
+    endif()
   endif()
 
   # VEXA_FIXES: Disable Wayland host thunk build for Android cross-builds without wayland-client headers.

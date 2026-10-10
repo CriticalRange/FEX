@@ -18,6 +18,11 @@ struct fex_gen_config {
 #define VK_USE_PLATFORM_XLIB_KHR
 #define VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_WAYLAND_KHR
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: Enable Android WSI types for thunkgen on Android builds.
+// vulkan_android.h is self-contained (fwd-declares struct ANativeWindow).
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 template<>
@@ -1557,6 +1562,12 @@ struct fex_gen_type<wl_display> : fexgen::opaque_type {};
 template<>
 struct fex_gen_type<wl_surface> : fexgen::opaque_type {};
 
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: ANativeWindow is opaque to the guest ABI.
+template<>
+struct fex_gen_type<ANativeWindow> : fexgen::opaque_type {};
+#endif
+
 namespace internal {
 
 // Function, parameter index, parameter type [optional]
@@ -1602,8 +1613,14 @@ template<>
 struct fex_gen_param<vkCreateDevice, 3, VkDevice*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<vkDestroyDevice> {};
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: Spoof foreign-WSI instance extensions on Android.
+template<>
+struct fex_gen_config<vkEnumerateInstanceExtensionProperties> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkEnumerateInstanceExtensionProperties> {};
+#endif
 template<>
 struct fex_gen_config<vkEnumerateDeviceExtensionProperties> {};
 template<>
@@ -2207,8 +2224,15 @@ template<>
 struct fex_gen_config<vkCreateDisplayModeKHR> {};
 template<>
 struct fex_gen_config<vkGetDisplayPlaneCapabilitiesKHR> {};
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: VK_KHR_display does not exist on Android; fail cleanly instead of
+// calling a null fexldr_ptr (which is __builtin_trap under VEXA gen).
+template<>
+struct fex_gen_config<vkCreateDisplayPlaneSurfaceKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkCreateDisplayPlaneSurfaceKHR> {};
+#endif
 template<>
 struct fex_gen_config<vkCreateSharedSwapchainsKHR> {};
 template<>
@@ -3219,25 +3243,49 @@ template<>
 struct fex_gen_param<vkGetRandROutputDisplayEXT, 1, Display*> : fexgen::ptr_passthrough {};
 
 // vulkan_wayland.h
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: Route foreign WSI entry points through the Android surface bridge.
+template<>
+struct fex_gen_config<vkCreateWaylandSurfaceKHR> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceWaylandPresentationSupportKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkCreateWaylandSurfaceKHR> {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceWaylandPresentationSupportKHR> {};
+#endif
 
 // vulkan_xcb.h
+#if defined(BUILD_ANDROID)
+template<>
+struct fex_gen_config<vkCreateXcbSurfaceKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkCreateXcbSurfaceKHR> {};
+#endif
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceXcbPresentationSupportKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkGetPhysicalDeviceXcbPresentationSupportKHR, 2, xcb_connection_t*> : fexgen::ptr_passthrough {};
 
 // vulkan_xlib.h
+#if defined(BUILD_ANDROID)
+template<>
+struct fex_gen_config<vkCreateXlibSurfaceKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkCreateXlibSurfaceKHR> {};
+#endif
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceXlibPresentationSupportKHR> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkGetPhysicalDeviceXlibPresentationSupportKHR, 2, Display*> : fexgen::ptr_passthrough {};
+
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: vulkan_android.h — real surface creation path on Android.
+template<>
+struct fex_gen_config<vkCreateAndroidSurfaceKHR> : fexgen::custom_host_impl {};
+#endif
 
 } // namespace internal

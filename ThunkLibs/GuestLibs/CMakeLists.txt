@@ -242,6 +242,9 @@ if (BITNESS EQUAL 64)
   if (ENABLE_VULKAN_THUNKS)
     generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
     target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+    # VEXA_FIXES: Minimal X11/xcb stub headers so vulkan.h platform sections
+    # parse on the guest rootfs, which has Xlib.h but not Xrandr.h.
+    target_include_directories(libvulkan-guest-deps BEFORE INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/include")
     add_guest_lib(vulkan "libvulkan.so.1")
   endif()
 

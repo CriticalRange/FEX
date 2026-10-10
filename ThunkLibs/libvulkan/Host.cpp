@@ -10,6 +10,10 @@ $end_info$
 #define VK_USE_PLATFORM_XLIB_KHR
 #define VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_WAYLAND_KHR
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 #include "common/Host.h"
@@ -32,7 +36,13 @@ struct guest_layout<VkDescriptorDataEXT> {
 
 #include "thunkgen_host_libvulkan.inl"
 
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: runtime ANativeWindow bridge (same contract as libEGL_Host.cpp)
+#include <common/AndroidWindow.h>
+#include <cstdio>
+#else
 #include <common/X11Manager.h>
+#endif
 
 static bool SetupInstance {};
 static std::mutex SetupMutex {};
@@ -61,6 +71,181 @@ static void DoSetupWithInstance(VkInstance instance) {
 
 #define FEXFN_IMPL(fn) fexfn_impl_libvulkan_##fn
 
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: Android has no X11/xcb server. The three Vulkan_SetGuestX* internal
+// functions stay custom_host_impl in the interface so the generated exports table
+// needs definitions. OnInit never calls them on Android.
+static void fexfn_impl_libvulkan_Vulkan_SetGuestXGetVisualInfo(uintptr_t, uintptr_t) {}
+static void fexfn_impl_libvulkan_Vulkan_SetGuestXSync(uintptr_t, uintptr_t) {}
+static void fexfn_impl_libvulkan_Vulkan_SetGuestXDisplayString(uintptr_t, uintptr_t) {}
+
+// Member custom_repack annotations on VkXcbSurfaceCreateInfoKHR::connection and
+// VkXlibSurfaceCreateInfoKHR::dpy are unconditional. custom_repack forces the
+// struct to TypeCompatibility::Repackable even on 64-bit, so the unpacker still
+// calls these. The Android host impls ignore the foreign-WSI members.
+// Returning true from exit tells repack_wrapper nothing else needs doing.
+void fex_custom_repack_entry(host_layout<VkXcbSurfaceCreateInfoKHR>&, const guest_layout<VkXcbSurfaceCreateInfoKHR>&) {}
+bool fex_custom_repack_exit(guest_layout<VkXcbSurfaceCreateInfoKHR>&, const host_layout<VkXcbSurfaceCreateInfoKHR>&) {
+  return true;
+}
+void fex_custom_repack_entry(host_layout<VkXlibSurfaceCreateInfoKHR>&, const guest_layout<VkXlibSurfaceCreateInfoKHR>&) {}
+bool fex_custom_repack_exit(guest_layout<VkXlibSurfaceCreateInfoKHR>&, const host_layout<VkXlibSurfaceCreateInfoKHR>&) {
+  return true;
+}
+
+// Shared helper: wrap the app's runtime ANativeWindow in a VkSurfaceKHR.
+// Mirrors libEGL_Host.cpp eglCreateWindowSurface (VexaAcquireRuntimeWindow(2000)).
+static VkResult VexaCreateRuntimeVulkanSurface(VkInstance instance, ANativeWindow* requested, VkSurfaceKHR* out) {
+  if (!out) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  static PFN_vkCreateAndroidSurfaceKHR create_android_surface = nullptr;
+  if (!create_android_surface) {
+    create_android_surface = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
+      LDR_PTR(vkGetInstanceProcAddr)(instance, "vkCreateAndroidSurfaceKHR"));
+    if (!create_android_surface) {
+      // vkCreateAndroidSurfaceKHR is a direct export of /system/lib64/libvulkan.so
+      // (AOSP known_non_device_names).
+      create_android_surface = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(dlsym(fexldr_ptr_libvulkan_so, "vkCreateAndroidSurfaceKHR"));
+    }
+  }
+  if (!create_android_surface) {
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+  }
+
+  ANativeWindow* window = requested;
+  bool acquired = false;
+  if (!window) {
+    window = VexaAcquireRuntimeWindow(2000);
+    acquired = true;
+  }
+  if (!window) {
+    fprintf(stderr, "[VEXA][VK] no runtime window for VkSurfaceKHR\n");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  VkAndroidSurfaceCreateInfoKHR info = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, nullptr, 0, window};
+  VkResult ret = create_android_surface(instance, &info, nullptr, out);
+  if (acquired) {
+    ANativeWindow_release(window);
+  }
+  fprintf(stderr, "[VEXA][VK] vkCreate*Surface -> %d surface=%p window=%p\n", (int)ret,
+          ret == VK_SUCCESS ? (void*)(uintptr_t)*out : nullptr, (void*)window);
+  return ret;
+}
+
+static VkResult fexfn_impl_libvulkan_vkCreateAndroidSurfaceKHR(VkInstance a_0, const VkAndroidSurfaceCreateInfoKHR* a_1,
+                                                               const VkAllocationCallbacks*, VkSurfaceKHR* a_3) {
+  ANativeWindow* requested = a_1 ? a_1->window : nullptr;
+  return VexaCreateRuntimeVulkanSurface(a_0, requested, a_3);
+}
+static VkResult fexfn_impl_libvulkan_vkCreateXlibSurfaceKHR(VkInstance a_0, const VkXlibSurfaceCreateInfoKHR*, const VkAllocationCallbacks*,
+                                                            VkSurfaceKHR* a_3) {
+  return VexaCreateRuntimeVulkanSurface(a_0, nullptr, a_3);
+}
+static VkResult fexfn_impl_libvulkan_vkCreateXcbSurfaceKHR(VkInstance a_0, const VkXcbSurfaceCreateInfoKHR*, const VkAllocationCallbacks*,
+                                                           VkSurfaceKHR* a_3) {
+  return VexaCreateRuntimeVulkanSurface(a_0, nullptr, a_3);
+}
+static VkResult fexfn_impl_libvulkan_vkCreateWaylandSurfaceKHR(VkInstance a_0, const VkWaylandSurfaceCreateInfoKHR*, const VkAllocationCallbacks*,
+                                                               VkSurfaceKHR* a_3) {
+  return VexaCreateRuntimeVulkanSurface(a_0, nullptr, a_3);
+}
+
+static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice, uint32_t, guest_layout<xcb_connection_t*>,
+                                                                                  xcb_visualid_t) {
+  return VK_TRUE;
+}
+static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice, uint32_t, guest_layout<Display*>, VisualID) {
+  return VK_TRUE;
+}
+static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice, uint32_t, wl_display*) {
+  return VK_TRUE;
+}
+
+static VkResult fexfn_impl_libvulkan_vkAcquireXlibDisplayEXT(VkPhysicalDevice, guest_layout<Display*>, VkDisplayKHR) {
+  return VK_ERROR_INITIALIZATION_FAILED;
+}
+static VkResult fexfn_impl_libvulkan_vkGetRandROutputDisplayEXT(VkPhysicalDevice, guest_layout<Display*>, RROutput, VkDisplayKHR*) {
+  return VK_ERROR_INITIALIZATION_FAILED;
+}
+static VkResult fexfn_impl_libvulkan_vkCreateDisplayPlaneSurfaceKHR(VkInstance, const VkDisplaySurfaceCreateInfoKHR*, const VkAllocationCallbacks*,
+                                                                    VkSurfaceKHR*) {
+  return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+// VEXA_FIXES: One ANativeWindow accepts one Vulkan producer. vulkaninfo creates a
+// surface for every advertised WSI whose connect call succeeds. xcb_connect is
+// that call for DISPLAY. xlib's XOpenDisplay also succeeds, and a second
+// vkCreateAndroidSurfaceKHR on the same window returns NATIVE_WINDOW_IN_USE.
+// Wayland stays advertised; wl_display_connect fails closed, so no second surface.
+// xlib and wayland create entry points remain for a guest that uses only one of them.
+static const VkExtensionProperties kVexaSpoofedInstanceExts[] = {
+  {VK_KHR_XCB_SURFACE_EXTENSION_NAME, VK_KHR_XCB_SURFACE_SPEC_VERSION},
+  {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
+};
+static constexpr uint32_t kVexaSpoofedInstanceExtCount = sizeof(kVexaSpoofedInstanceExts) / sizeof(kVexaSpoofedInstanceExts[0]);
+
+static VkResult FEXFN_IMPL(vkEnumerateInstanceExtensionProperties)(const char* a_0, uint32_t* a_1, VkExtensionProperties* a_2) {
+  const bool spoof = a_0 == nullptr || a_0[0] == '\0';
+  const uint32_t extra = spoof ? kVexaSpoofedInstanceExtCount : 0;
+  if (!a_2) {
+    uint32_t host_count = 0;
+    VkResult ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &host_count, nullptr);
+    if (ret != VK_SUCCESS) {
+      return ret;
+    }
+    *a_1 = host_count + extra;
+    return VK_SUCCESS;
+  }
+
+  const uint32_t capacity = *a_1;
+  uint32_t host_count = 0;
+  VkResult count_ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &host_count, nullptr);
+  if (count_ret != VK_SUCCESS) {
+    return count_ret;
+  }
+  uint32_t host_write = host_count < capacity ? host_count : capacity;
+  if (host_write != 0) {
+    uint32_t query = host_write;
+    VkResult ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &query, a_2);
+    if (ret != VK_SUCCESS && ret != VK_INCOMPLETE) {
+      *a_1 = query;
+      return ret;
+    }
+  }
+  uint32_t written = host_write;
+  if (spoof) {
+    for (uint32_t i = 0; i < kVexaSpoofedInstanceExtCount && written < capacity; ++i) {
+      a_2[written] = kVexaSpoofedInstanceExts[i];
+      ++written;
+    }
+  }
+  *a_1 = written;
+  const uint32_t total = host_count + extra;
+  return written < total ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+static bool VexaVulkanStripInstanceExt(const char* name) {
+  static const char* const kStrip[] = {
+    VK_KHR_XLIB_SURFACE_EXTENSION_NAME,
+    VK_KHR_XCB_SURFACE_EXTENSION_NAME,
+    VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
+    VK_KHR_DISPLAY_EXTENSION_NAME,
+    VK_EXT_ACQUIRE_XLIB_DISPLAY_EXTENSION_NAME,
+    VK_EXT_DIRECT_MODE_DISPLAY_EXTENSION_NAME,
+    VK_EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME,
+  };
+  if (!name) {
+    return false;
+  }
+  for (auto* s : kStrip) {
+    if (std::strcmp(name, s) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+#else
 static X11Manager x11_manager;
 
 static void fexfn_impl_libvulkan_Vulkan_SetGuestXGetVisualInfo(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
@@ -121,6 +306,7 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
   x11_manager.HostXFlush(host_display);
   return ret;
 }
+#endif
 
 // Functions with callbacks are overridden to ignore the guest-side callbacks
 
@@ -150,6 +336,34 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
       }
     }
   }
+
+#if defined(BUILD_ANDROID)
+  // VEXA_FIXES: strip foreign-WSI instance extensions, inject VK_KHR_android_surface.
+  // REQUIRED: the loader's exported vkCreateAndroidSurfaceKHR is a disabled
+  // trampoline unless the extension was enabled at instance creation (AOSP api_gen).
+  VkInstanceCreateInfo patched = *vk_struct_base;
+  std::vector<const char*> filtered_exts;
+  bool have_android_surface = false;
+  if (patched.ppEnabledExtensionNames) {
+    for (uint32_t i = 0; i < patched.enabledExtensionCount; ++i) {
+      const char* ext = patched.ppEnabledExtensionNames[i];
+      if (!ext || VexaVulkanStripInstanceExt(ext)) {
+        continue;
+      }
+      if (std::strcmp(ext, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME) == 0) {
+        have_android_surface = true;
+      }
+      filtered_exts.push_back(ext);
+    }
+  }
+  if (!have_android_surface) {
+    filtered_exts.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+  }
+  patched.enabledExtensionCount = static_cast<uint32_t>(filtered_exts.size());
+  patched.ppEnabledExtensionNames = filtered_exts.data();
+  patched.flags &= ~static_cast<VkInstanceCreateFlags>(VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR);
+  vk_struct_base = &patched;
+#endif
 
   VkInstance out;
   auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
@@ -370,6 +584,22 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetPhysicalDeviceXcbPresentationSupportKHR;
   } else if (a_1 == "vkGetPhysicalDeviceXlibPresentationSupportKHR"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportKHR;
+#if defined(BUILD_ANDROID)
+  } else if (a_1 == "vkCreateAndroidSurfaceKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateAndroidSurfaceKHR;
+  } else if (a_1 == "vkCreateXlibSurfaceKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateXlibSurfaceKHR;
+  } else if (a_1 == "vkCreateXcbSurfaceKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateXcbSurfaceKHR;
+  } else if (a_1 == "vkCreateWaylandSurfaceKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateWaylandSurfaceKHR;
+  } else if (a_1 == "vkGetPhysicalDeviceWaylandPresentationSupportKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetPhysicalDeviceWaylandPresentationSupportKHR;
+  } else if (a_1 == "vkEnumerateInstanceExtensionProperties"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkEnumerateInstanceExtensionProperties;
+  } else if (a_1 == "vkCreateDisplayPlaneSurfaceKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDisplayPlaneSurfaceKHR;
+#endif
 #ifdef IS_32BIT_THUNK
   } else if (a_1 == "vkAllocateCommandBuffers"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAllocateCommandBuffers;
