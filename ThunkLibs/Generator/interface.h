@@ -21,9 +21,7 @@ public:
     return *abi;
   }
 
-  std::unique_ptr<ABI> TakeDataLayout() {
-    return std::move(abi);
-  }
+  std::unique_ptr<ABI> TakeDataLayout();
 };
 
 class DataLayoutCompareActionFactory : public clang::tooling::FrontendActionFactory {

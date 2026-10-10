@@ -211,6 +211,51 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
 }
 #endif
 
+#if defined(__ANDROID__)
+// VEXA_FIXES: The Android app seccomp filter kills the process with SIGSYS on set*id/setgroups.
+// VEXA_FIXES: An app can never change credentials, so keep requests for current ids as no-ops and refuse the rest.
+namespace AndroidCreds {
+  template<bool Gid>
+  bool IsCurrent(uint64_t Id) {
+    if (static_cast<uint32_t>(Id) == UINT32_MAX) {
+      return true;
+    }
+    uint32_t R, E, S;
+    if constexpr (Gid) {
+      ::getresgid(&R, &E, &S);
+    } else {
+      ::getresuid(&R, &E, &S);
+    }
+    return Id == R || Id == E || Id == S;
+  }
+
+  template<bool Gid>
+  uint64_t Set1(FEXCore::Core::CpuStateFrame*, uint64_t Id) {
+    return IsCurrent<Gid>(Id) ? 0 : -EPERM;
+  }
+
+  template<bool Gid>
+  uint64_t Set2(FEXCore::Core::CpuStateFrame*, uint64_t A, uint64_t B) {
+    return IsCurrent<Gid>(A) && IsCurrent<Gid>(B) ? 0 : -EPERM;
+  }
+
+  template<bool Gid>
+  uint64_t Set3(FEXCore::Core::CpuStateFrame*, uint64_t A, uint64_t B, uint64_t C) {
+    return IsCurrent<Gid>(A) && IsCurrent<Gid>(B) && IsCurrent<Gid>(C) ? 0 : -EPERM;
+  }
+
+  // setfsuid/setfsgid always return the previous fs id, which equals the effective id here.
+  template<bool Gid>
+  uint64_t SetFs(FEXCore::Core::CpuStateFrame*, uint64_t) {
+    return Gid ? ::getegid() : ::geteuid();
+  }
+
+  inline uint64_t SetGroups(FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t) {
+    return -EPERM;
+  }
+} // namespace AndroidCreds
+#endif
+
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   using namespace FEXCore::IR;
   REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
@@ -252,24 +297,36 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(getuid, SyscallPassthrough0<SYSCALL_DEF(getuid)>);
   REGISTER_SYSCALL_IMPL(syslog, SyscallPassthrough3<SYSCALL_DEF(syslog)>);
   REGISTER_SYSCALL_IMPL(getgid, SyscallPassthrough0<SYSCALL_DEF(getgid)>);
+#if defined(__ANDROID__)
+  REGISTER_SYSCALL_IMPL(setuid, AndroidCreds::Set1<false>);
+  REGISTER_SYSCALL_IMPL(setgid, AndroidCreds::Set1<true>);
+  REGISTER_SYSCALL_IMPL(setreuid, AndroidCreds::Set2<false>);
+  REGISTER_SYSCALL_IMPL(setregid, AndroidCreds::Set2<true>);
+  REGISTER_SYSCALL_IMPL(setgroups, AndroidCreds::SetGroups);
+  REGISTER_SYSCALL_IMPL(setresuid, AndroidCreds::Set3<false>);
+  REGISTER_SYSCALL_IMPL(setresgid, AndroidCreds::Set3<true>);
+  REGISTER_SYSCALL_IMPL(setfsuid, AndroidCreds::SetFs<false>);
+  REGISTER_SYSCALL_IMPL(setfsgid, AndroidCreds::SetFs<true>);
+#else
   REGISTER_SYSCALL_IMPL(setuid, SyscallPassthrough1<SYSCALL_DEF(setuid)>);
   REGISTER_SYSCALL_IMPL(setgid, SyscallPassthrough1<SYSCALL_DEF(setgid)>);
+  REGISTER_SYSCALL_IMPL(setreuid, SyscallPassthrough2<SYSCALL_DEF(setreuid)>);
+  REGISTER_SYSCALL_IMPL(setregid, SyscallPassthrough2<SYSCALL_DEF(setregid)>);
+  REGISTER_SYSCALL_IMPL(setgroups, SyscallPassthrough2<SYSCALL_DEF(setgroups)>);
+  REGISTER_SYSCALL_IMPL(setresuid, SyscallPassthrough3<SYSCALL_DEF(setresuid)>);
+  REGISTER_SYSCALL_IMPL(setresgid, SyscallPassthrough3<SYSCALL_DEF(setresgid)>);
+  REGISTER_SYSCALL_IMPL(setfsuid, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
+  REGISTER_SYSCALL_IMPL(setfsgid, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
+#endif
   REGISTER_SYSCALL_IMPL(geteuid, SyscallPassthrough0<SYSCALL_DEF(geteuid)>);
   REGISTER_SYSCALL_IMPL(getegid, SyscallPassthrough0<SYSCALL_DEF(getegid)>);
   REGISTER_SYSCALL_IMPL(setpgid, SyscallPassthrough2<SYSCALL_DEF(setpgid)>);
   REGISTER_SYSCALL_IMPL(getppid, SyscallPassthrough0<SYSCALL_DEF(getppid)>);
   REGISTER_SYSCALL_IMPL(setsid, SyscallPassthrough0<SYSCALL_DEF(setsid)>);
-  REGISTER_SYSCALL_IMPL(setreuid, SyscallPassthrough2<SYSCALL_DEF(setreuid)>);
-  REGISTER_SYSCALL_IMPL(setregid, SyscallPassthrough2<SYSCALL_DEF(setregid)>);
   REGISTER_SYSCALL_IMPL(getgroups, SyscallPassthrough2<SYSCALL_DEF(getgroups)>);
-  REGISTER_SYSCALL_IMPL(setgroups, SyscallPassthrough2<SYSCALL_DEF(setgroups)>);
-  REGISTER_SYSCALL_IMPL(setresuid, SyscallPassthrough3<SYSCALL_DEF(setresuid)>);
   REGISTER_SYSCALL_IMPL(getresuid, SyscallPassthrough3<SYSCALL_DEF(getresuid)>);
-  REGISTER_SYSCALL_IMPL(setresgid, SyscallPassthrough3<SYSCALL_DEF(setresgid)>);
   REGISTER_SYSCALL_IMPL(getresgid, SyscallPassthrough3<SYSCALL_DEF(getresgid)>);
   REGISTER_SYSCALL_IMPL(getpgid, SyscallPassthrough1<SYSCALL_DEF(getpgid)>);
-  REGISTER_SYSCALL_IMPL(setfsuid, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
-  REGISTER_SYSCALL_IMPL(setfsgid, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
   REGISTER_SYSCALL_IMPL(getsid, SyscallPassthrough1<SYSCALL_DEF(getsid)>);
   REGISTER_SYSCALL_IMPL(capget, SyscallPassthrough2<SYSCALL_DEF(capget)>);
   REGISTER_SYSCALL_IMPL(capset, SyscallPassthrough2<SYSCALL_DEF(capset)>);
@@ -569,19 +626,31 @@ namespace x32 {
     REGISTER_SYSCALL_IMPL_X32(getgid32, SyscallPassthrough0<SYSCALL_DEF(getgid)>);
     REGISTER_SYSCALL_IMPL_X32(geteuid32, SyscallPassthrough0<SYSCALL_DEF(geteuid)>);
     REGISTER_SYSCALL_IMPL_X32(getegid32, SyscallPassthrough0<SYSCALL_DEF(getegid)>);
+#if defined(__ANDROID__)
+    REGISTER_SYSCALL_IMPL_X32(setreuid32, AndroidCreds::Set2<false>);
+    REGISTER_SYSCALL_IMPL_X32(setregid32, AndroidCreds::Set2<true>);
+    REGISTER_SYSCALL_IMPL_X32(setgroups32, AndroidCreds::SetGroups);
+    REGISTER_SYSCALL_IMPL_X32(setresuid32, AndroidCreds::Set3<false>);
+    REGISTER_SYSCALL_IMPL_X32(setresgid32, AndroidCreds::Set3<true>);
+    REGISTER_SYSCALL_IMPL_X32(setuid32, AndroidCreds::Set1<false>);
+    REGISTER_SYSCALL_IMPL_X32(setgid32, AndroidCreds::Set1<true>);
+    REGISTER_SYSCALL_IMPL_X32(setfsuid32, AndroidCreds::SetFs<false>);
+    REGISTER_SYSCALL_IMPL_X32(setfsgid32, AndroidCreds::SetFs<true>);
+#else
     REGISTER_SYSCALL_IMPL_X32(setreuid32, SyscallPassthrough2<SYSCALL_DEF(setreuid)>);
     REGISTER_SYSCALL_IMPL_X32(setregid32, SyscallPassthrough2<SYSCALL_DEF(setregid)>);
-    REGISTER_SYSCALL_IMPL_X32(getgroups32, SyscallPassthrough2<SYSCALL_DEF(getgroups)>);
     REGISTER_SYSCALL_IMPL_X32(setgroups32, SyscallPassthrough2<SYSCALL_DEF(setgroups)>);
-    REGISTER_SYSCALL_IMPL_X32(fchown32, SyscallPassthrough3<SYSCALL_DEF(fchown)>);
     REGISTER_SYSCALL_IMPL_X32(setresuid32, SyscallPassthrough3<SYSCALL_DEF(setresuid)>);
-    REGISTER_SYSCALL_IMPL_X32(getresuid32, SyscallPassthrough3<SYSCALL_DEF(getresuid)>);
     REGISTER_SYSCALL_IMPL_X32(setresgid32, SyscallPassthrough3<SYSCALL_DEF(setresgid)>);
-    REGISTER_SYSCALL_IMPL_X32(getresgid32, SyscallPassthrough3<SYSCALL_DEF(getresgid)>);
     REGISTER_SYSCALL_IMPL_X32(setuid32, SyscallPassthrough1<SYSCALL_DEF(setuid)>);
     REGISTER_SYSCALL_IMPL_X32(setgid32, SyscallPassthrough1<SYSCALL_DEF(setgid)>);
     REGISTER_SYSCALL_IMPL_X32(setfsuid32, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
     REGISTER_SYSCALL_IMPL_X32(setfsgid32, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
+#endif
+    REGISTER_SYSCALL_IMPL_X32(getgroups32, SyscallPassthrough2<SYSCALL_DEF(getgroups)>);
+    REGISTER_SYSCALL_IMPL_X32(fchown32, SyscallPassthrough3<SYSCALL_DEF(fchown)>);
+    REGISTER_SYSCALL_IMPL_X32(getresuid32, SyscallPassthrough3<SYSCALL_DEF(getresuid)>);
+    REGISTER_SYSCALL_IMPL_X32(getresgid32, SyscallPassthrough3<SYSCALL_DEF(getresgid)>);
     REGISTER_SYSCALL_IMPL_X32(sendfile64, SyscallPassthrough4<SYSCALL_DEF(sendfile)>);
     REGISTER_SYSCALL_IMPL_X32(clock_gettime64, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
     REGISTER_SYSCALL_IMPL_X32(clock_settime64, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);

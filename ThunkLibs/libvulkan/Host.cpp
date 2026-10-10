@@ -123,6 +123,16 @@ static VkResult VexaCreateRuntimeVulkanSurface(VkInstance instance, ANativeWindo
     fprintf(stderr, "[VEXA][VK] no runtime window for VkSurfaceKHR\n");
     return VK_ERROR_INITIALIZATION_FAILED;
   }
+  // Guest programs such as vkgears never see this ANativeWindow. Publish the
+  // size into the guest rootfs so the libxcb shim can deliver ConfigureNotify.
+  {
+    using Publisher = void (*)(int, int);
+    void* vexa = dlopen("libvexa.so", RTLD_NOW | RTLD_NOLOAD);
+    auto* publish = vexa ? reinterpret_cast<Publisher>(dlsym(vexa, "Vexa_PublishGuestWindowSize")) : nullptr;
+    if (publish) {
+      publish(ANativeWindow_getWidth(window), ANativeWindow_getHeight(window));
+    }
+  }
   VkAndroidSurfaceCreateInfoKHR info = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, nullptr, 0, window};
   VkResult ret = create_android_surface(instance, &info, nullptr, out);
   if (acquired) {
@@ -308,6 +318,83 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
 }
 #endif
 
+#if defined(BUILD_ANDROID)
+// The device create info does not carry the physical device, and swapchain
+// extent checks need it for vkGetPhysicalDeviceSurfaceCapabilitiesKHR.
+static VkPhysicalDevice g_vexa_physical_device = VK_NULL_HANDLE;
+
+static VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice a_0, VkSurfaceKHR a_1, VkSurfaceCapabilitiesKHR* a_2) {
+  if (!LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)) {
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+  }
+  const VkResult result = LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(a_0, a_1, a_2);
+  if (result == VK_SUCCESS && a_2) {
+    a_2->supportedCompositeAlpha |= VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+  }
+  return result;
+}
+
+static VkCompositeAlphaFlagBitsKHR VexaSupportedCompositeAlpha(VkCompositeAlphaFlagsKHR supported, VkCompositeAlphaFlagBitsKHR requested) {
+  if (requested != 0 && (supported & requested) != 0) {
+    return requested;
+  }
+  if ((supported & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) != 0) {
+    return VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+  }
+  if (supported == 0) {
+    return requested;
+  }
+  return static_cast<VkCompositeAlphaFlagBitsKHR>(supported & ~(supported - 1));
+}
+
+static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const VkSwapchainCreateInfoKHR* a_1, const VkAllocationCallbacks*,
+                                                          VkSwapchainKHR* a_3) {
+  if (!a_1) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  VkSwapchainCreateInfoKHR copy = *a_1;
+  if (g_vexa_physical_device && copy.surface && LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)) {
+    VkSurfaceCapabilitiesKHR caps {};
+    const VkResult caps_result = LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(g_vexa_physical_device, copy.surface, &caps);
+    if (caps_result == VK_SUCCESS) {
+      const bool real_extent = caps.currentExtent.width != 0xFFFFFFFFu && caps.currentExtent.height != 0xFFFFFFFFu && caps.currentExtent.width > 0 &&
+                               caps.currentExtent.height > 0;
+      if (real_extent && (copy.imageExtent.width != caps.currentExtent.width || copy.imageExtent.height != caps.currentExtent.height)) {
+        fprintf(stderr, "[VEXA][VK] swapchain extent %ux%u -> %ux%u\n", copy.imageExtent.width, copy.imageExtent.height, caps.currentExtent.width,
+                caps.currentExtent.height);
+        copy.imageExtent = caps.currentExtent;
+      }
+      if (copy.preTransform != 0 && (caps.supportedTransforms & copy.preTransform) == 0 && caps.currentTransform != 0) {
+        fprintf(stderr, "[VEXA][VK] swapchain preTransform 0x%x -> 0x%x\n", (unsigned)copy.preTransform, (unsigned)caps.currentTransform);
+        copy.preTransform = caps.currentTransform;
+      }
+      const VkCompositeAlphaFlagBitsKHR alpha = VexaSupportedCompositeAlpha(caps.supportedCompositeAlpha, copy.compositeAlpha);
+      if (alpha != copy.compositeAlpha) {
+        fprintf(stderr, "[VEXA][VK] swapchain alpha 0x%x -> 0x%x (supported 0x%x)\n", (unsigned)copy.compositeAlpha, (unsigned)alpha,
+                (unsigned)caps.supportedCompositeAlpha);
+        copy.compositeAlpha = alpha;
+      }
+    }
+  }
+  if (LDR_PTR(vkGetDeviceProcAddr)) {
+    void* create_swapchain = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSwapchainKHR");
+    if (create_swapchain) {
+      (void*&)LDR_PTR(vkCreateSwapchainKHR) = create_swapchain;
+    }
+  }
+  if (!LDR_PTR(vkCreateSwapchainKHR)) {
+    fprintf(stderr, "[VEXA][VK] vkCreateSwapchainKHR is missing\n");
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+  }
+  const VkResult result = LDR_PTR(vkCreateSwapchainKHR)(a_0, &copy, nullptr, a_3);
+  if (result != VK_SUCCESS) {
+    fprintf(stderr, "[VEXA][VK] vkCreateSwapchainKHR -> %d extent %ux%u format %d alpha 0x%x transform 0x%x\n", (int)result, copy.imageExtent.width,
+            copy.imageExtent.height, (int)copy.imageFormat, (unsigned)copy.compositeAlpha, (unsigned)copy.preTransform);
+  }
+  return result;
+}
+#endif
+
 // Functions with callbacks are overridden to ignore the guest-side callbacks
 
 static VkResult
@@ -373,6 +460,9 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
 
 static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                            guest_layout<VkDevice*> a_3) {
+#if defined(BUILD_ANDROID)
+  g_vexa_physical_device = a_0;
+#endif
   VkDevice out;
   auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);
   *a_3.get_pointer() = to_guest(to_host_layout(out));

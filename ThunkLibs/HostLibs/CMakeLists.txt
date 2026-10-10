@@ -222,10 +222,11 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
       ${VEXA_SDL3_PREFIX}/include
       ${VEXA_SDL3_IMAGE_PREFIX}/include)
     add_host_lib(SDL3_image ${GUEST_BITNESS})
-
-    # VEXA_FIXES: Build OpenAL host thunk as Android audio path replacement for ALSA-oriented guests.
+  endif()
+  # VEXA_FIXES: OpenAL host thunk plays for the guest libasound shim. It does not
+  # require the SDL3 prefix.
+  if (ANDROID AND NOT VEXA_OPENAL_PREFIX STREQUAL "")
     generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp ${GUEST_BITNESS})
-
     target_include_directories(libopenal-${GUEST_BITNESS}-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
     add_host_lib(openal ${GUEST_BITNESS})
   endif()

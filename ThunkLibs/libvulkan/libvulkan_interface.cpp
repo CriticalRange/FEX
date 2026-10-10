@@ -2187,14 +2187,29 @@ template<>
 struct fex_gen_config<vkDestroySurfaceKHR> {};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfaceSupportKHR> {};
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: vkgears asserts VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR. Android
+// surfaces advertise INHERIT instead. The swapchain host impl substitutes a
+// supported bit when the guest asks for one the driver does not have.
+template<>
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilitiesKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilitiesKHR> {};
+#endif
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormatsKHR> {}; // TODO: Need to figure out how *not* to repack the last parameter on input...
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfacePresentModesKHR> {};
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: vkgears creates the swapchain at its 300x300 window size and does
+// not check the result. Android requires imageExtent == currentExtent.
+template<>
+struct fex_gen_config<vkCreateSwapchainKHR> : fexgen::custom_host_impl {};
+#else
 template<>
 struct fex_gen_config<vkCreateSwapchainKHR> {};
+#endif
 template<>
 struct fex_gen_config<vkDestroySwapchainKHR> {};
 template<>

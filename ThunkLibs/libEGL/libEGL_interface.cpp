@@ -40,6 +40,8 @@ struct fex_gen_config<eglSurfaceAttrib> {};
 template<>
 struct fex_gen_config<eglSwapBuffers> {};
 template<>
+struct fex_gen_config<eglSwapInterval> {};
+template<>
 struct fex_gen_config<eglTerminate> {};
 template<>
 struct fex_gen_config<eglGetError> {};

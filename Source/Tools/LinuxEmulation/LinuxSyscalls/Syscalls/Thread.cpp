@@ -572,9 +572,19 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     FEX::HLE::_SyscallHandler->GetSignalDelegator()->SaveTelemetry();
     FEX::HLE::_SyscallHandler->TM.CleanupForExit();
 
+#if defined(__ANDROID__)
+    // VEXA_FIXES: The guest shares the Android app process. A host exit_group would kill the runtime worker
+    // before it can report back, so stop every guest thread and let ExecuteThread return to VEXA instead.
+    FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame)->StatusCode = status;
+    LogMan::Msg::IFmt("[VEXA] guest exit_group({})", status);
+    FEX::HLE::_SyscallHandler->TM.Stop(false);
+    // The stop signal unwinds this thread; if it is deferred it fires on the way back into the JIT.
+    return 0;
+#else
     syscall(SYSCALL_DEF(exit_group), status);
     // This will never be reached
     std::terminate();
+#endif
   });
 }
 } // namespace FEX::HLE
