@@ -222,7 +222,11 @@ if (BITNESS EQUAL 64)
   ${VEXA_SDL3_PREFIX}/include
   ${VEXA_SDL3_IMAGE_PREFIX}/include)
 
-  # VEXA_FIXES: Add OpenAL guest thunk to replace ALSA-centric guest audio on Android.
+  endif()
+
+  # VEXA_FIXES: OpenAL is independent of SDL3. The Android libasound shim
+  # dlopens libopenal.so.1 and this guest thunk forwards it to host OpenSL.
+  if ((NOT ANDROID AND NOT BUILD_ANDROID) OR NOT VEXA_OPENAL_PREFIX STREQUAL "")
   generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp)
   add_guest_lib(openal "libopenal.so.1")
   target_include_directories(libopenal-guest-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)

@@ -80,6 +80,8 @@
   OP(glVertexAttribPointer) \
   OP(glVertexAttribIPointer) \
   OP(glVertexAttrib2f) \
+  OP(glVertexAttrib4f) \
+  OP(glVertexAttrib4fv) \
   OP(glEnableVertexAttribArray) \
   OP(glDisableVertexAttribArray) \
   OP(glGetVertexAttribiv) \
@@ -99,6 +101,7 @@
   OP(glDeleteFramebuffers) \
   OP(glBindFramebuffer) \
   OP(glFramebufferTexture2D) \
+  OP(glFramebufferTextureLayer) \
   OP(glInvalidateFramebuffer) \
   OP(glCheckFramebufferStatus) \
   OP(glBlitFramebuffer) \
@@ -110,6 +113,7 @@
   OP(glRenderbufferStorageMultisample) \
   OP(glRenderbufferStorageMultisampleEXT) \
   OP(glFramebufferRenderbuffer) \
+  OP(glGetRenderbufferParameteriv) \
   OP(glGenSamplers) \
   OP(glDeleteSamplers) \
   OP(glBindSampler) \
@@ -253,6 +257,8 @@
   OP(glVertexAttribPointer) \
   OP(glVertexAttribIPointer) \
   OP(glVertexAttrib2f) \
+  OP(glVertexAttrib4f) \
+  OP(glVertexAttrib4fv) \
   OP(glEnableVertexAttribArray) \
   OP(glDisableVertexAttribArray) \
   OP(glGetVertexAttribiv) \
@@ -272,10 +278,9 @@
   OP(glDeleteFramebuffers) \
   OP(glBindFramebuffer) \
   OP(glFramebufferTexture2D) \
+  OP(glFramebufferTextureLayer) \
   OP(glInvalidateFramebuffer) \
   OP(glCheckFramebufferStatus) \
-  OP(glBlitFramebuffer) \
-  OP(glBlitFramebufferEXT) \
   OP(glGenRenderbuffers) \
   OP(glDeleteRenderbuffers) \
   OP(glBindRenderbuffer) \
@@ -283,6 +288,7 @@
   OP(glRenderbufferStorageMultisample) \
   OP(glRenderbufferStorageMultisampleEXT) \
   OP(glFramebufferRenderbuffer) \
+  OP(glGetRenderbufferParameteriv) \
   OP(glGenSamplers) \
   OP(glDeleteSamplers) \
   OP(glBindSampler) \

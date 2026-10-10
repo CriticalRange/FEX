@@ -17,6 +17,7 @@ extern "C" using __GLXextFuncPtr = void (*)(void);
 extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
 extern "C" int VEXA_BindGlxSurface(void);
 extern "C" void VEXA_SwapGlxBuffers(void);
+extern "C" int VEXA_SetSwapInterval(int interval);
 // One host transition uploads or draws a baked fixed-function mesh.
 extern "C" unsigned VEXA_FFUpload(const float* vertices, int float_count);
 extern "C" void VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp);
@@ -53,6 +54,8 @@ template<>
 struct fex_gen_config<VEXA_BindGlxSurface> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_SwapGlxBuffers> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_SetSwapInterval> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_FFUpload> : fexgen::custom_host_impl {};
 template<>
@@ -147,6 +150,10 @@ template<>
 struct fex_gen_config<glViewport> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glScissor> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glBlitFramebuffer> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glBlitFramebufferEXT> : fexgen::custom_host_impl {};
 
 #else
 template<>

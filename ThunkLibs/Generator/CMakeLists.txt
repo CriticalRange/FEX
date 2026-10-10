@@ -30,6 +30,7 @@ if (NOT CLANG_RESOURCE_DIR)
     OUTPUT_VARIABLE CLANG_RESOURCE_DIR
     OUTPUT_STRIP_TRAILING_WHITESPACE)
 endif()
+file(TO_CMAKE_PATH "${CLANG_RESOURCE_DIR}" CLANG_RESOURCE_DIR)
 
 add_library(thunkgenlib STATIC analysis.cpp data_layout.cpp gen.cpp)
 target_include_directories(thunkgenlib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

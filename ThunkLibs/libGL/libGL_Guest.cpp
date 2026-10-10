@@ -12,6 +12,8 @@ $end_info$
 #ifdef BUILD_ANDROID
 #include <GLES3/gl3.h>
 #include <GLES3/gl3ext.h>
+#include <fcntl.h>
+#include <unistd.h>
 #if __has_include(<android/log.h>)
 #include <android/log.h>
 #define VEXA_HAS_ANDROID_LOG 1
@@ -121,7 +123,7 @@ void LogMissingGLProcEvent(const char* phase, const char* procname, const char* 
   }
 }
 
-[[noreturn]] void MissingGLProcStub() {
+extern "C" uintptr_t MissingGLProcStub() {
   char proc_copy[sizeof(LastMissingGLProc)] {};
   char reason_copy[sizeof(LastMissingGLProcReason)] {};
 
@@ -137,22 +139,19 @@ void LogMissingGLProcEvent(const char* phase, const char* procname, const char* 
     std::snprintf(reason_copy, sizeof(reason_copy), "%s", LastMissingGLProcReason);
   }
 
-  fprintf(stderr,
-               "[libGL thunk] invoked unresolved GL proc '%s' (%s, host=%p)\n",
-               proc_copy,
-               reason_copy,
-               nullptr);
-
-  if (FILE* f = std::fopen(GLProcTracePath, "a")) {
-    fprintf(f,
+  static std::atomic<int> logs {0};
+  const int n = logs.fetch_add(1, std::memory_order_relaxed);
+  if (n < 24) {
+    fprintf(stderr,
                  "[libGL thunk] invoked unresolved GL proc '%s' (%s, host=%p)\n",
                  proc_copy,
                  reason_copy,
                  nullptr);
-    std::fclose(f);
+  } else if (n == 24) {
+    fprintf(stderr, "[libGL thunk] further unresolved GL calls suppressed (last='%s')\n", proc_copy);
   }
 
-  std::abort();
+  return 0;
 }
 }
 #endif
@@ -162,10 +161,20 @@ using GLGetFramebufferAttachmentParameterivFn = void (*)(GLenum, GLenum, GLenum,
 
 std::atomic<uint64_t> GLGuestTraceSeq {0};
 
+// Per-call and per-frame trace lines cost real frame time, so they are opt-in via VEXA_GL_TRACE=1.
+bool GLGuestTraceEnabled() {
+  static const bool Enabled = [] {
+    const char* v = std::getenv("VEXA_GL_TRACE");
+    return v && v[0] && v[0] != '0';
+  }();
+  return Enabled;
+}
+
 struct ScopedGLGuestTrace {
   explicit ScopedGLGuestTrace(const char* fn_)
     : fn {fn_ ? fn_ : "<null>"}
     , seq {GLGuestTraceSeq.fetch_add(1, std::memory_order_acq_rel) + 1} {
+    if (!GLGuestTraceEnabled()) return;
     fprintf(stderr,
                  "[libGL-guest] call-enter seq=%llu fn=%s\n",
                  static_cast<unsigned long long>(seq),
@@ -173,6 +182,7 @@ struct ScopedGLGuestTrace {
   }
 
   ~ScopedGLGuestTrace() {
+    if (!GLGuestTraceEnabled()) return;
     fprintf(stderr,
                  "[libGL-guest] call-exit seq=%llu fn=%s\n",
                  static_cast<unsigned long long>(seq),
@@ -195,6 +205,11 @@ std::atomic<bool> GLFramebufferAttachCompatPrelinked {false};
 extern "C" {
 void* glXChooseVisual(void* display, int screen, int* attributes);
 void* glXCreateContext(void* display, void* visual, void* share_list, int direct);
+void* glXCreateContextAttribsARB(void* display, void* config, void* share_list, int direct, const int* attribs);
+void VexaCompat_glFramebufferTexture3D(unsigned int target, unsigned int attachment, unsigned int textarget,
+                                       unsigned int texture, int level, int zoffset);
+void VexaCompat_glFramebufferTexture1D(unsigned int target, unsigned int attachment, unsigned int textarget,
+                                       unsigned int texture, int level);
 void glXDestroyContext(void* display, void* context);
 void* glXGetCurrentContext();
 unsigned long glXGetCurrentDrawable();
@@ -437,6 +452,24 @@ std::string_view ResolveGLInvokerAlias(std::string_view procname) {
   if (procname == "glGetQueryObjectivEXT") {
     return "glGetQueryObjectiv";
   }
+  // GL_EXT_framebuffer_object names. Mali exposes the core GLES entry points
+  // only. The signatures match, so the EXT lookup can call the core function.
+  if (procname == "glGenerateMipmapEXT") return "glGenerateMipmap";
+  if (procname == "glIsRenderbufferEXT") return "glIsRenderbuffer";
+  if (procname == "glBindRenderbufferEXT") return "glBindRenderbuffer";
+  if (procname == "glDeleteRenderbuffersEXT") return "glDeleteRenderbuffers";
+  if (procname == "glGenRenderbuffersEXT") return "glGenRenderbuffers";
+  if (procname == "glRenderbufferStorageEXT") return "glRenderbufferStorage";
+  if (procname == "glGetRenderbufferParameterivEXT") return "glGetRenderbufferParameteriv";
+  if (procname == "glIsFramebufferEXT") return "glIsFramebuffer";
+  if (procname == "glBindFramebufferEXT") return "glBindFramebuffer";
+  if (procname == "glDeleteFramebuffersEXT") return "glDeleteFramebuffers";
+  if (procname == "glGenFramebuffersEXT") return "glGenFramebuffers";
+  if (procname == "glCheckFramebufferStatusEXT") return "glCheckFramebufferStatus";
+  if (procname == "glFramebufferTexture1DEXT") return "glFramebufferTexture1D";
+  if (procname == "glFramebufferTexture2DEXT") return "glFramebufferTexture2D";
+  if (procname == "glFramebufferTexture3DEXT") return "glFramebufferTexture3D";
+  if (procname == "glFramebufferRenderbufferEXT") return "glFramebufferRenderbuffer";
   return {};
 }
 
@@ -461,6 +494,12 @@ uintptr_t ResolveAndroidDirectGuestProc(std::string_view procname) {
   if (procname == "glScissor") {
     return reinterpret_cast<uintptr_t>(fexfn_pack_glScissor);
   }
+  if (procname == "glBlitFramebuffer") {
+    return reinterpret_cast<uintptr_t>(fexfn_pack_glBlitFramebuffer);
+  }
+  if (procname == "glBlitFramebufferEXT") {
+    return reinterpret_cast<uintptr_t>(fexfn_pack_glBlitFramebufferEXT);
+  }
   return 0;
 }
 
@@ -468,6 +507,13 @@ uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
 #ifdef BUILD_ANDROID
   if (procname == "glXChooseVisual") return reinterpret_cast<uintptr_t>(glXChooseVisual);
   if (procname == "glXCreateContext") return reinterpret_cast<uintptr_t>(glXCreateContext);
+  if (procname == "glXCreateContextAttribsARB") return reinterpret_cast<uintptr_t>(glXCreateContextAttribsARB);
+  if (procname == "glFramebufferTexture3D" || procname == "glFramebufferTexture3DEXT") {
+    return reinterpret_cast<uintptr_t>(VexaCompat_glFramebufferTexture3D);
+  }
+  if (procname == "glFramebufferTexture1D" || procname == "glFramebufferTexture1DEXT") {
+    return reinterpret_cast<uintptr_t>(VexaCompat_glFramebufferTexture1D);
+  }
   if (procname == "glXDestroyContext") return reinterpret_cast<uintptr_t>(glXDestroyContext);
   if (procname == "glXGetCurrentContext") return reinterpret_cast<uintptr_t>(glXGetCurrentContext);
   if (procname == "glXGetCurrentDrawable") return reinterpret_cast<uintptr_t>(glXGetCurrentDrawable);
@@ -611,10 +657,11 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
   }
 
 #ifdef BUILD_ANDROID
-  // VEXA_FIXES: Android branch keeps startup resilient by emitting diagnostics and
-  // returning a deterministic abort stub when host/guest proc mapping is incomplete.
+  // Godot calls the pointer it stored, including optional fixed-function
+  // entries. Return a stub that logs and returns 0 instead of aborting or
+  // handing back NULL.
   auto ReturnMissingDiagnostic = [&](const char* reason, const void* host_target = nullptr) -> voidFunc* {
-    LogMissingGLProcEvent("returning stub for", reinterpret_cast<const char*>(procname), reason, host_target);
+    LogMissingGLProcEvent("no entry for", reinterpret_cast<const char*>(procname), reason, host_target);
     return reinterpret_cast<voidFunc*>(MissingGLProcStub);
   };
 
@@ -641,6 +688,27 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
 
   auto Ret = fexfn_pack_glXGetProcAddress(procname);
   if (!Ret) {
+    // Host GLES has no EXT suffix. If the core entry exists, hand that host
+    // pointer back so the guest calls the real function instead of the abort stub.
+    const auto alias = ResolveGLInvokerAlias(procname_s);
+    if (!alias.empty()) {
+      if (const auto AliasIt = HostPtrInvokers.find(alias); AliasIt != HostPtrInvokers.end()) {
+        char alias_name[96];
+        if (alias.size() < sizeof(alias_name)) {
+          std::memcpy(alias_name, alias.data(), alias.size());
+          alias_name[alias.size()] = '\0';
+          auto AliasRet = fexfn_pack_glXGetProcAddress(reinterpret_cast<const GLubyte*>(alias_name));
+          if (AliasRet) {
+            const auto AliasAddr = reinterpret_cast<uintptr_t>(AliasRet);
+            TraceGLProcLink(procname_s, reinterpret_cast<const void*>(AliasAddr), AliasIt->second);
+            LinkAddressToFunction(AliasAddr, AliasIt->second);
+            fprintf(stderr, "[libGL thunk] glXGetProcAddress alias '%.*s' -> '%s'\n",
+                    static_cast<int>(procname_s.size()), procname_s.data(), alias_name);
+            return AliasRet;
+          }
+        }
+      }
+    }
     return ReturnMissingDiagnostic("host lookup returned null");
   }
   // VEXA_FIXES: Normalize function-pointer diagnostics/linking through integer
@@ -754,7 +822,8 @@ extern "C" {
 // VEXA_FIXES: Unigine probes desktop GLX and legacy GL symbols via dlsym(libGL.so.1, ...).
 // Android thunk builds don't naturally export all of them, so provide a compatibility
 // symbol surface to let GLWrapper::init() proceed.
-constexpr const char* kCompatGLXExts = "GLX_ARB_create_context GLX_EXT_framebuffer_sRGB";
+constexpr const char* kCompatGLXExts =
+  "GLX_ARB_create_context GLX_EXT_framebuffer_sRGB GLX_EXT_swap_control GLX_MESA_swap_control";
 constexpr uintptr_t kCompatDisplay = 0x47584453ULL;  // "GXDS"
 constexpr uintptr_t kCompatContext = 0x47584354ULL;  // "GXCT"
 constexpr uintptr_t kCompatVisual = 0x47585649ULL;   // "GXVI"
@@ -773,6 +842,32 @@ VEXA_GL_GUEST_EXPORT void* glXChooseVisual(void* /*display*/, int /*screen*/, in
 VEXA_GL_GUEST_EXPORT void* glXCreateContext(void* /*display*/, void* /*visual*/, void* /*share_list*/, int /*direct*/) {
   fprintf(stderr, "[libGL thunk] compat glXCreateContext\n");
   return reinterpret_cast<void*>(kCompatContext);
+}
+
+VEXA_GL_GUEST_EXPORT void* glXCreateContextAttribsARB(void* /*display*/, void* /*config*/, void* /*share_list*/, int /*direct*/,
+                                                      const int* /*attribs*/) {
+  fprintf(stderr, "[libGL thunk] compat glXCreateContextAttribsARB\n");
+  return reinterpret_cast<void*>(kCompatContext);
+}
+
+// Desktop GL attaches one slice of a 3D texture with glFramebufferTexture3D.
+// GLES only has glFramebufferTextureLayer, which takes the slice index directly.
+VEXA_GL_GUEST_EXPORT void VexaCompat_glFramebufferTexture3D(unsigned int target, unsigned int attachment, unsigned int /*textarget*/,
+                                                            unsigned int texture, int level, int zoffset) {
+  fprintf(stderr, "[libGL thunk] compat glFramebufferTexture3D layer=%d\n", zoffset);
+  fexfn_pack_glFramebufferTextureLayer(target, attachment, texture, level, zoffset);
+}
+
+// GLES has no 1D framebuffer attachment. The call shape matches glFramebufferTexture2D.
+VEXA_GL_GUEST_EXPORT void VexaCompat_glFramebufferTexture1D(unsigned int target, unsigned int attachment, unsigned int textarget,
+                                                            unsigned int texture, int level) {
+  constexpr unsigned int kTexture1D = 0x0DE0;
+  constexpr unsigned int kTexture2D = 0x0DE1;
+  if (textarget == kTexture1D) {
+    textarget = kTexture2D;
+  }
+  fprintf(stderr, "[libGL thunk] compat glFramebufferTexture1D texture=%u level=%d\n", texture, level);
+  fexfn_pack_glFramebufferTexture2D(target, attachment, textarget, texture, level);
 }
 
 VEXA_GL_GUEST_EXPORT void glXDestroyContext(void* /*display*/, void* context) {
@@ -798,18 +893,57 @@ VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawabl
 }
 
 VEXA_GL_GUEST_EXPORT void glXSwapBuffers(void* /*display*/, unsigned long drawable) {
-  fprintf(stderr, "[libGL thunk] compat glXSwapBuffers drawable=%lu\n", drawable);
+  if (GLGuestTraceEnabled()) {
+    fprintf(stderr, "[libGL thunk] compat glXSwapBuffers drawable=%lu\n", drawable);
+  }
   fexfn_pack_VEXA_SwapGlxBuffers();
+}
+
+static void VexaGuestWindowSize(unsigned int* width, unsigned int* height) {
+  *width = 1280;
+  *height = 720;
+#ifdef BUILD_ANDROID
+  const int fd = open("/tmp/vexa-window-size", O_RDONLY);
+  if (fd < 0) {
+    return;
+  }
+  char buf[64];
+  const int n = static_cast<int>(read(fd, buf, sizeof(buf) - 1));
+  close(fd);
+  if (n <= 0) {
+    return;
+  }
+  buf[n] = '\0';
+  int w = 0;
+  int h = 0;
+  if (sscanf(buf, "%d %d", &w, &h) == 2 && w > 1 && h > 1) {
+    *width = static_cast<unsigned int>(w);
+    *height = static_cast<unsigned int>(h);
+  }
+#else
+  (void)width;
+  (void)height;
+#endif
 }
 
 VEXA_GL_GUEST_EXPORT void glXQueryDrawable(void* /*display*/, unsigned long /*drawable*/, int attribute, unsigned int* value) {
   if (!value) {
     return;
   }
+  unsigned int width = 1280;
+  unsigned int height = 720;
+  VexaGuestWindowSize(&width, &height);
+  static unsigned int logged_w = 0;
+  static unsigned int logged_h = 0;
+  if (width != logged_w || height != logged_h) {
+    logged_w = width;
+    logged_h = height;
+    fprintf(stderr, "[libGL thunk] drawable size %u x %u\n", width, height);
+  }
   if (attribute == 0x801D) {
-    *value = 1280;
+    *value = width;
   } else if (attribute == 0x801E) {
-    *value = 720;
+    *value = height;
   } else {
     *value = 0;
   }
@@ -938,9 +1072,16 @@ VEXA_GL_GUEST_EXPORT void glXSelectEvent(void*, unsigned long, unsigned long) {}
 VEXA_GL_GUEST_EXPORT void glXGetSelectedEvent(void*, unsigned long, unsigned long* mask) {
   if (mask) *mask = 0;
 }
-VEXA_GL_GUEST_EXPORT void glXSwapIntervalEXT(void*, unsigned long, int) {}
-VEXA_GL_GUEST_EXPORT int glXGetSwapIntervalMESA(void) { return 0; }
-VEXA_GL_GUEST_EXPORT int glXSwapIntervalMESA(unsigned int) { return 0; }
+static int g_vexa_swap_interval = 1;
+VEXA_GL_GUEST_EXPORT void glXSwapIntervalEXT(void*, unsigned long, int interval) {
+  if (fexfn_pack_VEXA_SetSwapInterval(interval)) g_vexa_swap_interval = interval;
+}
+VEXA_GL_GUEST_EXPORT int glXGetSwapIntervalMESA(void) { return g_vexa_swap_interval; }
+VEXA_GL_GUEST_EXPORT int glXSwapIntervalMESA(unsigned int interval) {
+  if (!fexfn_pack_VEXA_SetSwapInterval(static_cast<int>(interval))) return 1;
+  g_vexa_swap_interval = static_cast<int>(interval);
+  return 0;
+}
 
 VEXA_GL_GUEST_EXPORT void glLineWidth(GLfloat width) {
   fprintf(stderr, "[libGL thunk] compat glLineWidth width=%f (no-op)\n", static_cast<double>(width));

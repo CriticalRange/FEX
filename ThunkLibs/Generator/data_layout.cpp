@@ -439,6 +439,10 @@ AnalyzeDataLayoutActionFactory::AnalyzeDataLayoutActionFactory()
 
 AnalyzeDataLayoutActionFactory::~AnalyzeDataLayoutActionFactory() = default;
 
+std::unique_ptr<ABI> AnalyzeDataLayoutActionFactory::TakeDataLayout() {
+  return std::move(abi);
+}
+
 std::unique_ptr<clang::FrontendAction> AnalyzeDataLayoutActionFactory::create() {
   return std::make_unique<AnalyzeDataLayoutAction>(*abi);
 }

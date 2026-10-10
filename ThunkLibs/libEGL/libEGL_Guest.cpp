@@ -75,7 +75,6 @@ EGLBoolean eglWaitNative(EGLint) { return EGL_TRUE; }
 EGLBoolean eglWaitClient(void) { return EGL_TRUE; }
 EGLBoolean eglBindTexImage(EGLDisplay, EGLSurface, EGLint) { return EGL_FALSE; }
 EGLBoolean eglReleaseTexImage(EGLDisplay, EGLSurface, EGLint) { return EGL_FALSE; }
-EGLBoolean eglSwapInterval(EGLDisplay, EGLint) { return EGL_TRUE; }
 EGLenum eglQueryAPI(void) { return EGL_OPENGL_ES_API; }
 EGLBoolean eglReleaseThread(void) { return EGL_TRUE; }
 

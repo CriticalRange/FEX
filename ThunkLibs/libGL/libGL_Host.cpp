@@ -236,25 +236,38 @@ struct ScopedGLCallTimer {
 
 std::atomic<uint64_t> GLHostTraceSeq {0};
 
+// Per-call trace lines cost real frame time, so they are opt-in via VEXA_GL_TRACE=1.
+bool GLHostTraceEnabled() {
+  static const bool Enabled = [] {
+    const char* v = getenv("VEXA_GL_TRACE");
+    return v && v[0] && v[0] != '0';
+  }();
+  return Enabled;
+}
+
 struct ScopedGLThunkTrace {
   explicit ScopedGLThunkTrace(const char* fn_)
     : fn {fn_ ? fn_ : "<null>"}
     , seq {GLHostTraceSeq.fetch_add(1, std::memory_order_acq_rel) + 1}
     , start_ns {GLHostNowNs()} {
     GLHostMarkProgress(fn);
-    fprintf(stderr,
-                 "[libGL-host] call-enter seq=%llu fn=%s\n",
-                 static_cast<unsigned long long>(seq),
-                 fn);
+    if (GLHostTraceEnabled()) {
+      fprintf(stderr,
+                   "[libGL-host] call-enter seq=%llu fn=%s\n",
+                   static_cast<unsigned long long>(seq),
+                   fn);
+    }
   }
 
   ~ScopedGLThunkTrace() {
     const uint64_t elapsed_ns = GLHostNowNs() - start_ns;
-    fprintf(stderr,
-                 "[libGL-host] call-exit seq=%llu fn=%s duration_us=%llu\n",
-                 static_cast<unsigned long long>(seq),
-                 fn,
-                 static_cast<unsigned long long>(elapsed_ns / 1000ULL));
+    if (GLHostTraceEnabled()) {
+      fprintf(stderr,
+                   "[libGL-host] call-exit seq=%llu fn=%s duration_us=%llu\n",
+                   static_cast<unsigned long long>(seq),
+                   fn,
+                   static_cast<unsigned long long>(elapsed_ns / 1000ULL));
+    }
     GLHostLogDuration(fn, elapsed_ns);
     GLHostMarkProgress(fn);
   }
@@ -1179,13 +1192,29 @@ static auto fexfn_impl_libGL_VEXA_BindGlxSurface() -> int {
   return VexaEnsureGlx() ? 1 : 0;
 }
 
+static void VexaCoverPresent();
+
 static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
   if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
     return;
   }
+  VexaCoverPresent();
   if (eglSwapBuffers(g_vexa_glx.display, g_vexa_glx.surface) != EGL_TRUE) {
     fprintf(stderr, "[VEXA][GLX] eglSwapBuffers failed 0x%x\n", eglGetError());
   }
+}
+
+static auto fexfn_impl_libGL_VEXA_SetSwapInterval(int interval) -> int {
+  EGLDisplay display = eglGetCurrentDisplay();
+  if (display == EGL_NO_DISPLAY) {
+    if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
+      return 0;
+    }
+    display = g_vexa_glx.display;
+  }
+  const EGLBoolean ok = eglSwapInterval(display, interval);
+  fprintf(stderr, "[VEXA][GLX] swap interval %d -> %s\n", interval, ok == EGL_TRUE ? "ok" : "failed");
+  return ok == EGL_TRUE ? 1 : 0;
 }
 
 struct VexaVisibleRect {
@@ -1198,15 +1227,22 @@ struct VexaVisibleRect {
   int surface_h = 0;
 };
 
+// Cover the whole surface. A guest window that already matches the surface stays
+// at 0,0. A smaller one is scaled up and centered; a negative origin lets GL clip
+// the overflow so the picture still fills the screen.
 static VexaVisibleRect VexaVisibleRectFor(GLsizei width, GLsizei height) {
   static int surface_w = 0;
   static int surface_h = 0;
-  if (surface_w <= 0 || surface_h <= 0) {
+  if (surface_w <= 0 || surface_h <= 0 || surface_h > surface_w) {
     ANativeWindow* window = VexaAcquireRuntimeWindow(0);
     if (window) {
-      surface_w = ANativeWindow_getWidth(window);
-      surface_h = ANativeWindow_getHeight(window);
+      const int w = ANativeWindow_getWidth(window);
+      const int h = ANativeWindow_getHeight(window);
       ANativeWindow_release(window);
+      if (w > 0 && h > 0) {
+        surface_w = w;
+        surface_h = h;
+      }
     }
   }
   VexaVisibleRect rect {};
@@ -1215,32 +1251,77 @@ static VexaVisibleRect VexaVisibleRectFor(GLsizei width, GLsizei height) {
   if (surface_w <= 0 || surface_h <= 0 || width <= 0 || height <= 0) {
     return rect;
   }
-  GLsizei side = width < surface_w / 2 ? surface_w : width;
-  if (side > surface_w) {
-    side = surface_w;
+  GLsizei view_w = 0;
+  GLsizei view_h = 0;
+  if (static_cast<int64_t>(surface_w) * height >= static_cast<int64_t>(surface_h) * width) {
+    view_w = static_cast<GLsizei>(surface_w);
+    view_h = static_cast<GLsizei>((static_cast<int64_t>(surface_w) * height + width / 2) / width);
+  } else {
+    view_h = static_cast<GLsizei>(surface_h);
+    view_w = static_cast<GLsizei>((static_cast<int64_t>(surface_h) * width + height / 2) / height);
   }
-  GLsizei view_h = static_cast<GLsizei>((static_cast<int64_t>(side) * height) / width);
-  if (view_h > surface_h / 2) {
-    view_h = surface_h / 2;
-    side = static_cast<GLsizei>((static_cast<int64_t>(view_h) * width) / height);
+  if (view_w < surface_w) {
+    view_w = static_cast<GLsizei>(surface_w);
   }
-  GLint bottom = surface_h - view_h - surface_h / 10;
-  if (bottom < surface_h / 3) {
-    bottom = surface_h / 3;
-  }
-  if (bottom + view_h > surface_h) {
-    view_h = surface_h - bottom;
+  if (view_h < surface_h) {
+    view_h = static_cast<GLsizei>(surface_h);
   }
   rect.ok = true;
-  rect.x = 0;
-  rect.y = bottom;
-  rect.width = side;
+  rect.x = (surface_w - static_cast<int>(view_w)) / 2;
+  rect.y = (surface_h - static_cast<int>(view_h)) / 2;
+  rect.width = view_w;
   rect.height = view_h;
   return rect;
 }
 
+static GLint g_vexa_guest_x = 0;
+static GLint g_vexa_guest_y = 0;
+static GLsizei g_vexa_guest_w = 0;
+static GLsizei g_vexa_guest_h = 0;
+
+static void VexaNoteGuestViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+  // The 300x300 EnsureGlx viewport is below half of the 1280x720 guest window.
+  if (width < 640 || height < 360) {
+    return;
+  }
+  GLint draw_fbo = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
+  if (draw_fbo != 0) {
+    return;
+  }
+  if (g_vexa_guest_x == x && g_vexa_guest_y == y && g_vexa_guest_w == width && g_vexa_guest_h == height) {
+    return;
+  }
+  g_vexa_guest_x = x;
+  g_vexa_guest_y = y;
+  g_vexa_guest_w = width;
+  g_vexa_guest_h = height;
+  fprintf(stderr, "[VEXA][GL] guest viewport %d,%d %dx%d\n", x, y, width, height);
+}
+
+static GLint VexaBoundDrawFramebuffer() {
+  GLint draw_fbo = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
+  return draw_fbo;
+}
+
 static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
   static bool logged = false;
+  static bool logged_fbo = false;
+  VexaNoteGuestViewport(x, y, width, height);
+  if (VexaBoundDrawFramebuffer() != 0) {
+    if (!logged_fbo) {
+      logged_fbo = true;
+      fprintf(stderr, "[VEXA][GL] glViewport fbo passthrough %d,%d %dx%d\n", x, y, width, height);
+    }
+    glViewport(x, y, width, height);
+    return;
+  }
+  // The 300x300 context bootstrap is not the guest window.
+  if (width < 640 || height < 360) {
+    glViewport(x, y, width, height);
+    return;
+  }
   VexaVisibleRect rect = VexaVisibleRectFor(width, height);
   if (rect.ok) {
     glViewport(rect.x, rect.y, rect.width, rect.height);
@@ -1256,6 +1337,19 @@ static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei
 
 static void fexfn_impl_libGL_glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
   static bool logged = false;
+  static bool logged_fbo = false;
+  if (VexaBoundDrawFramebuffer() != 0) {
+    if (!logged_fbo) {
+      logged_fbo = true;
+      fprintf(stderr, "[VEXA][GL] glScissor fbo passthrough %d,%d %dx%d\n", x, y, width, height);
+    }
+    glScissor(x, y, width, height);
+    return;
+  }
+  if (width < 640 || height < 360) {
+    glScissor(x, y, width, height);
+    return;
+  }
   VexaVisibleRect rect = VexaVisibleRectFor(width, height);
   if (rect.ok) {
     glScissor(rect.x, rect.y, rect.width, rect.height);
@@ -1267,6 +1361,250 @@ static void fexfn_impl_libGL_glScissor(GLint x, GLint y, GLsizei width, GLsizei 
     return;
   }
   glScissor(x, y, width, height);
+}
+
+static GLint VexaMapGuestToVisible(GLint value, GLint guest_origin, GLsizei guest_span, GLint visible_origin, GLsizei visible_span) {
+  if (guest_span <= 0) {
+    return value;
+  }
+  return visible_origin + static_cast<GLint>((static_cast<int64_t>(value - guest_origin) * visible_span) / guest_span);
+}
+
+// Godot's stretch/keep draws the 16:9 frame inside the device window and blits
+// that inset onto the default framebuffer. A dest outside the surface is left
+// 1:1 here; VexaCoverPresent scales it to the full surface at swap time.
+static int g_present_x0 = 0;
+static int g_present_y0 = 0;
+static int g_present_x1 = 0;
+static int g_present_y1 = 0;
+static bool g_present_ready = false;
+
+// Screen pixels are the covered surface. Publish the inverse so guest X11
+// clicks land on the Godot window pixel that was cropped into that point.
+static void VexaPublishPresentMap(int x0, int y0, int cw, int ch, int sx, int sy, int src_w, int src_h, int sw,
+                                  int sh) {
+  using Fn = void (*)(int, int, int, int, int, int, int, int, int, int);
+  static Fn fn = nullptr;
+  static int logged = 0;
+  static int last[10];
+  static int have_last = 0;
+  const int next[10] = {x0, y0, cw, ch, sx, sy, src_w, src_h, sw, sh};
+  if (have_last && std::memcmp(last, next, sizeof(last)) == 0) {
+    return;
+  }
+  if (!fn) {
+    fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "Vexa_PublishPresentMap"));
+    if (!fn) {
+      if (void* handle = dlopen("libvexa.so", RTLD_NOW | RTLD_NOLOAD)) {
+        fn = reinterpret_cast<Fn>(dlsym(handle, "Vexa_PublishPresentMap"));
+      }
+    }
+  }
+  if (!fn) {
+    if (logged < 1) {
+      ++logged;
+      fprintf(stderr, "[VEXA][GL] present map unpublished\n");
+    }
+    return;
+  }
+  fn(x0, y0, cw, ch, sx, sy, src_w, src_h, sw, sh);
+  std::memcpy(last, next, sizeof(last));
+  have_last = 1;
+  if (logged < 2) {
+    ++logged;
+    fprintf(stderr, "[VEXA][GL] present map %d %d %d %d %d %d %d %d %d %d\n", x0, y0, cw, ch, sx, sy, src_w, src_h, sw,
+            sh);
+  }
+}
+
+static void VexaNotePresentDest(GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1) {
+  const int x0 = dstX0 < dstX1 ? dstX0 : dstX1;
+  const int y0 = dstY0 < dstY1 ? dstY0 : dstY1;
+  const int x1 = dstX0 < dstX1 ? dstX1 : dstX0;
+  const int y1 = dstY0 < dstY1 ? dstY1 : dstY0;
+  if (x1 - x0 < 64 || y1 - y0 < 64) {
+    return;
+  }
+  g_present_x0 = x0;
+  g_present_y0 = y0;
+  g_present_x1 = x1;
+  g_present_y1 = y1;
+  g_present_ready = true;
+}
+
+static void VexaCoverPresent() {
+  if (!g_present_ready) {
+    return;
+  }
+  const int x0 = g_present_x0;
+  const int y0 = g_present_y0;
+  const int x1 = g_present_x1;
+  const int y1 = g_present_y1;
+  g_present_ready = false;
+  const int cw = x1 - x0;
+  const int ch = y1 - y0;
+  const VexaVisibleRect surface = VexaVisibleRectFor(cw, ch);
+  const int sw = surface.surface_w;
+  const int sh = surface.surface_h;
+  if (sw <= 0 || sh <= 0 || cw < 64 || ch < 64) {
+    return;
+  }
+  if (x0 <= 8 && y0 <= 8 && sw - x1 <= 8 && sh - y1 <= 8) {
+    VexaPublishPresentMap(0, 0, sw, sh, 0, 0, sw, sh, sw, sh);
+    return;
+  }
+  if (x0 < 0 || y0 < 0 || x1 > sw || y1 > sh) {
+    VexaPublishPresentMap(0, 0, sw, sh, 0, 0, sw, sh, sw, sh);
+    return;
+  }
+
+  static GLuint tex = 0;
+  static GLuint fbo = 0;
+  static int tw = 0;
+  static int th = 0;
+  static int logged = 0;
+  GLint draw_fbo = 0;
+  GLint read_fbo = 0;
+  GLint tex_binding = 0;
+  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_binding);
+  if (tex == 0) {
+    glGenTextures(1, &tex);
+    glGenFramebuffers(1, &fbo);
+  }
+  glBindTexture(GL_TEXTURE_2D, tex);
+  if (tw != cw || th != ch) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cw, ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    tw = cw;
+    th = ch;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+  if (scissor == GL_TRUE) {
+    glDisable(GL_SCISSOR_TEST);
+  }
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+  ::glBlitFramebuffer(x0, y0, x1, y1, 0, 0, cw, ch, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+  int src_w = cw;
+  int src_h = ch;
+  if (static_cast<int64_t>(sw) * ch >= static_cast<int64_t>(sh) * cw) {
+    src_w = cw;
+    src_h = static_cast<int>(static_cast<int64_t>(cw) * sh / sw);
+  } else {
+    src_h = ch;
+    src_w = static_cast<int>(static_cast<int64_t>(ch) * sw / sh);
+  }
+  if (src_w < 1) {
+    src_w = 1;
+  }
+  if (src_h < 1) {
+    src_h = 1;
+  }
+  if (src_w > cw) {
+    src_w = cw;
+  }
+  if (src_h > ch) {
+    src_h = ch;
+  }
+  const int sx = (cw - src_w) / 2;
+  const int sy = (ch - src_h) / 2;
+  VexaPublishPresentMap(x0, y0, cw, ch, sx, sy, src_w, src_h, sw, sh);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+  ::glBlitFramebuffer(sx, sy, sx + src_w, sy + src_h, 0, 0, sw, sh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+  if (logged < 2) {
+    ++logged;
+    fprintf(stderr, "[VEXA][GL] present cover %d,%d %dx%d crop %d,%d %dx%d -> %dx%d\n", x0, y0, cw, ch, sx, sy, src_w,
+            src_h, sw, sh);
+  }
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(tex_binding));
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read_fbo));
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw_fbo));
+  if (scissor == GL_TRUE) {
+    glEnable(GL_SCISSOR_TEST);
+  }
+  while (glGetError() != GL_NO_ERROR) {
+  }
+}
+
+// glViewport remaps draws into the visible band. glBlitFramebuffer ignores the
+// viewport, so a present into the default framebuffer still uses guest window
+// coordinates and lands under that band. Scale only that destination.
+static void VexaBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                                GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                                GLbitfield mask, GLenum filter) {
+  GLint dx0 = dstX0;
+  GLint dy0 = dstY0;
+  GLint dx1 = dstX1;
+  GLint dy1 = dstY1;
+  GLint draw_fbo = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
+  if (draw_fbo == 0) {
+    VexaNotePresentDest(dstX0, dstY0, dstX1, dstY1);
+    const int dw = dstX1 >= dstX0 ? dstX1 - dstX0 : dstX0 - dstX1;
+    const int dh = dstY1 >= dstY0 ? dstY1 - dstY0 : dstY0 - dstY1;
+    const bool have_guest = g_vexa_guest_w > 0 && g_vexa_guest_h > 0;
+    const GLsizei guest_w = have_guest ? g_vexa_guest_w : static_cast<GLsizei>(dw);
+    const GLsizei guest_h = have_guest ? g_vexa_guest_h : static_cast<GLsizei>(dh);
+    const GLint guest_x = have_guest ? g_vexa_guest_x : (dstX0 < dstX1 ? dstX0 : dstX1);
+    const GLint guest_y = have_guest ? g_vexa_guest_y : (dstY0 < dstY1 ? dstY0 : dstY1);
+    VexaVisibleRect rect = VexaVisibleRectFor(guest_w, guest_h);
+    // Already the full surface. A guest window that is merely larger than half
+    // the surface still needs to be scaled into the cover rect.
+    const bool host_sized = rect.surface_w > 0 && rect.surface_h > 0 && dw + 8 >= rect.surface_w && dh + 8 >= rect.surface_h;
+    const bool tiny = guest_w > 0 && guest_h > 0 && (dw * 2 < static_cast<int>(guest_w) || dh * 2 < static_cast<int>(guest_h));
+    if (rect.ok && !host_sized && !tiny && guest_w > 0 && guest_h > 0) {
+      dx0 = VexaMapGuestToVisible(dstX0, guest_x, guest_w, rect.x, rect.width);
+      dy0 = VexaMapGuestToVisible(dstY0, guest_y, guest_h, rect.y, rect.height);
+      dx1 = VexaMapGuestToVisible(dstX1, guest_x, guest_w, rect.x, rect.width);
+      dy1 = VexaMapGuestToVisible(dstY1, guest_y, guest_h, rect.y, rect.height);
+      const int min_x = dx0 < dx1 ? dx0 : dx1;
+      const int min_y = dy0 < dy1 ? dy0 : dy1;
+      const int max_x = dx0 < dx1 ? dx1 : dx0;
+      const int max_y = dy0 < dy1 ? dy1 : dy0;
+      // Mali rejects a blit that starts outside the surface, which left the 16:9 bars in place.
+      if (min_x < 0 || min_y < 0 || max_x > rect.surface_w || max_y > rect.surface_h) {
+        dx0 = dstX0;
+        dy0 = dstY0;
+        dx1 = dstX1;
+        dy1 = dstY1;
+      }
+      static int logged = 0;
+      if (logged < 8) {
+        ++logged;
+        fprintf(stderr,
+                "[VEXA][GL] blit %d,%d,%d,%d -> %d,%d,%d,%d guest %d,%d %dx%d visible %d,%d %dx%d\n",
+                dstX0, dstY0, dstX1, dstY1, dx0, dy0, dx1, dy1, guest_x, guest_y, guest_w, guest_h, rect.x, rect.y,
+                rect.width, rect.height);
+      }
+    } else {
+      static int skipped = 0;
+      if (skipped < 4) {
+        ++skipped;
+        fprintf(stderr, "[VEXA][GL] blit passthrough %d,%d,%d,%d host_sized=%d tiny=%d guest %dx%d\n", dstX0, dstY0,
+                dstX1, dstY1, host_sized ? 1 : 0, tiny ? 1 : 0, guest_w, guest_h);
+      }
+    }
+  }
+  ::glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dx0, dy0, dx1, dy1, mask, filter);
+}
+
+static void fexfn_impl_libGL_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0,
+                                               GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
+  VexaBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
+}
+
+static void fexfn_impl_libGL_glBlitFramebufferEXT(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0,
+                                                  GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
+  VexaBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 
 struct VexaFFMesh {
@@ -1748,6 +2086,49 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
       LogShaderTranspileEvent("skip-essl-source", static_cast<GLenum>(shader_type));
     }
   }
+#elif defined(BUILD_ANDROID)
+  // Mali accepts ESSL up to 320 es. Godot's Linux GLES3 export emits desktop
+  // #version 330, which the driver rejects before it parses layout().
+  if (host_strings && count > 0) {
+    std::string source;
+    for (GLsizei i = 0; i < count; ++i) {
+      if (!host_strings[i]) {
+        continue;
+      }
+      if (length && length[i] > 0) {
+        source.append(host_strings[i], static_cast<size_t>(length[i]));
+      } else {
+        source.append(host_strings[i]);
+      }
+    }
+    const auto version_pos = source.find("#version");
+    if (version_pos != std::string::npos) {
+      const auto line_end = source.find('\n', version_pos);
+      const auto line_len = line_end == std::string::npos ? source.size() - version_pos : line_end - version_pos;
+      const auto line = source.substr(version_pos, line_len);
+      if (line.find(" es") == std::string::npos && line.find("330") != std::string::npos) {
+        source.replace(version_pos, line_len, "#version 300 es");
+        GLint shader_type = 0;
+        ::glGetShaderiv(shader, GL_SHADER_TYPE, &shader_type);
+        if (shader_type == GL_FRAGMENT_SHADER && source.find("precision ") == std::string::npos) {
+          const auto insert_at = source.find('\n', source.find("#version"));
+          if (insert_at != std::string::npos) {
+            source.insert(insert_at + 1, "precision highp float;\nprecision highp int;\n");
+          }
+        }
+        fprintf(stderr, "[libGL-host] shader version 330 -> 300 es type=0x%x len=%zu binding=%d fragcolor=%d arb_lod=%d sampler_array=%d\n",
+                shader_type,
+                source.size(),
+                source.find("layout(binding") != std::string::npos ? 1 : 0,
+                source.find("gl_FragColor") != std::string::npos ? 1 : 0,
+                source.find("GL_ARB_shader_texture_lod") != std::string::npos ? 1 : 0,
+                source.find("sampler2DArray") != std::string::npos ? 1 : 0);
+        const GLchar* rewritten = source.c_str();
+        ::glShaderSource(shader, 1, &rewritten, nullptr);
+        return;
+      }
+    }
+  }
 #endif
   ::glShaderSource(shader, count, host_strings, length);
 }
@@ -1780,6 +2161,23 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
   GLHOST_TRACE_SCOPE();
 #ifdef BUILD_ANDROID
   GLHostLogCurrentEGLState("glGetString");
+  // Godot 3's Linux export is GLES-over-GL and rejects anything below desktop
+  // OpenGL 3.3. Mali reports "OpenGL ES 3.2", so both the GLES3 and GLES2
+  // viability checks fail before a frame is drawn.
+  if (name == GL_VERSION) {
+    static const GLubyte kDesktopVersion[] = "3.3.0";
+    fprintf(stderr,
+                 "[libGL-host] glGetString(GL_VERSION) desktop spoof => '%s'\n",
+                 reinterpret_cast<const char*>(kDesktopVersion));
+    return kDesktopVersion;
+  }
+  if (name == GL_SHADING_LANGUAGE_VERSION) {
+    static const GLubyte kDesktopShading[] = "3.30";
+    fprintf(stderr,
+                 "[libGL-host] glGetString(GL_SHADING_LANGUAGE_VERSION) desktop spoof => '%s'\n",
+                 reinterpret_cast<const char*>(kDesktopShading));
+    return kDesktopShading;
+  }
   const GLubyte* result = ::glGetString(name);
   if (!result) {
     fprintf(stderr,
@@ -1805,6 +2203,28 @@ const GLubyte* fexfn_impl_libGL_glGetStringi(GLenum name, GLuint index) {
   GLHOST_TRACE_SCOPE();
 #ifdef BUILD_ANDROID
   GLHostLogCurrentEGLState("glGetStringi");
+  // GLES2-over-GL refuses to start unless GLAD sees a desktop FBO extension.
+  // Framebuffer objects are core on this GLES 3.2 driver; only the name differs.
+  static const char* kDesktopFboExts[] = {
+    "GL_ARB_framebuffer_object",
+    "GL_EXT_framebuffer_object",
+  };
+  if (name == GL_EXTENSIONS) {
+    GLint real_count = 0;
+    ::glGetIntegerv(GL_NUM_EXTENSIONS, &real_count);
+    if (real_count < 0) {
+      real_count = 0;
+    }
+    const auto real = static_cast<GLuint>(real_count);
+    if (index >= real && index < real + 2) {
+      const char* ext = kDesktopFboExts[index - real];
+      fprintf(stderr,
+                   "[libGL-host] glGetStringi(GL_EXTENSIONS index=%u) desktop spoof => '%s'\n",
+                   static_cast<unsigned>(index),
+                   ext);
+      return reinterpret_cast<const GLubyte*>(ext);
+    }
+  }
   const GLubyte* result = ::glGetStringi(name, index);
   if (!result) {
     fprintf(stderr,
@@ -2433,7 +2853,7 @@ void glBlitFramebufferEXT(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                           GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
                           GLbitfield mask, GLenum filter) {
   GLHOST_TRACE_SCOPE();
-  ::glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
+  VexaBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -2519,6 +2939,8 @@ void fexfn_impl_libGL_glAttachShader(GLuint a_0, GLuint a_1) {
   LogShaderDriverError("attach-call", a_0, detail);
 #endif
   fexldr_ptr_libGL_glAttachShader(a_0, a_1);
+  fprintf(stderr, "[libGL-host] glAttachShader done program=%u shader=%u\n",
+               static_cast<unsigned>(a_0), static_cast<unsigned>(a_1));
 }
 
 void fexfn_impl_libGL_glDetachShader(GLuint a_0, GLuint a_1) {
@@ -2564,7 +2986,20 @@ void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
 
 void fexfn_impl_libGL_glLinkProgram(GLuint a_0) {
   GLHOST_TRACE_SCOPE();
+  fprintf(stderr, "[libGL-host] glLinkProgram(%u) enter\n", static_cast<unsigned>(a_0));
   fexldr_ptr_libGL_glLinkProgram(a_0);
+  GLint link_status = 0;
+  ::glGetProgramiv(a_0, GL_LINK_STATUS, &link_status);
+  GLint log_len = 0;
+  ::glGetProgramiv(a_0, GL_INFO_LOG_LENGTH, &log_len);
+  fprintf(stderr, "[libGL-host] glLinkProgram(%u) status=%d log_len=%d\n",
+               static_cast<unsigned>(a_0), link_status, static_cast<int>(log_len));
+  if (log_len > 1 && log_len < 8192) {
+    std::string info(static_cast<size_t>(log_len), '\0');
+    GLsizei written = 0;
+    ::glGetProgramInfoLog(a_0, log_len, &written, info.data());
+    fprintf(stderr, "[libGL-host] link log: %s\n", info.c_str());
+  }
 #if defined(VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR)
   LogFailedProgramLink(a_0);
 #endif
@@ -2581,6 +3016,27 @@ void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1) {
   // treat this as a fatal capability mismatch and stop rendering.
   if (a_0 == GL_DOUBLEBUFFER) {
     *a_1 = 1;
+    return;
+  }
+  if (a_0 == GL_MAJOR_VERSION) {
+    *a_1 = 3;
+    return;
+  }
+  if (a_0 == GL_MINOR_VERSION) {
+    *a_1 = 3;
+    return;
+  }
+  if (a_0 == GL_NUM_EXTENSIONS) {
+    GLint real_count = 0;
+    if (fexldr_ptr_libGL_glGetIntegerv) {
+      fexldr_ptr_libGL_glGetIntegerv(GL_NUM_EXTENSIONS, &real_count);
+    } else {
+      ::glGetIntegerv(GL_NUM_EXTENSIONS, &real_count);
+    }
+    if (real_count < 0) {
+      real_count = 0;
+    }
+    *a_1 = real_count + 2;
     return;
   }
 
