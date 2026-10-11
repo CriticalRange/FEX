@@ -20,6 +20,8 @@ $end_info$
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
@@ -202,6 +204,91 @@ const char* GLHostGLStringName(GLenum name) {
     case GL_EXTENSIONS: return "GL_EXTENSIONS";
     default: return "UNKNOWN";
   }
+}
+
+// ES fragment shaders have no default precision for float and no default at
+// all for most opaque types, while desktop GLSL never declares precision. A
+// raw substring check for "precision " both misses partially-qualified sources
+// and false-triggers on unrelated tokens (e.g. GL_ARB_shader_precision), so
+// always emit a complete default-precision set. Precision statements later in
+// the source still override these defaults.
+constexpr std::string_view kVexaShaderPrecisionEs300 {
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "precision highp sampler2D;\n"
+    "precision highp sampler3D;\n"
+    "precision highp samplerCube;\n"
+    "precision highp sampler2DShadow;\n"
+    "precision highp samplerCubeShadow;\n"
+    "precision highp sampler2DArray;\n"
+    "precision highp sampler2DArrayShadow;\n"
+    "precision highp isampler2D;\n"
+    "precision highp isampler3D;\n"
+    "precision highp isamplerCube;\n"
+    "precision highp isampler2DArray;\n"
+    "precision highp usampler2D;\n"
+    "precision highp usampler3D;\n"
+    "precision highp usamplerCube;\n"
+    "precision highp usampler2DArray;\n"};
+
+// ES 3.1/3.2-only sampler types (multisample, cube-array, texel-buffer).
+constexpr std::string_view kVexaShaderPrecisionEs320Extra {
+    "precision highp sampler2DMS;\n"
+    "precision highp isampler2DMS;\n"
+    "precision highp usampler2DMS;\n"
+    "precision highp sampler2DMSArray;\n"
+    "precision highp isampler2DMSArray;\n"
+    "precision highp usampler2DMSArray;\n"
+    "precision highp samplerCubeArray;\n"
+    "precision highp samplerCubeArrayShadow;\n"
+    "precision highp isamplerCubeArray;\n"
+    "precision highp usamplerCubeArray;\n"
+    "precision highp samplerBuffer;\n"
+    "precision highp isamplerBuffer;\n"
+    "precision highp usamplerBuffer;\n"};
+
+// Insert after the #version line and the contiguous leading #extension block,
+// so extension directives remain in the prologue where drivers expect them.
+[[maybe_unused]] static size_t VexaShaderPrecisionInsertPos(std::string_view source) {
+  size_t insert_pos = 0;
+  const auto version_pos = source.find("#version");
+  if (version_pos != std::string_view::npos) {
+    const auto version_end = source.find('\n', version_pos);
+    insert_pos = (version_end == std::string_view::npos) ? source.size() : (version_end + 1);
+  }
+
+  size_t cursor = insert_pos;
+  while (cursor < source.size()) {
+    const auto line_end = source.find('\n', cursor);
+    const std::string_view line = source.substr(cursor, line_end == std::string_view::npos ? source.size() - cursor : line_end - cursor);
+
+    size_t begin = 0;
+    while (begin < line.size() && (line[begin] == ' ' || line[begin] == '\t')) {
+      ++begin;
+    }
+    const auto trimmed = line.substr(begin);
+
+    if (trimmed.empty()) {
+      if (line_end == std::string_view::npos) {
+        break;
+      }
+      cursor = line_end + 1;
+      continue;
+    }
+
+    if (trimmed.starts_with("#extension")) {
+      insert_pos = (line_end == std::string_view::npos) ? source.size() : (line_end + 1);
+      if (line_end == std::string_view::npos) {
+        break;
+      }
+      cursor = line_end + 1;
+      continue;
+    }
+
+    break;
+  }
+
+  return insert_pos;
 }
 #endif
 
@@ -734,12 +821,9 @@ void EnsureFragmentPrecision(std::string* source, GLenum shader_type) {
     return;
   }
 
-  if (source->find("precision ") != std::string::npos) {
-    return;
-  }
-
-  constexpr std::string_view kPrecision {"precision highp float;\nprecision highp int;\n"};
-  source->insert(FindPrecisionInsertPos(*source), kPrecision);
+  const size_t insert_at = FindPrecisionInsertPos(*source);
+  source->insert(insert_at, kVexaShaderPrecisionEs300);
+  source->insert(insert_at + kVexaShaderPrecisionEs300.size(), kVexaShaderPrecisionEs320Extra);
 }
 
 std::string TrimASCII(std::string_view text) {
@@ -1129,18 +1213,73 @@ struct VexaGlxState {
   EGLDisplay display = EGL_NO_DISPLAY;
   EGLSurface surface = EGL_NO_SURFACE;
   EGLContext context = EGL_NO_CONTEXT;
+  EGLConfig config = nullptr;
+  int buffer_format = 0;
   ANativeWindow* window = nullptr;
+  uint64_t window_serial = 0;
   bool ready = false;
 };
 
+// The SurfaceView can hand us a new ANativeWindow at any time (surface
+// recreated). eglSwapBuffers against the old window still "works" — frames are
+// queued into a surface nobody composites — which is exactly a black screen.
+// Rebuild the EGL surface whenever the bridge serial moves.
+static uint64_t VexaRuntimeSurfaceSerial() {
+  using Getter = uint64_t (*)();
+  static Getter fn = [] {
+    if (void* vexa = dlopen("libvexa.so", RTLD_NOW | RTLD_NOLOAD)) {
+      return reinterpret_cast<Getter>(dlsym(vexa, "Vexa_GetRuntimeSurfaceSerial"));
+    }
+    return Getter {};
+  }();
+  return fn ? fn() : 0;
+}
+
 static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
+
+extern uint64_t g_vexa_diag_draws;
+// VEXA diag: when non-zero, the diag wrappers log every call (one frame only).
+static int g_vexa_trace_frame = 0;
+// VEXA: set when the guest draws/clears/blits into FB0 during the current frame.
+static bool g_vexa_fb0_drawn = false;
+extern uint64_t g_vexa_diag_clears;
+extern uint64_t g_vexa_diag_useprog;
+extern uint64_t g_vexa_diag_bindfbo;
 
 static VexaGlxState g_vexa_glx;
 
 static bool VexaEnsureGlx() {
   if (g_vexa_glx.ready && g_vexa_glx.display != EGL_NO_DISPLAY && g_vexa_glx.context != EGL_NO_CONTEXT &&
       g_vexa_glx.surface != EGL_NO_SURFACE) {
-    return eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, g_vexa_glx.context) == EGL_TRUE;
+    const uint64_t serial = VexaRuntimeSurfaceSerial();
+    if (serial != 0 && g_vexa_glx.window_serial != 0 && serial != g_vexa_glx.window_serial) {
+      ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
+      if (window) {
+        eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
+        ANativeWindow_release(g_vexa_glx.window);
+        if (g_vexa_glx.buffer_format != 0) {
+          ANativeWindow_setBuffersGeometry(window, 0, 0, g_vexa_glx.buffer_format);
+        }
+        EGLSurface surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, nullptr);
+        if (surface != EGL_NO_SURFACE) {
+          fprintf(stderr, "[VEXA][GLX] surface rebuilt for window %p serial %llu->%llu\n", window,
+                  (unsigned long long)g_vexa_glx.window_serial, (unsigned long long)serial);
+          g_vexa_glx.surface = surface;
+          g_vexa_glx.window = window;
+          g_vexa_glx.window_serial = serial;
+        } else {
+          fprintf(stderr, "[VEXA][GLX] surface rebuild failed 0x%x\n", eglGetError());
+          ANativeWindow_release(window);
+          return false;
+        }
+      }
+    }
+    if (eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, g_vexa_glx.context) == EGL_TRUE) {
+      return true;
+    }
+    fprintf(stderr, "[VEXA][GLX] eglMakeCurrent failed 0x%x\n", eglGetError());
+    return false;
   }
   ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
   if (!window) {
@@ -1152,9 +1291,12 @@ static bool VexaEnsureGlx() {
     fprintf(stderr, "[VEXA][GLX] eglInitialize failed 0x%x\n", eglGetError());
     return false;
   }
+#ifndef EGL_OPENGL_ES3_BIT
+#define EGL_OPENGL_ES3_BIT 0x00000040
+#endif
   const EGLint config_attribs[] = {
     EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-    EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+    EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT,
     EGL_RED_SIZE, 8,
     EGL_GREEN_SIZE, 8,
     EGL_BLUE_SIZE, 8,
@@ -1174,16 +1316,54 @@ static bool VexaEnsureGlx() {
     ANativeWindow_setBuffersGeometry(window, 0, 0, format);
   }
   EGLSurface surface = eglCreateWindowSurface(display, config, window, nullptr);
-  const EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-  EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
-  if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
-      eglMakeCurrent(display, surface, surface, context) != EGL_TRUE) {
-    fprintf(stderr, "[VEXA][GLX] context setup failed 0x%x\n", eglGetError());
+  if (surface == EGL_NO_SURFACE) {
+    fprintf(stderr, "[VEXA][GLX] eglCreateWindowSurface failed 0x%x\n", eglGetError());
     ANativeWindow_release(window);
     return false;
   }
-  g_vexa_glx = {display, surface, context, window, true};
-  fprintf(stderr, "[VEXA][GLX] surface ready %p\n", surface);
+  // Indirect draws and compute need GLES 3.1. Fall back if the driver rejects a version.
+#ifndef EGL_CONTEXT_MAJOR_VERSION
+#define EGL_CONTEXT_MAJOR_VERSION 0x3098
+#endif
+#ifndef EGL_CONTEXT_MINOR_VERSION
+#define EGL_CONTEXT_MINOR_VERSION 0x30FB
+#endif
+  const EGLint ctx_32[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 2, EGL_NONE};
+  const EGLint ctx_31[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE};
+  const EGLint ctx_30[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+  const EGLint ctx_20[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+  const EGLint* const ctx_tries[] = {ctx_32, ctx_31, ctx_30, ctx_20};
+  const char* const ctx_names[] = {"3.2", "3.1", "3.0", "2.0"};
+  EGLContext context = EGL_NO_CONTEXT;
+  const char* ctx_name = "none";
+  for (int i = 0; i < 4; ++i) {
+    context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_tries[i]);
+    if (context != EGL_NO_CONTEXT &&
+        eglMakeCurrent(display, surface, surface, context) == EGL_TRUE) {
+      ctx_name = ctx_names[i];
+      break;
+    }
+    fprintf(stderr, "[VEXA][GLX] GLES %s context failed 0x%x\n", ctx_names[i], eglGetError());
+    if (context != EGL_NO_CONTEXT) {
+      eglDestroyContext(display, context);
+      context = EGL_NO_CONTEXT;
+    }
+  }
+  if (context == EGL_NO_CONTEXT) {
+    eglDestroySurface(display, surface);
+    ANativeWindow_release(window);
+    return false;
+  }
+  g_vexa_glx.display = display;
+  g_vexa_glx.surface = surface;
+  g_vexa_glx.context = context;
+  g_vexa_glx.config = config;
+  g_vexa_glx.buffer_format = format;
+  g_vexa_glx.window = window;
+  g_vexa_glx.window_serial = VexaRuntimeSurfaceSerial();
+  g_vexa_glx.ready = true;
+  fprintf(stderr, "[VEXA][GLX] surface ready %p gles %s serial %llu\n", surface, ctx_name,
+          (unsigned long long)g_vexa_glx.window_serial);
   fexfn_impl_libGL_glViewport(0, 0, 300, 300);
   return true;
 }
@@ -1192,13 +1372,195 @@ static auto fexfn_impl_libGL_VEXA_BindGlxSurface() -> int {
   return VexaEnsureGlx() ? 1 : 0;
 }
 
+static auto fexfn_impl_libGL_VEXA_ReleaseGlxSurface() -> int {
+  if (!g_vexa_glx.ready || g_vexa_glx.display == EGL_NO_DISPLAY) {
+    return 1;
+  }
+  // glXMakeCurrent(NULL) must drop the context on this thread. Leaving it
+  // current makes the next thread's eglMakeCurrent fail with EGL_BAD_ACCESS,
+  // and Unity then creates shaders against no context.
+  const EGLBoolean ok = eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (ok != EGL_TRUE) {
+    fprintf(stderr, "[VEXA][GLX] release failed 0x%x\n", eglGetError());
+    return 0;
+  }
+  return 1;
+}
+
 static void VexaCoverPresent();
+
+// KHR_debug values (not exposed by the GLES headers this TU includes).
+constexpr GLenum kVexaGLDebugTypeError = 0x824C;
+constexpr GLenum kVexaGLDebugOutput = 0x92E0;
+constexpr GLenum kVexaGLDebugOutputSync = 0x8242;
+using VexaGLDebugProc = void(GL_APIENTRYP)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar*, const void*);
+
+static void GL_APIENTRY VexaGLDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length,
+                                            const GLchar* message, const void*) {
+  static int logged = 0;
+  if (type != kVexaGLDebugTypeError || logged >= 40) {
+    return;
+  }
+  ++logged;
+  fprintf(stderr, "[VEXA][GLDBG] src=%x type=%x id=%u sev=%x tid=%ld: %.*s\n", source, type, id, severity,
+          (long)syscall(SYS_gettid), length > 0 ? (int)length : 512, message ? message : "");
+}
+
+static void VexaInstallGLDebugOnce() {
+  static bool done = false;
+  if (done) {
+    return;
+  }
+  done = true;
+  using CbFn = void(GL_APIENTRYP)(VexaGLDebugProc, const void*);
+  auto fn = reinterpret_cast<CbFn>(eglGetProcAddress("glDebugMessageCallbackKHR"));
+  if (!fn) {
+    fn = reinterpret_cast<CbFn>(eglGetProcAddress("glDebugMessageCallback"));
+  }
+  if (!fn) {
+    fprintf(stderr, "[VEXA][GLDBG] no debug callback entry\n");
+    return;
+  }
+  ::glEnable(kVexaGLDebugOutput);
+  ::glEnable(kVexaGLDebugOutputSync);
+  fn(VexaGLDebugCallback, nullptr);
+  fprintf(stderr, "[VEXA][GLDBG] installed err=0x%x\n", glGetError());
+}
+
+// VEXA: present fallback. Some guests finish the frame in an offscreen FBO and
+// swap without copying it to FB0 (observed with Unity GLCore on this stack:
+// last pass goes to FBO 2, no blit to 0). Copy that FBO to the surface.
+static void VexaPresentFallback() {
+  const bool drew_fb0 = g_vexa_fb0_drawn;
+  g_vexa_fb0_drawn = false;
+  if (drew_fb0) {
+    return;
+  }
+  GLint dfbo = 0;
+  ::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+  if (dfbo == 0) {
+    return;
+  }
+  GLint type = 0, name = 0;
+  ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+  ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+  GLint w = 0, h = 0;
+  if (type == GL_TEXTURE) {
+    GLint level = 0;
+    ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+    GLint prev_tex = 0;
+    ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    ::glBindTexture(GL_TEXTURE_2D, name);
+    ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_WIDTH, &w);
+    ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_HEIGHT, &h);
+    ::glBindTexture(GL_TEXTURE_2D, prev_tex);
+  } else if (type == GL_RENDERBUFFER) {
+    GLint prev_rb = 0;
+    ::glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
+    ::glBindRenderbuffer(GL_RENDERBUFFER, name);
+    ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &w);
+    ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &h);
+    ::glBindRenderbuffer(GL_RENDERBUFFER, prev_rb);
+  }
+  EGLint sw = 0, sh = 0;
+  eglQuerySurface(g_vexa_glx.display, g_vexa_glx.surface, EGL_WIDTH, &sw);
+  eglQuerySurface(g_vexa_glx.display, g_vexa_glx.surface, EGL_HEIGHT, &sh);
+  static int logged = 0;
+  if (logged < 3) {
+    ++logged;
+    fprintf(stderr, "[VEXA][PRESENT] fallback fbo=%d att_type=0x%x name=%d %dx%d -> surface %dx%d\n", dfbo, type, name,
+            w, h, sw, sh);
+  }
+  if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0) {
+    return;
+  }
+  GLint rfbo = 0;
+  ::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfbo);
+  GLint read_buf = GL_COLOR_ATTACHMENT0;
+  const GLboolean scissor = ::glIsEnabled(GL_SCISSOR_TEST);
+  ::glDisable(GL_SCISSOR_TEST);
+  ::glBindFramebuffer(GL_READ_FRAMEBUFFER, dfbo);
+  ::glGetIntegerv(GL_READ_BUFFER, &read_buf);
+  ::glReadBuffer(GL_COLOR_ATTACHMENT0);
+  ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+  ::glBlitFramebuffer(0, 0, w, h, 0, 0, sw, sh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+  const GLenum err = ::glGetError();
+  if (err != GL_NO_ERROR && logged < 6) {
+    ++logged;
+    fprintf(stderr, "[VEXA][PRESENT] fallback blit err=0x%x\n", err);
+  }
+  ::glReadBuffer(read_buf);
+  ::glBindFramebuffer(GL_READ_FRAMEBUFFER, rfbo);
+  ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dfbo);
+  if (scissor) {
+    ::glEnable(GL_SCISSOR_TEST);
+  }
+}
 
 static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
   if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
     return;
   }
+  VexaInstallGLDebugOnce();
   VexaCoverPresent();
+  VexaPresentFallback();
+  // Debug: sample the presented framebuffer to verify guest content reaches FB0.
+  {
+    static int swap_count = 0;
+    ++swap_count;
+    if (swap_count == 60 || swap_count == 300 || swap_count == 900) {
+      eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, g_vexa_glx.context);
+      GLint draw_fbo = -1, read_fbo = -1;
+      glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+      while (glGetError() != GL_NO_ERROR) {
+      }
+      GLubyte px[8 * 4];
+      int nonzero = 0;
+      GLenum first_err = GL_NO_ERROR;
+      for (int i = 0; i < 8; ++i) {
+        glReadPixels(100 + i * 300, 100 + i * 120, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px + i * 4);
+        const GLenum e = glGetError();
+        if (e != GL_NO_ERROR && first_err == GL_NO_ERROR) {
+          first_err = e;
+        }
+      }
+      for (int i = 0; i < 8; ++i) {
+        if (px[i * 4] || px[i * 4 + 1] || px[i * 4 + 2]) {
+          ++nonzero;
+        }
+      }
+      fprintf(stderr,
+              "[VEXA][GLX] fb0 sample n=%d nz=%d dfbo=%d rfbo=%d: %02x%02x%02x %02x%02x%02x %02x%02x%02x "
+              "%02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x err=0x%x\n",
+              swap_count, nonzero, draw_fbo, read_fbo, px[0], px[1], px[2], px[4], px[5], px[6], px[8], px[9],
+              px[10], px[12], px[13], px[14], px[16], px[17], px[18], px[20], px[21], px[22], px[24], px[25],
+              px[26], px[28], px[29], px[30], first_err);
+    }
+  }
+  {
+    static int diag_swaps = 0;
+    ++diag_swaps;
+    if (g_vexa_trace_frame) {
+      GLint dfbo = -1, rfbo = -1;
+      glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfbo);
+      fprintf(stderr, "[VEXA][TRACE] swap dfbo=%d rfbo=%d err=0x%x -- end trace\n", dfbo, rfbo, glGetError());
+    }
+    g_vexa_trace_frame = (diag_swaps == 600) ? 1 : 0;
+    if (g_vexa_trace_frame) {
+      fprintf(stderr, "[VEXA][TRACE] begin frame after swap %d tid=%ld\n", diag_swaps, (long)syscall(SYS_gettid));
+    }
+    if ((diag_swaps & 127) == 0) {
+      fprintf(stderr,
+              "[VEXA][GLX] diag swaps=%d draws=%llu clears=%llu useprog=%llu bindfbo=%llu\n",
+              diag_swaps, (unsigned long long)g_vexa_diag_draws, (unsigned long long)g_vexa_diag_clears,
+              (unsigned long long)g_vexa_diag_useprog, (unsigned long long)g_vexa_diag_bindfbo);
+    }
+  }
   if (eglSwapBuffers(g_vexa_glx.display, g_vexa_glx.surface) != EGL_TRUE) {
     fprintf(stderr, "[VEXA][GLX] eglSwapBuffers failed 0x%x\n", eglGetError());
   }
@@ -1305,6 +1667,13 @@ static GLint VexaBoundDrawFramebuffer() {
   return draw_fbo;
 }
 
+// True when the guest rectangle already lies on the surface. The window size
+// is the surface size, so this holds for any panel: the guest placed the rect.
+static bool VexaRectInsideSurface(int x, int y, int width, int height, int surface_w, int surface_h) {
+  return surface_w > 0 && surface_h > 0 && width > 0 && height > 0 && x >= -1 && y >= -1 &&
+         x + width <= surface_w + 1 && y + height <= surface_h + 1;
+}
+
 static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
   static bool logged = false;
   static bool logged_fbo = false;
@@ -1323,6 +1692,10 @@ static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei
     return;
   }
   VexaVisibleRect rect = VexaVisibleRectFor(width, height);
+  if (rect.ok && VexaRectInsideSurface(x, y, width, height, rect.surface_w, rect.surface_h)) {
+    glViewport(x, y, width, height);
+    return;
+  }
   if (rect.ok) {
     glViewport(rect.x, rect.y, rect.width, rect.height);
     if (!logged) {
@@ -1351,6 +1724,10 @@ static void fexfn_impl_libGL_glScissor(GLint x, GLint y, GLsizei width, GLsizei 
     return;
   }
   VexaVisibleRect rect = VexaVisibleRectFor(width, height);
+  if (rect.ok && VexaRectInsideSurface(x, y, width, height, rect.surface_w, rect.surface_h)) {
+    glScissor(x, y, width, height);
+    return;
+  }
   if (rect.ok) {
     glScissor(rect.x, rect.y, rect.width, rect.height);
     if (!logged) {
@@ -1370,17 +1747,16 @@ static GLint VexaMapGuestToVisible(GLint value, GLint guest_origin, GLsizei gues
   return visible_origin + static_cast<GLint>((static_cast<int64_t>(value - guest_origin) * visible_span) / guest_span);
 }
 
-// Godot's stretch/keep draws the 16:9 frame inside the device window and blits
-// that inset onto the default framebuffer. A dest outside the surface is left
-// 1:1 here; VexaCoverPresent scales it to the full surface at swap time.
+// The guest window is the surface. A blit that already lands on it is the
+// guest's own layout for this size. VexaCoverPresent must not crop it.
 static int g_present_x0 = 0;
 static int g_present_y0 = 0;
 static int g_present_x1 = 0;
 static int g_present_y1 = 0;
 static bool g_present_ready = false;
 
-// Screen pixels are the covered surface. Publish the inverse so guest X11
-// clicks land on the Godot window pixel that was cropped into that point.
+// Screen pixels match the guest window when the frame is not rescaled.
+// Identity (origin 0, crop == surface) keeps a touch on that window pixel.
 static void VexaPublishPresentMap(int x0, int y0, int cw, int ch, int sx, int sy, int src_w, int src_h, int sw,
                                   int sh) {
   using Fn = void (*)(int, int, int, int, int, int, int, int, int, int);
@@ -1449,95 +1825,25 @@ static void VexaCoverPresent() {
   if (sw <= 0 || sh <= 0 || cw < 64 || ch < 64) {
     return;
   }
-  if (x0 <= 8 && y0 <= 8 && sw - x1 <= 8 && sh - y1 <= 8) {
+  // Inside the surface, including a centered fit on a wider or taller panel:
+  // leave the guest's rectangle. Covering it would crop the long axis, and the
+  // number of pixels depends on the two aspect ratios, not on one device.
+  if (VexaRectInsideSurface(x0, y0, cw, ch, sw, sh)) {
     VexaPublishPresentMap(0, 0, sw, sh, 0, 0, sw, sh, sw, sh);
+    static int kept = 0;
+    if (kept < 2) {
+      ++kept;
+      fprintf(stderr, "[VEXA][GL] present keep %d,%d %dx%d on %dx%d\n", x0, y0, cw, ch, sw, sh);
+    }
     return;
   }
-  if (x0 < 0 || y0 < 0 || x1 > sw || y1 > sh) {
-    VexaPublishPresentMap(0, 0, sw, sh, 0, 0, sw, sh, sw, sh);
-    return;
-  }
-
-  static GLuint tex = 0;
-  static GLuint fbo = 0;
-  static int tw = 0;
-  static int th = 0;
-  static int logged = 0;
-  GLint draw_fbo = 0;
-  GLint read_fbo = 0;
-  GLint tex_binding = 0;
-  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
-  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
-  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
-  glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_binding);
-  if (tex == 0) {
-    glGenTextures(1, &tex);
-    glGenFramebuffers(1, &fbo);
-  }
-  glBindTexture(GL_TEXTURE_2D, tex);
-  if (tw != cw || th != ch) {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cw, ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    tw = cw;
-    th = ch;
-  }
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-  if (scissor == GL_TRUE) {
-    glDisable(GL_SCISSOR_TEST);
-  }
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
-  ::glBlitFramebuffer(x0, y0, x1, y1, 0, 0, cw, ch, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-  int src_w = cw;
-  int src_h = ch;
-  if (static_cast<int64_t>(sw) * ch >= static_cast<int64_t>(sh) * cw) {
-    src_w = cw;
-    src_h = static_cast<int>(static_cast<int64_t>(cw) * sh / sw);
-  } else {
-    src_h = ch;
-    src_w = static_cast<int>(static_cast<int64_t>(ch) * sw / sh);
-  }
-  if (src_w < 1) {
-    src_w = 1;
-  }
-  if (src_h < 1) {
-    src_h = 1;
-  }
-  if (src_w > cw) {
-    src_w = cw;
-  }
-  if (src_h > ch) {
-    src_h = ch;
-  }
-  const int sx = (cw - src_w) / 2;
-  const int sy = (ch - src_h) / 2;
-  VexaPublishPresentMap(x0, y0, cw, ch, sx, sy, src_w, src_h, sw, sh);
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-  ::glBlitFramebuffer(sx, sy, sx + src_w, sy + src_h, 0, 0, sw, sh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-  if (logged < 2) {
-    ++logged;
-    fprintf(stderr, "[VEXA][GL] present cover %d,%d %dx%d crop %d,%d %dx%d -> %dx%d\n", x0, y0, cw, ch, sx, sy, src_w,
-            src_h, sw, sh);
-  }
-  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(tex_binding));
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read_fbo));
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw_fbo));
-  if (scissor == GL_TRUE) {
-    glEnable(GL_SCISSOR_TEST);
-  }
-  while (glGetError() != GL_NO_ERROR) {
-  }
+  // The part that fell outside the surface was never stored. Resampling the
+  // clipped remainder would still drop the guest's edges.
+  VexaPublishPresentMap(0, 0, sw, sh, 0, 0, sw, sh, sw, sh);
 }
 
-// glViewport remaps draws into the visible band. glBlitFramebuffer ignores the
-// viewport, so a present into the default framebuffer still uses guest window
-// coordinates and lands under that band. Scale only that destination.
+// A blit whose destination already lies on the surface is in window pixels.
+// Remapping it through the cover rect crops or shifts that layout.
 static void VexaBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                                 GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
                                 GLbitfield mask, GLenum filter) {
@@ -1548,6 +1854,7 @@ static void VexaBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint src
   GLint draw_fbo = 0;
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
   if (draw_fbo == 0) {
+    g_vexa_fb0_drawn = true;
     VexaNotePresentDest(dstX0, dstY0, dstX1, dstY1);
     const int dw = dstX1 >= dstX0 ? dstX1 - dstX0 : dstX0 - dstX1;
     const int dh = dstY1 >= dstY0 ? dstY1 - dstY0 : dstY0 - dstY1;
@@ -1556,12 +1863,15 @@ static void VexaBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint src
     const GLsizei guest_h = have_guest ? g_vexa_guest_h : static_cast<GLsizei>(dh);
     const GLint guest_x = have_guest ? g_vexa_guest_x : (dstX0 < dstX1 ? dstX0 : dstX1);
     const GLint guest_y = have_guest ? g_vexa_guest_y : (dstY0 < dstY1 ? dstY0 : dstY1);
+    const int dst_x = dstX0 < dstX1 ? dstX0 : dstX1;
+    const int dst_y = dstY0 < dstY1 ? dstY0 : dstY1;
     VexaVisibleRect rect = VexaVisibleRectFor(guest_w, guest_h);
+    const bool placed = VexaRectInsideSurface(dst_x, dst_y, dw, dh, rect.surface_w, rect.surface_h);
     // Already the full surface. A guest window that is merely larger than half
     // the surface still needs to be scaled into the cover rect.
     const bool host_sized = rect.surface_w > 0 && rect.surface_h > 0 && dw + 8 >= rect.surface_w && dh + 8 >= rect.surface_h;
     const bool tiny = guest_w > 0 && guest_h > 0 && (dw * 2 < static_cast<int>(guest_w) || dh * 2 < static_cast<int>(guest_h));
-    if (rect.ok && !host_sized && !tiny && guest_w > 0 && guest_h > 0) {
+    if (!placed && rect.ok && !host_sized && !tiny && guest_w > 0 && guest_h > 0) {
       dx0 = VexaMapGuestToVisible(dstX0, guest_x, guest_w, rect.x, rect.width);
       dy0 = VexaMapGuestToVisible(dstY0, guest_y, guest_h, rect.y, rect.height);
       dx1 = VexaMapGuestToVisible(dstX1, guest_x, guest_w, rect.x, rect.width);
@@ -1594,17 +1904,879 @@ static void VexaBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint src
       }
     }
   }
+  // Debug: sample the blit SOURCE and destination to see whether the game
+  // rendered content (source) and whether the blit deposits it (dest).
+  if (draw_fbo == 0) {
+    static int sampled = 0;
+    if (sampled < 6) {
+      ++sampled;
+      GLint read_fbo = -1;
+      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+      while (glGetError() != GL_NO_ERROR) {
+      }
+      GLubyte src_px[9 * 4];
+      int nonzero = 0;
+      for (int gy = 0; gy < 3; ++gy) {
+        for (int gx = 0; gx < 3; ++gx) {
+          const GLint sx = srcX0 + (srcX1 - srcX0) * (2 * gx + 1) / 6;
+          const GLint sy = srcY0 + (srcY1 - srcY0) * (2 * gy + 1) / 6;
+          GLubyte* dst = src_px + (gy * 3 + gx) * 4;
+          glReadPixels(sx, sy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+          if (dst[0] || dst[1] || dst[2]) {
+            ++nonzero;
+          }
+        }
+      }
+      const GLenum src_err = glGetError();
+      fprintf(stderr,
+              "[VEXA][GL] blit src rfbo=%d nz=%d: %02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x "
+              "%02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x err=0x%x tid=%ld\n",
+              read_fbo, nonzero, src_px[0], src_px[1], src_px[2], src_px[4], src_px[5], src_px[6], src_px[8],
+              src_px[9], src_px[10], src_px[12], src_px[13], src_px[14], src_px[16], src_px[17], src_px[18],
+              src_px[20], src_px[21], src_px[22], src_px[24], src_px[25], src_px[26], src_px[28], src_px[29],
+              src_px[30], src_px[32], src_px[33], src_px[34], src_err, (long)syscall(SYS_gettid));
+      if (sampled == 3) {
+        const GLint rw = srcX1 - srcX0;
+        const GLint rh = srcY1 - srcY0;
+        if (rw > 0 && rh > 0 && rw <= 8192 && rh <= 8192) {
+          std::vector<GLubyte> img(static_cast<size_t>(rw) * rh * 4);
+          glReadPixels(srcX0, srcY0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+          const char* path = "/data/data/com.critical.vexaemulator/files/artifacts/megabonk/fb_dump.ppm";
+          if (FILE* f = fopen(path, "wb")) {
+            fprintf(f, "P6\n%d %d\n255\n", rw, rh);
+            for (int y = rh - 1; y >= 0; --y) {
+              for (int x = 0; x < rw; ++x) {
+                const GLubyte* p = img.data() + (static_cast<size_t>(y) * rw + x) * 4;
+                fwrite(p, 1, 3, f);
+              }
+            }
+            fclose(f);
+            fprintf(stderr, "[VEXA][GL] dumped %dx%d to %s\n", rw, rh, path);
+          }
+        }
+      }
+    }
+  }
   ::glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dx0, dy0, dx1, dy1, mask, filter);
 }
 
 static void fexfn_impl_libGL_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0,
                                                GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
+  if (g_vexa_trace_frame) {
+    GLint dfbo = -1, rfbo = -1;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfbo);
+    fprintf(stderr, "[VEXA][TRACE] blit %d,%d,%d,%d -> %d,%d,%d,%d mask=%x rfbo=%d dfbo=%d pending_err=0x%x\n", srcX0,
+            srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, rfbo, dfbo, glGetError());
+  }
   VexaBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 
 static void fexfn_impl_libGL_glBlitFramebufferEXT(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0,
                                                   GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
   VexaBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
+}
+
+// VEXA diag: count guest rendering activity reaching the host. The FBO we
+// sample at blit time is all-zero; these counters show whether the guest is
+// drawing at all, what its clear color is, and which FBO receives draws.
+uint64_t g_vexa_diag_draws = 0;
+uint64_t g_vexa_diag_clears = 0;
+uint64_t g_vexa_diag_useprog = 0;
+uint64_t g_vexa_diag_bindfbo = 0;
+static GLuint g_vexa_diag_curprog = 0;
+static GLuint g_vexa_diag_curfbo = 0;
+static GLuint g_vexa_diag_drawfbo = 0;
+
+static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
+  ++g_vexa_diag_draws;
+  if (g_vexa_diag_drawfbo == 0) {
+    g_vexa_fb0_drawn = true;
+  }
+  if (g_vexa_trace_frame) {
+    GLint dfbo = -1;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+    fprintf(stderr, "[VEXA][TRACE] draw %s mode=%x n=%d dfbo=%d prog=%u pending_err=0x%x\n", name, mode, count, dfbo,
+            g_vexa_diag_curprog, glGetError());
+  }
+  if ((g_vexa_diag_draws & 1023) == 0) {
+    GLenum err = glGetError();
+    fprintf(stderr,
+            "[VEXA][GL] draws=%llu last=%s mode=%x n=%d fbo=%u prog=%u clears=%llu err=%x\n",
+            (unsigned long long)g_vexa_diag_draws, name, mode, count, g_vexa_diag_curfbo,
+            g_vexa_diag_curprog, (unsigned long long)g_vexa_diag_clears, err);
+  }
+}
+
+static void fexfn_impl_libGL_glUseProgram(GLuint program) {
+  g_vexa_diag_curprog = program;
+  ++g_vexa_diag_useprog;
+  if (g_vexa_trace_frame) {
+    fprintf(stderr, "[VEXA][TRACE] useprog %u pending_err=0x%x\n", program, glGetError());
+  }
+  ::glUseProgram(program);
+}
+
+static void fexfn_impl_libGL_glBindFramebuffer(GLenum target, GLuint framebuffer) {
+  g_vexa_diag_curfbo = framebuffer;
+  if (target != GL_READ_FRAMEBUFFER) {
+    g_vexa_diag_drawfbo = framebuffer;
+  }
+  ++g_vexa_diag_bindfbo;
+  if (g_vexa_trace_frame) {
+    fprintf(stderr, "[VEXA][TRACE] bindfbo target=%x fbo=%u pending_err=0x%x\n", target, framebuffer, glGetError());
+  } else {
+    static int early_binds = 0;
+    if (early_binds < 60) {
+      ++early_binds;
+      fprintf(stderr, "[VEXA][GL] early bindfbo #%d target=%x fbo=%u tid=%ld\n", early_binds, target, framebuffer,
+              (long)syscall(SYS_gettid));
+    }
+  }
+  ::glBindFramebuffer(target, framebuffer);
+}
+
+static void fexfn_impl_libGL_glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
+  static int cc_logged = 0;
+  if (cc_logged < 12 || g_vexa_trace_frame) {
+    ++cc_logged;
+    fprintf(stderr, "[VEXA][GL] clearcolor %.2f %.2f %.2f %.2f fbo=%u\n", red, green, blue, alpha,
+            g_vexa_diag_curfbo);
+  }
+  ::glClearColor(red, green, blue, alpha);
+}
+
+static void fexfn_impl_libGL_glClear(GLbitfield mask) {
+  ++g_vexa_diag_clears;
+  if (g_vexa_trace_frame) {
+    GLint dfbo = -1;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+    fprintf(stderr, "[VEXA][TRACE] clear mask=%x dfbo=%d pending_err=0x%x\n", mask, dfbo, glGetError());
+  }
+  ::glClear(mask);
+}
+
+static void fexfn_impl_libGL_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+  VexaDiagDraw("arrays", mode, count);
+  ::glDrawArrays(mode, first, count);
+}
+
+static void fexfn_impl_libGL_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+  VexaDiagDraw("elements", mode, count);
+  ::glDrawElements(mode, count, type, indices);
+}
+
+static void fexfn_impl_libGL_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
+  VexaDiagDraw("arrays_inst", mode, count * primcount);
+  ::glDrawArraysInstanced(mode, first, count, primcount);
+}
+
+static void fexfn_impl_libGL_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                                     GLsizei primcount) {
+  VexaDiagDraw("elements_inst", mode, count * primcount);
+  ::glDrawElementsInstanced(mode, count, type, indices, primcount);
+}
+
+static void fexfn_impl_libGL_glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
+  VexaDiagDraw("elements_indirect", mode, -1);
+  ::glDrawElementsIndirect(mode, type, indirect);
+}
+
+static void fexfn_impl_libGL_glDrawArraysIndirect(GLenum mode, const void* indirect) {
+  VexaDiagDraw("arrays_indirect", mode, -1);
+  ::glDrawArraysIndirect(mode, indirect);
+}
+
+static void fexfn_impl_libGL_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                                      GLint basevertex) {
+  VexaDiagDraw("elements_basev", mode, count);
+  ::glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+}
+
+static void fexfn_impl_libGL_glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type,
+                                                               const void* indices, GLsizei primcount,
+                                                               GLint basevertex) {
+  VexaDiagDraw("elements_inst_basev", mode, count * primcount);
+  ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, primcount, basevertex);
+}
+
+static void fexfn_impl_libGL_glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z) {
+  VexaDiagDraw("dispatch", (GLenum)num_groups_x, (GLsizei)(num_groups_y * num_groups_z));
+  ::glDispatchCompute(num_groups_x, num_groups_y, num_groups_z);
+}
+
+static void fexfn_impl_libGL_glDispatchComputeIndirect(GLintptr indirect) {
+  VexaDiagDraw("dispatch_indirect", 0, (GLsizei)indirect);
+  ::glDispatchComputeIndirect(indirect);
+}
+
+static uint64_t g_vexa_diag_barriers = 0;
+static void fexfn_impl_libGL_glMemoryBarrier(GLbitfield barriers) {
+  ++g_vexa_diag_barriers;
+  if ((g_vexa_diag_barriers & 2047) == 0) {
+    fprintf(stderr, "[VEXA][GL] barriers=%llu fbo=%u\n", (unsigned long long)g_vexa_diag_barriers,
+            g_vexa_diag_curfbo);
+  }
+  ::glMemoryBarrier(barriers);
+}
+
+static void fexfn_impl_libGL_glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value) {
+  static int cb_logged = 0;
+  if (cb_logged < 8) {
+    ++cb_logged;
+    fprintf(stderr, "[VEXA][GL] clearbuffer uiv buf=%x idx=%d fbo=%u\n", buffer, drawbuffer, g_vexa_diag_curfbo);
+  }
+  ::glClearBufferuiv(buffer, drawbuffer, value);
+}
+
+static void fexfn_impl_libGL_glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value) {
+  static int cb_logged = 0;
+  if (cb_logged < 8) {
+    ++cb_logged;
+    fprintf(stderr, "[VEXA][GL] clearbuffer fv buf=%x idx=%d v=%.2f,%.2f,%.2f,%.2f fbo=%u\n", buffer, drawbuffer,
+            value ? value[0] : 0.f, value ? value[1] : 0.f, value ? value[2] : 0.f, value ? value[3] : 0.f,
+            g_vexa_diag_curfbo);
+  }
+  ::glClearBufferfv(buffer, drawbuffer, value);
+}
+
+// Sync/query instrumentation: a stuck render thread usually shows up here.
+static uint64_t g_vexa_diag_fences = 0;
+static uint64_t g_vexa_diag_waits = 0;
+static uint64_t g_vexa_diag_queries = 0;
+
+static GLsync fexfn_impl_libGL_glFenceSync(GLenum condition, GLbitfield flags) {
+  GLsync s = ::glFenceSync(condition, flags);
+  ++g_vexa_diag_fences;
+  if ((g_vexa_diag_fences & 63) == 0 || !s) {
+    fprintf(stderr, "[VEXA][GL] fence n=%llu cond=%x -> %p err=%x\n",
+            (unsigned long long)g_vexa_diag_fences, condition, s, glGetError());
+  }
+  return s;
+}
+
+static void fexfn_impl_libGL_glDeleteSync(GLsync sync) { ::glDeleteSync(sync); }
+
+static void fexfn_impl_libGL_glBeginQuery(GLenum target, GLuint id) {
+  ++g_vexa_diag_queries;
+  ::glBeginQuery(target, id);
+}
+
+static void fexfn_impl_libGL_glEndQuery(GLenum target) { ::glEndQuery(target); }
+
+static void fexfn_impl_libGL_glGenQueries(GLsizei n, GLuint* ids) { ::glGenQueries(n, ids); }
+
+static void fexfn_impl_libGL_glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64* params) {
+  ::glGetQueryObjectui64v(id, pname, params);
+}
+
+static void fexfn_impl_libGL_glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint* params) {
+  ::glGetQueryObjectuiv(id, pname, params);
+}
+
+// ----- Bridges for desktop procs missing from the guest-visible surface -----
+// Unity probes a wide proc surface at startup; several reflection/uniform/MSAA
+// entry points were unresolved, which leaves shaders unusable or silently
+// disables paths. Core GLES symbols are called directly; extension-only or
+// GLES3.1+ entry points resolve lazily through eglGetProcAddress with a
+// functional fallback where possible.
+
+static void fexfn_impl_libGL_glGetUniformiv(GLuint program, GLint location, GLint* params) {
+  ::glGetUniformiv(program, location, params);
+}
+
+static void fexfn_impl_libGL_glGetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar* const* uniformNames, GLuint* uniformIndices) {
+  ::glGetUniformIndices(program, uniformCount, uniformNames, uniformIndices);
+}
+
+static void fexfn_impl_libGL_glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint* uniformIndices, GLenum pname, GLint* params) {
+  ::glGetActiveUniformsiv(program, uniformCount, uniformIndices, pname, params);
+}
+
+static void fexfn_impl_libGL_glGetActiveUniformBlockName(GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei* length, GLchar* uniformBlockName) {
+  ::glGetActiveUniformBlockName(program, uniformBlockIndex, bufSize, length, uniformBlockName);
+}
+
+static void fexfn_impl_libGL_glGetQueryiv(GLenum target, GLenum pname, GLint* params) {
+  ::glGetQueryiv(target, pname, params);
+}
+
+static void fexfn_impl_libGL_glValidateProgram(GLuint program) {
+  ::glValidateProgram(program);
+}
+
+static void fexfn_impl_libGL_glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* source) {
+  ::glGetShaderSource(shader, bufSize, length, source);
+}
+
+static void fexfn_impl_libGL_glGetShaderPrecisionFormat(GLenum shaderType, GLenum precisionType, GLint* range, GLint* precision) {
+  ::glGetShaderPrecisionFormat(shaderType, precisionType, range, precision);
+}
+
+static void fexfn_impl_libGL_glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
+  ::glClearBufferfi(buffer, drawbuffer, depth, stencil);
+}
+
+// ---------------------------------------------------------------------------
+// VEXA: software BCn fallback. Desktop builds (Unity standalone) upload
+// S3TC/RGTC/BPTC textures; Mali GLES has none of them, so glTexStorage2D and
+// glCompressedTex*Image* fail with GL_INVALID_ENUM and every texture samples
+// black. Substitute an uncompressed storage format and decode on the host.
+// ---------------------------------------------------------------------------
+#define BCDEC_STATIC
+#define BCDEC_IMPLEMENTATION
+#include "bcdec.h"
+
+namespace {
+enum class VexaBCKind { None, BC1, BC2, BC3, BC4, BC5, BC6H, BC7 };
+
+struct VexaBCInfo {
+  VexaBCKind kind = VexaBCKind::None;
+  GLenum storage = 0;  // substituted sized internal format
+  GLenum format = 0;   // upload format
+  GLenum type = 0;     // upload type
+  int bpp = 0;         // bytes per decoded pixel
+  int block = 0;       // compressed bytes per 4x4 block
+  bool is_signed = false;
+};
+
+VexaBCInfo VexaBCLookup(GLenum f) {
+  VexaBCInfo i;
+  auto rgba = [&](VexaBCKind k, int block, bool srgb) {
+    i.kind = k;
+    i.storage = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+    i.format = GL_RGBA;
+    i.type = GL_UNSIGNED_BYTE;
+    i.bpp = 4;
+    i.block = block;
+  };
+  switch (f) {
+  case 0x83F0: case 0x83F1: rgba(VexaBCKind::BC1, 8, false); break;   // DXT1 RGB/RGBA
+  case 0x8C4C: case 0x8C4D: rgba(VexaBCKind::BC1, 8, true); break;    // SRGB DXT1
+  case 0x83F2: rgba(VexaBCKind::BC2, 16, false); break;               // DXT3
+  case 0x8C4E: rgba(VexaBCKind::BC2, 16, true); break;
+  case 0x83F3: rgba(VexaBCKind::BC3, 16, false); break;               // DXT5
+  case 0x8C4F: rgba(VexaBCKind::BC3, 16, true); break;
+  case 0x8E8C: rgba(VexaBCKind::BC7, 16, false); break;               // BPTC UNORM
+  case 0x8E8D: rgba(VexaBCKind::BC7, 16, true); break;
+  case 0x8DBB: case 0x8DBC:                                           // RGTC1 (BC4)
+    i.kind = VexaBCKind::BC4; i.storage = GL_R8; i.format = GL_RED; i.type = GL_UNSIGNED_BYTE;
+    i.bpp = 1; i.block = 8; i.is_signed = (f == 0x8DBC);
+    break;
+  case 0x8DBD: case 0x8DBE:                                           // RGTC2 (BC5)
+    i.kind = VexaBCKind::BC5; i.storage = GL_RG8; i.format = GL_RG; i.type = GL_UNSIGNED_BYTE;
+    i.bpp = 2; i.block = 16; i.is_signed = (f == 0x8DBE);
+    break;
+  case 0x8E8E: case 0x8E8F:                                           // BPTC float (BC6H)
+    i.kind = VexaBCKind::BC6H; i.storage = GL_RGB16F; i.format = GL_RGB; i.type = GL_HALF_FLOAT;
+    i.bpp = 6; i.block = 16; i.is_signed = (f == 0x8E8E);
+    break;
+  default: break;
+  }
+  return i;
+}
+
+// Decode a w x h region of BC blocks into tightly packed pixels.
+bool VexaBCDecode(const VexaBCInfo& bc, const uint8_t* src, size_t src_size, GLsizei w, GLsizei h,
+                  std::vector<uint8_t>& out) {
+  if (!src || w <= 0 || h <= 0) {
+    return false;
+  }
+  const int bw = (w + 3) / 4;
+  const int bh = (h + 3) / 4;
+  if (src_size < static_cast<size_t>(bw) * bh * bc.block) {
+    return false;
+  }
+  out.assign(static_cast<size_t>(w) * h * bc.bpp, 0);
+  uint8_t tmp[4 * 4 * 6];
+  const int tpitch = 4 * bc.bpp;
+  for (int by = 0; by < bh; ++by) {
+    for (int bx = 0; bx < bw; ++bx) {
+      const uint8_t* blk = src + (static_cast<size_t>(by) * bw + bx) * bc.block;
+      switch (bc.kind) {
+      case VexaBCKind::BC1: bcdec_bc1(blk, tmp, tpitch); break;
+      case VexaBCKind::BC2: bcdec_bc2(blk, tmp, tpitch); break;
+      case VexaBCKind::BC3: bcdec_bc3(blk, tmp, tpitch); break;
+      case VexaBCKind::BC4: bcdec_bc4(blk, tmp, tpitch); break;
+      case VexaBCKind::BC5: bcdec_bc5(blk, tmp, tpitch); break;
+      case VexaBCKind::BC6H: bcdec_bc6h_half(blk, tmp, 4 * 3, bc.is_signed ? 1 : 0); break;
+      case VexaBCKind::BC7: bcdec_bc7(blk, tmp, tpitch); break;
+      default: return false;
+      }
+      for (int y = 0; y < 4; ++y) {
+        const int py = by * 4 + y;
+        if (py >= h) {
+          break;
+        }
+        const int cols = (bx * 4 + 4 <= w) ? 4 : (w - bx * 4);
+        std::memcpy(out.data() + (static_cast<size_t>(py) * w + bx * 4) * bc.bpp, tmp + y * tpitch,
+                    static_cast<size_t>(cols) * bc.bpp);
+      }
+    }
+  }
+  return true;
+}
+
+// Resolves the compressed source, honouring a bound GL_PIXEL_UNPACK_BUFFER.
+struct VexaBCSource {
+  const uint8_t* ptr = nullptr;
+  GLint pbo = 0;
+  bool mapped = false;
+
+  VexaBCSource(const void* data, GLsizei size) {
+    ::glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
+    if (pbo == 0) {
+      ptr = static_cast<const uint8_t*>(data);
+      return;
+    }
+    const auto offset = reinterpret_cast<GLintptr>(data);
+    ptr = static_cast<const uint8_t*>(::glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, offset, size, GL_MAP_READ_BIT));
+    mapped = ptr != nullptr;
+  }
+  ~VexaBCSource() {
+    if (mapped) {
+      ::glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    }
+  }
+};
+
+// Tight unpack state for the decoded upload; restores the guest's state after.
+struct VexaUnpackScope {
+  GLint align = 4, row = 0, skip_px = 0, skip_rows = 0, img_h = 0, skip_img = 0, pbo = 0;
+  VexaUnpackScope() {
+    ::glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+    ::glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row);
+    ::glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_px);
+    ::glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    ::glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &img_h);
+    ::glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_img);
+    ::glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
+    ::glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    ::glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    ::glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    ::glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    ::glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+    ::glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
+    if (pbo) {
+      ::glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
+  }
+  ~VexaUnpackScope() {
+    ::glPixelStorei(GL_UNPACK_ALIGNMENT, align);
+    ::glPixelStorei(GL_UNPACK_ROW_LENGTH, row);
+    ::glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_px);
+    ::glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+    ::glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, img_h);
+    ::glPixelStorei(GL_UNPACK_SKIP_IMAGES, skip_img);
+    if (pbo) {
+      ::glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    }
+  }
+};
+
+void VexaBCLogOnce(const char* where, GLenum fmt) {
+  static std::atomic<int> logged {0};
+  if (logged.fetch_add(1) < 16) {
+    fprintf(stderr, "[VEXA][BCN] %s fmt=0x%x -> software decode\n", where, fmt);
+  }
+}
+} // namespace
+
+static void VexaGL_glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
+  const VexaBCInfo bc = VexaBCLookup(internalformat);
+  if (bc.kind != VexaBCKind::None) {
+    VexaBCLogOnce("glTexStorage2D", internalformat);
+    internalformat = bc.storage;
+  }
+  ::glTexStorage2D(target, levels, internalformat, width, height);
+}
+
+static void VexaGL_glTexStorage3D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height,
+                                  GLsizei depth) {
+  const VexaBCInfo bc = VexaBCLookup(internalformat);
+  if (bc.kind != VexaBCKind::None) {
+    VexaBCLogOnce("glTexStorage3D", internalformat);
+    internalformat = bc.storage;
+  }
+  ::glTexStorage3D(target, levels, internalformat, width, height, depth);
+}
+
+static void VexaGL_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width,
+                                          GLsizei height, GLint border, GLsizei imageSize, const void* data) {
+  const VexaBCInfo bc = VexaBCLookup(internalformat);
+  if (bc.kind == VexaBCKind::None) {
+    ::glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+    return;
+  }
+  VexaBCLogOnce("glCompressedTexImage2D", internalformat);
+  std::vector<uint8_t> px;
+  bool ok = false;
+  {
+    VexaBCSource src(data, imageSize);
+    ok = VexaBCDecode(bc, src.ptr, static_cast<size_t>(imageSize), width, height, px);
+  }
+  VexaUnpackScope unpack;
+  ::glTexImage2D(target, level, bc.storage, width, height, 0, bc.format, bc.type, ok ? px.data() : nullptr);
+}
+
+static void VexaGL_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
+                                             GLsizei height, GLenum format, GLsizei imageSize, const void* data) {
+  const VexaBCInfo bc = VexaBCLookup(format);
+  if (bc.kind == VexaBCKind::None) {
+    ::glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
+    return;
+  }
+  VexaBCLogOnce("glCompressedTexSubImage2D", format);
+  std::vector<uint8_t> px;
+  bool ok = false;
+  {
+    VexaBCSource src(data, imageSize);
+    ok = VexaBCDecode(bc, src.ptr, static_cast<size_t>(imageSize), width, height, px);
+  }
+  if (!ok) {
+    return;
+  }
+  VexaUnpackScope unpack;
+  ::glTexSubImage2D(target, level, xoffset, yoffset, width, height, bc.format, bc.type, px.data());
+}
+
+static void VexaGL_glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width,
+                                          GLsizei height, GLsizei depth, GLint border, GLsizei imageSize,
+                                          const void* data) {
+  const VexaBCInfo bc = VexaBCLookup(internalformat);
+  if (bc.kind == VexaBCKind::None) {
+    ::glCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
+    return;
+  }
+  VexaBCLogOnce("glCompressedTexImage3D", internalformat);
+  std::vector<uint8_t> all;
+  bool ok = depth > 0;
+  {
+    VexaBCSource src(data, imageSize);
+    const size_t slice = static_cast<size_t>((width + 3) / 4) * ((height + 3) / 4) * bc.block;
+    std::vector<uint8_t> px;
+    for (GLsizei z = 0; ok && z < depth; ++z) {
+      ok = src.ptr && slice * (z + 1) <= static_cast<size_t>(imageSize) &&
+           VexaBCDecode(bc, src.ptr + slice * z, slice, width, height, px);
+      if (ok) {
+        all.insert(all.end(), px.begin(), px.end());
+      }
+    }
+  }
+  VexaUnpackScope unpack;
+  ::glTexImage3D(target, level, bc.storage, width, height, depth, 0, bc.format, bc.type, ok ? all.data() : nullptr);
+}
+
+static void VexaGL_glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
+                                             GLsizei width, GLsizei height, GLsizei depth, GLenum format,
+                                             GLsizei imageSize, const void* data) {
+  const VexaBCInfo bc = VexaBCLookup(format);
+  if (bc.kind == VexaBCKind::None) {
+    ::glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+    return;
+  }
+  VexaBCLogOnce("glCompressedTexSubImage3D", format);
+  std::vector<uint8_t> all;
+  bool ok = depth > 0;
+  {
+    VexaBCSource src(data, imageSize);
+    const size_t slice = static_cast<size_t>((width + 3) / 4) * ((height + 3) / 4) * bc.block;
+    std::vector<uint8_t> px;
+    for (GLsizei z = 0; ok && z < depth; ++z) {
+      ok = src.ptr && slice * (z + 1) <= static_cast<size_t>(imageSize) &&
+           VexaBCDecode(bc, src.ptr + slice * z, slice, width, height, px);
+      if (ok) {
+        all.insert(all.end(), px.begin(), px.end());
+      }
+    }
+  }
+  if (!ok) {
+    return;
+  }
+  VexaUnpackScope unpack;
+  ::glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, bc.format, bc.type, all.data());
+}
+
+static void fexfn_impl_libGL_glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void* data) {
+  VexaGL_glCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
+}
+
+static void fexfn_impl_libGL_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void* data) {
+  VexaGL_glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
+}
+
+static void fexfn_impl_libGL_glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void* data) {
+  VexaGL_glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+}
+
+using VexaProgramBinaryFn = void (*)(GLuint, GLenum, const void*, GLsizei);
+static void fexfn_impl_libGL_glProgramBinary(GLuint program, GLenum binaryFormat, const void* binary, GLsizei length) {
+  static auto fn = reinterpret_cast<VexaProgramBinaryFn>(eglGetProcAddress("glProgramBinary"));
+  static auto fn_oes = reinterpret_cast<VexaProgramBinaryFn>(eglGetProcAddress("glProgramBinaryOES"));
+  if (fn) fn(program, binaryFormat, binary, length);
+  else if (fn_oes) fn_oes(program, binaryFormat, binary, length);
+}
+
+using VexaGetProgramBinaryFn = void (*)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
+static void fexfn_impl_libGL_glGetProgramBinary(GLuint program, GLsizei bufSize, GLsizei* length, GLenum* binaryFormat, void* binary) {
+  static auto fn = reinterpret_cast<VexaGetProgramBinaryFn>(eglGetProcAddress("glGetProgramBinary"));
+  static auto fn_oes = reinterpret_cast<VexaGetProgramBinaryFn>(eglGetProcAddress("glGetProgramBinaryOES"));
+  if (fn) { fn(program, bufSize, length, binaryFormat, binary); return; }
+  if (fn_oes) { fn_oes(program, bufSize, length, binaryFormat, binary); return; }
+  if (length) *length = 0;
+  if (binaryFormat) *binaryFormat = 0;
+}
+
+#define VEXA_IMPL_PROG_UNIFORM_V(uname, T) \
+static void fexfn_impl_libGL_glProgramUniform##uname(GLuint program, GLint location, GLsizei count, const T* value) { \
+  using Fn = void (*)(GLuint, GLint, GLsizei, const T*); \
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glProgramUniform" #uname)); \
+  if (fn) fn(program, location, count, value); \
+}
+VEXA_IMPL_PROG_UNIFORM_V(1iv, GLint)
+VEXA_IMPL_PROG_UNIFORM_V(1fv, GLfloat)
+VEXA_IMPL_PROG_UNIFORM_V(1uiv, GLuint)
+VEXA_IMPL_PROG_UNIFORM_V(2iv, GLint)
+VEXA_IMPL_PROG_UNIFORM_V(2fv, GLfloat)
+VEXA_IMPL_PROG_UNIFORM_V(2uiv, GLuint)
+VEXA_IMPL_PROG_UNIFORM_V(3iv, GLint)
+VEXA_IMPL_PROG_UNIFORM_V(3fv, GLfloat)
+VEXA_IMPL_PROG_UNIFORM_V(3uiv, GLuint)
+VEXA_IMPL_PROG_UNIFORM_V(4iv, GLint)
+VEXA_IMPL_PROG_UNIFORM_V(4fv, GLfloat)
+VEXA_IMPL_PROG_UNIFORM_V(4uiv, GLuint)
+#undef VEXA_IMPL_PROG_UNIFORM_V
+
+#define VEXA_IMPL_PROG_UNIFORM_M(uname) \
+static void fexfn_impl_libGL_glProgramUniform##uname(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { \
+  using Fn = void (*)(GLuint, GLint, GLsizei, GLboolean, const GLfloat*); \
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glProgramUniform" #uname)); \
+  if (fn) fn(program, location, count, transpose, value); \
+}
+VEXA_IMPL_PROG_UNIFORM_M(Matrix2fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix3fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix4fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix2x3fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix3x2fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix2x4fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix4x2fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix3x4fv)
+VEXA_IMPL_PROG_UNIFORM_M(Matrix4x3fv)
+#undef VEXA_IMPL_PROG_UNIFORM_M
+
+// Desktop glTexImage2DMultisample maps 1:1 onto GLES glTexStorage2DMultisample.
+using VexaTexStorage2DMSFn = void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
+static void fexfn_impl_libGL_glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
+  static auto fn = reinterpret_cast<VexaTexStorage2DMSFn>(eglGetProcAddress("glTexStorage2DMultisample"));
+  if (fn) fn(target, samples, internalformat, width, height, fixedsamplelocations);
+}
+
+using VexaTexStorage3DMSFn = void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei, GLboolean);
+static void fexfn_impl_libGL_glTexStorage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) {
+  static auto fn = reinterpret_cast<VexaTexStorage3DMSFn>(eglGetProcAddress("glTexStorage3DMultisample"));
+  if (fn) fn(target, samples, internalformat, width, height, depth, fixedsamplelocations);
+}
+
+// GLES lacks DSA texture getters: emulate by (re)binding the texture to its
+// most likely target (2D) and reading back through glGetTexParameteriv.
+static void VexaGetTexParamEmulated(GLuint texture, GLint level, GLenum pname, GLint* params) {
+  GLint prev = 0;
+  ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+  if (prev != (GLint)texture) {
+    ::glBindTexture(GL_TEXTURE_2D, texture);
+  }
+  if (level >= 0) {
+    ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, pname, params);
+  } else {
+    ::glGetTexParameteriv(GL_TEXTURE_2D, pname, params);
+  }
+  if (prev != (GLint)texture) {
+    ::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev));
+  }
+}
+
+static void fexfn_impl_libGL_glGetTextureParameteriv(GLuint texture, GLenum pname, GLint* params) {
+  using Fn = void (*)(GLuint, GLenum, GLint*);
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glGetTextureParameteriv"));
+  if (fn) { fn(texture, pname, params); return; }
+  VexaGetTexParamEmulated(texture, -1, pname, params);
+}
+
+static void fexfn_impl_libGL_glGetTextureLevelParameteriv(GLuint texture, GLint level, GLenum pname, GLint* params) {
+  using Fn = void (*)(GLuint, GLint, GLenum, GLint*);
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glGetTextureLevelParameteriv"));
+  if (fn) { fn(texture, level, pname, params); return; }
+  VexaGetTexParamEmulated(texture, level, pname, params);
+}
+
+using VexaMapBufferRangeFn = void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+static void* fexfn_impl_libGL_glMapBufferOES(GLenum target, GLenum access) {
+  static auto fn = reinterpret_cast<VexaMapBufferRangeFn>(eglGetProcAddress("glMapBufferRange"));
+  if (!fn) {
+    return nullptr;
+  }
+  GLint size = 0;
+  ::glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+  if (size <= 0) {
+    return nullptr;
+  }
+  GLbitfield bits = 0;
+  switch (access) {
+    case 0x88B8 /* GL_READ_ONLY */:  bits = GL_MAP_READ_BIT; break;
+    case 0x88B9 /* GL_WRITE_ONLY */: bits = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT; break;
+    default:                        bits = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT; break;
+  }
+  return fn(target, 0, size, bits);
+}
+
+using VexaBlendBarrierFn = void (*)(void);
+static void fexfn_impl_libGL_glBlendBarrierKHR(void) {
+  static auto fn = reinterpret_cast<VexaBlendBarrierFn>(eglGetProcAddress("glBlendBarrierKHR"));
+  if (fn) fn();
+}
+
+using VexaBlendEqSepIFn = void (*)(GLuint, GLenum, GLenum);
+static void fexfn_impl_libGL_glBlendEquationSeparatei(GLuint buf, GLenum modeRGB, GLenum modeAlpha) {
+  static auto fn = reinterpret_cast<VexaBlendEqSepIFn>(eglGetProcAddress("glBlendEquationSeparatei"));
+  static auto fn_oes = reinterpret_cast<VexaBlendEqSepIFn>(eglGetProcAddress("glBlendEquationSeparateiOES"));
+  if (fn) { fn(buf, modeRGB, modeAlpha); return; }
+  if (fn_oes) { fn_oes(buf, modeRGB, modeAlpha); return; }
+  ::glBlendEquationSeparate(modeRGB, modeAlpha);
+}
+
+// KHR_debug callbacks cannot cross the host boundary (guest function pointer);
+// accepting and dropping them keeps the proc resolvable without crashing.
+static void fexfn_impl_libGL_glDebugMessageCallback(guest_layout<GLDEBUGPROC> callback, const void* userParam) {
+  (void)callback;
+  (void)userParam;
+}
+
+static void fexfn_impl_libGL_glDebugMessageControl(GLenum source, GLenum type, GLenum severity, GLsizei count, const GLuint* ids, GLboolean enabled) {
+  using Fn = void (*)(GLenum, GLenum, GLenum, GLsizei, const GLuint*, GLboolean);
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glDebugMessageControl"));
+  if (fn) fn(source, type, severity, count, ids, enabled);
+}
+
+static void fexfn_impl_libGL_glDebugMessageInsert(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* buf) {
+  using Fn = void (*)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar*);
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glDebugMessageInsert"));
+  if (fn) fn(source, type, id, severity, length, buf);
+}
+
+static void fexfn_impl_libGL_glGetObjectLabel(GLenum identifier, GLuint name, GLsizei bufSize, GLsizei* length, GLchar* label) {
+  using Fn = void (*)(GLenum, GLuint, GLsizei, GLsizei*, GLchar*);
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glGetObjectLabel"));
+  if (fn) { fn(identifier, name, bufSize, length, label); return; }
+  if (length) *length = 0;
+  if (label && bufSize > 0) label[0] = 0;
+}
+
+static void fexfn_impl_libGL_glGetObjectLabelEXT(GLenum type, GLuint object, GLsizei bufSize, GLsizei* length, GLchar* label) {
+  using Fn = void (*)(GLenum, GLuint, GLsizei, GLsizei*, GLchar*);
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glGetObjectLabelEXT"));
+  if (fn) { fn(type, object, bufSize, length, label); return; }
+  if (length) *length = 0;
+  if (label && bufSize > 0) label[0] = 0;
+}
+
+static void fexfn_impl_libGL_glLabelObjectEXT(GLenum type, GLuint object, GLsizei length, const GLchar* label) {
+  using Fn = void (*)(GLenum, GLuint, GLsizei, const GLchar*);
+  static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glLabelObjectEXT"));
+  if (fn) fn(type, object, length, label);
+}
+
+using VexaFBTexture2DMSFn = void (*)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei);
+static void fexfn_impl_libGL_glFramebufferTexture2DMultisampleEXT(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLsizei samples) {
+  static auto fn = reinterpret_cast<VexaFBTexture2DMSFn>(eglGetProcAddress("glFramebufferTexture2DMultisampleEXT"));
+  if (fn) { fn(target, attachment, textarget, texture, level, samples); return; }
+  ::glFramebufferTexture2D(target, attachment, textarget, texture, level);
+}
+
+using VexaEGLImageTargetFn = void (*)(GLenum, void*);
+static void fexfn_impl_libGL_glEGLImageTargetTexture2DOES(GLenum target, void* image) {
+  static auto fn = reinterpret_cast<VexaEGLImageTargetFn>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+  if (fn) fn(target, image);
+}
+
+// APPLE multisample resolve: on EXT_multisampled_render_to_texture the resolve
+// happens implicitly at framebuffer write-back, so a no-op is correct there.
+static void fexfn_impl_libGL_glResolveMultisampleFramebufferAPPLE(void) {}
+
+// ----- Extended draw entry points (desktop names -> GLES equivalents) -----
+static void fexfn_impl_libGL_glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices) {
+  (void)start; (void)end;
+  VexaDiagDraw("range_elements", mode, count);
+  ::glDrawElements(mode, count, type, indices);
+}
+
+static void fexfn_impl_libGL_glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices, GLint basevertex) {
+  (void)start; (void)end;
+  VexaDiagDraw("range_elements_bv", mode, count);
+  ::glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+}
+
+using VexaDrawArraysInstBIFn = void (*)(GLenum, GLint, GLsizei, GLsizei, GLuint);
+static void fexfn_impl_libGL_glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei primcount, GLuint baseinstance) {
+  VexaDiagDraw("arrays_inst_bi", mode, count * primcount);
+  static auto fn = reinterpret_cast<VexaDrawArraysInstBIFn>(eglGetProcAddress("glDrawArraysInstancedBaseInstanceEXT"));
+  if (fn) { fn(mode, first, count, primcount, baseinstance); return; }
+  ::glDrawArraysInstanced(mode, first, count, primcount);
+}
+
+using VexaDrawElemsInstBIFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLuint);
+static void fexfn_impl_libGL_glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount, GLuint baseinstance) {
+  VexaDiagDraw("elements_inst_bi", mode, count * primcount);
+  static auto fn = reinterpret_cast<VexaDrawElemsInstBIFn>(eglGetProcAddress("glDrawElementsInstancedBaseInstanceEXT"));
+  if (fn) { fn(mode, count, type, indices, primcount, baseinstance); return; }
+  ::glDrawElementsInstanced(mode, count, type, indices, primcount);
+}
+
+using VexaDrawElemsInstBVBiIFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint, GLuint);
+static void fexfn_impl_libGL_glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount, GLint basevertex, GLuint baseinstance) {
+  VexaDiagDraw("elements_inst_bv_bi", mode, count * primcount);
+  static auto fn = reinterpret_cast<VexaDrawElemsInstBVBiIFn>(eglGetProcAddress("glDrawElementsInstancedBaseVertexBaseInstanceEXT"));
+  if (fn) { fn(mode, count, type, indices, primcount, basevertex, baseinstance); return; }
+  ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, primcount, basevertex);
+}
+
+using VexaMultiDrawArraysFn = void (*)(GLenum, const GLint*, const GLsizei*, GLsizei);
+static void fexfn_impl_libGL_glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
+  GLsizei total = 0;
+  for (GLsizei i = 0; i < drawcount; ++i) total += count[i];
+  VexaDiagDraw("multi_arrays", mode, total);
+  static auto fn = reinterpret_cast<VexaMultiDrawArraysFn>(eglGetProcAddress("glMultiDrawArraysEXT"));
+  if (fn) { fn(mode, first, count, drawcount); return; }
+  for (GLsizei i = 0; i < drawcount; ++i) {
+    if (count[i] > 0) ::glDrawArrays(mode, first[i], count[i]);
+  }
+}
+
+using VexaDrawTFFn = void (*)(GLenum, GLuint);
+static void fexfn_impl_libGL_glDrawTransformFeedback(GLenum mode, GLuint id) {
+  VexaDiagDraw("tf", mode, 0);
+  static auto fn = reinterpret_cast<VexaDrawTFFn>(eglGetProcAddress("glDrawTransformFeedback"));
+  if (fn) fn(mode, id);
+}
+
+using VexaDrawTFInstFn = void (*)(GLenum, GLuint, GLsizei);
+static void fexfn_impl_libGL_glDrawTransformFeedbackInstanced(GLenum mode, GLuint id, GLsizei primcount) {
+  VexaDiagDraw("tf_inst", mode, 0);
+  static auto fn = reinterpret_cast<VexaDrawTFInstFn>(eglGetProcAddress("glDrawTransformFeedbackInstanced"));
+  if (fn) fn(mode, id, primcount);
+}
+
+using VexaDrawTFStreamFn = void (*)(GLenum, GLuint, GLuint);
+static void fexfn_impl_libGL_glDrawTransformFeedbackStream(GLenum mode, GLuint id, GLuint stream) {
+  VexaDiagDraw("tf_stream", mode, 0);
+  static auto fn = reinterpret_cast<VexaDrawTFStreamFn>(eglGetProcAddress("glDrawTransformFeedbackStream"));
+  if (fn) fn(mode, id, stream);
+}
+
+using VexaDrawTFStreamInstFn = void (*)(GLenum, GLuint, GLuint, GLsizei);
+static void fexfn_impl_libGL_glDrawTransformFeedbackStreamInstanced(GLenum mode, GLuint id, GLuint stream, GLsizei primcount) {
+  VexaDiagDraw("tf_stream_inst", mode, 0);
+  static auto fn = reinterpret_cast<VexaDrawTFStreamInstFn>(eglGetProcAddress("glDrawTransformFeedbackStreamInstanced"));
+  if (fn) fn(mode, id, stream, primcount);
 }
 
 struct VexaFFMesh {
@@ -1992,6 +3164,38 @@ void LogFailedProgramLink(GLuint program) {
 }
 #endif
 
+#if defined(BUILD_ANDROID) && !defined(VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR)
+// Desktop #extension GL_ARB_* : require fails on ESSL. Those features are core in 300/320 es.
+static void VexaStripDesktopArbExtensions(std::string* source) {
+  std::string out;
+  out.reserve(source->size());
+  size_t cursor = 0;
+  while (cursor < source->size()) {
+    size_t end = source->find('\n', cursor);
+    if (end == std::string::npos) {
+      end = source->size();
+    }
+    const std::string_view line(source->data() + cursor, end - cursor);
+    size_t begin = 0;
+    while (begin < line.size() && (line[begin] == ' ' || line[begin] == '\t')) {
+      ++begin;
+    }
+    if (line.substr(begin).starts_with("#extension") && line.find("GL_ARB_") != std::string_view::npos) {
+      out.append("// vexa stripped ");
+      out.append(line);
+    } else {
+      out.append(line);
+    }
+    if (end >= source->size()) {
+      break;
+    }
+    out.push_back('\n');
+    cursor = end + 1;
+  }
+  *source = std::move(out);
+}
+#endif
+
 // VEXA_FIXES: Central shader-source bridge used by both glShaderSource and glShaderSourceARB.
 static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length) {
   GLHOST_TRACE_SCOPE();
@@ -2087,8 +3291,8 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
     }
   }
 #elif defined(BUILD_ANDROID)
-  // Mali accepts ESSL up to 320 es. Godot's Linux GLES3 export emits desktop
-  // #version 330, which the driver rejects before it parses layout().
+  // Mali accepts ESSL up to 320 es. Godot emits desktop #version 330.
+  // Unity, once it sees GL 4.3, emits #version 430/450 including compute.
   if (host_strings && count > 0) {
     std::string source;
     for (GLsizei i = 0; i < count; ++i) {
@@ -2106,23 +3310,41 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
       const auto line_end = source.find('\n', version_pos);
       const auto line_len = line_end == std::string::npos ? source.size() - version_pos : line_end - version_pos;
       const auto line = source.substr(version_pos, line_len);
-      if (line.find(" es") == std::string::npos && line.find("330") != std::string::npos) {
-        source.replace(version_pos, line_len, "#version 300 es");
-        GLint shader_type = 0;
-        ::glGetShaderiv(shader, GL_SHADER_TYPE, &shader_type);
-        if (shader_type == GL_FRAGMENT_SHADER && source.find("precision ") == std::string::npos) {
-          const auto insert_at = source.find('\n', source.find("#version"));
-          if (insert_at != std::string::npos) {
-            source.insert(insert_at + 1, "precision highp float;\nprecision highp int;\n");
+      int desktop_version = 0;
+      if (const auto digits = line.find_first_of("0123456789"); digits != std::string::npos) {
+        for (size_t i = digits; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
+          desktop_version = desktop_version * 10 + (line[i] - '0');
+        }
+      }
+      GLint shader_type = 0;
+      ::glGetShaderiv(shader, GL_SHADER_TYPE, &shader_type);
+      const bool desktop = line.find(" es") == std::string::npos;
+      const bool compute = shader_type == GL_COMPUTE_SHADER;
+      const char* rewritten_version = nullptr;
+      if (desktop && (compute || desktop_version >= 400)) {
+        rewritten_version = "#version 320 es";
+      } else if (desktop && line.find("330") != std::string::npos) {
+        rewritten_version = "#version 300 es";
+      }
+      if (rewritten_version) {
+        source.replace(version_pos, line_len, rewritten_version);
+        if (desktop_version >= 400 || compute) {
+          VexaStripDesktopArbExtensions(&source);
+        }
+        {
+          const bool to_es_320 = std::string_view{rewritten_version} == "#version 320 es";
+          const size_t insert_at = VexaShaderPrecisionInsertPos(source);
+          source.insert(insert_at, kVexaShaderPrecisionEs300);
+          if (to_es_320) {
+            source.insert(insert_at + kVexaShaderPrecisionEs300.size(), kVexaShaderPrecisionEs320Extra);
           }
         }
-        fprintf(stderr, "[libGL-host] shader version 330 -> 300 es type=0x%x len=%zu binding=%d fragcolor=%d arb_lod=%d sampler_array=%d\n",
-                shader_type,
+        fprintf(stderr, "[libGL-host] shader version %d -> %s type=0x%x len=%zu binding=%d\n",
+                desktop_version,
+                rewritten_version,
+                static_cast<unsigned>(shader_type),
                 source.size(),
-                source.find("layout(binding") != std::string::npos ? 1 : 0,
-                source.find("gl_FragColor") != std::string::npos ? 1 : 0,
-                source.find("GL_ARB_shader_texture_lod") != std::string::npos ? 1 : 0,
-                source.find("sampler2DArray") != std::string::npos ? 1 : 0);
+                source.find("layout(binding") != std::string::npos ? 1 : 0);
         const GLchar* rewritten = source.c_str();
         ::glShaderSource(shader, 1, &rewritten, nullptr);
         return;
@@ -2157,6 +3379,24 @@ GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVis
 
 #endif
 
+#ifdef BUILD_ANDROID
+// Unity enables DrawMeshInstancedIndirect only when the desktop level has compute
+// (4.3) and draw-indirect. 4.5 would also turn on core direct-state-access; the
+// guest proc lookup returns a non-null stub for missing names, so Unity would
+// call texture-view and DSA entry points this driver path does not implement.
+// 4.3 still satisfies Godot 3's desktop >= 3.3 check.
+static const char* const kVexaDesktopSpoofExts[] = {
+  "GL_ARB_framebuffer_object",
+  "GL_EXT_framebuffer_object",
+  "GL_ARB_draw_indirect",
+  "GL_ARB_compute_shader",
+  "GL_ARB_shader_storage_buffer_object",
+  "GL_ARB_shader_image_load_store",
+};
+static constexpr unsigned kVexaDesktopSpoofExtCount =
+  sizeof(kVexaDesktopSpoofExts) / sizeof(kVexaDesktopSpoofExts[0]);
+#endif
+
 const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
   GLHOST_TRACE_SCOPE();
 #ifdef BUILD_ANDROID
@@ -2165,14 +3405,14 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
   // OpenGL 3.3. Mali reports "OpenGL ES 3.2", so both the GLES3 and GLES2
   // viability checks fail before a frame is drawn.
   if (name == GL_VERSION) {
-    static const GLubyte kDesktopVersion[] = "3.3.0";
+    static const GLubyte kDesktopVersion[] = "4.3.0";
     fprintf(stderr,
                  "[libGL-host] glGetString(GL_VERSION) desktop spoof => '%s'\n",
                  reinterpret_cast<const char*>(kDesktopVersion));
     return kDesktopVersion;
   }
   if (name == GL_SHADING_LANGUAGE_VERSION) {
-    static const GLubyte kDesktopShading[] = "3.30";
+    static const GLubyte kDesktopShading[] = "4.30";
     fprintf(stderr,
                  "[libGL-host] glGetString(GL_SHADING_LANGUAGE_VERSION) desktop spoof => '%s'\n",
                  reinterpret_cast<const char*>(kDesktopShading));
@@ -2205,10 +3445,8 @@ const GLubyte* fexfn_impl_libGL_glGetStringi(GLenum name, GLuint index) {
   GLHostLogCurrentEGLState("glGetStringi");
   // GLES2-over-GL refuses to start unless GLAD sees a desktop FBO extension.
   // Framebuffer objects are core on this GLES 3.2 driver; only the name differs.
-  static const char* kDesktopFboExts[] = {
-    "GL_ARB_framebuffer_object",
-    "GL_EXT_framebuffer_object",
-  };
+  // The extra ARB names are the ones Unity checks before it allows compute,
+  // shader storage buffers, images, and indirect draws.
   if (name == GL_EXTENSIONS) {
     GLint real_count = 0;
     ::glGetIntegerv(GL_NUM_EXTENSIONS, &real_count);
@@ -2216,8 +3454,8 @@ const GLubyte* fexfn_impl_libGL_glGetStringi(GLenum name, GLuint index) {
       real_count = 0;
     }
     const auto real = static_cast<GLuint>(real_count);
-    if (index >= real && index < real + 2) {
-      const char* ext = kDesktopFboExts[index - real];
+    if (index >= real && index < real + kVexaDesktopSpoofExtCount) {
+      const char* ext = kVexaDesktopSpoofExts[index - real];
       fprintf(stderr,
                    "[libGL-host] glGetStringi(GL_EXTENSIONS index=%u) desktop spoof => '%s'\n",
                    static_cast<unsigned>(index),
@@ -2560,6 +3798,48 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
                  proc_name, reinterpret_cast<void*>(result));
     return result;
   }
+  // VEXA diag: engines that load every entry point through glXGetProcAddress
+  // (Unity) would otherwise get raw driver pointers and bypass the counters.
+  {
+    struct DiagWrap {
+      const char* name;
+      VoidFn fn;
+    };
+    static const DiagWrap kDiagWraps[] = {
+        {"glDrawArrays", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawArrays)},
+        {"glDrawElements", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawElements)},
+        {"glDrawArraysInstanced", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawArraysInstanced)},
+        {"glDrawElementsInstanced", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawElementsInstanced)},
+        {"glDrawElementsBaseVertex", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawElementsBaseVertex)},
+        {"glDrawElementsInstancedBaseVertex",
+         reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawElementsInstancedBaseVertex)},
+        {"glDrawElementsIndirect", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawElementsIndirect)},
+        {"glDrawArraysIndirect", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawArraysIndirect)},
+        {"glDispatchCompute", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDispatchCompute)},
+        {"glUseProgram", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glUseProgram)},
+        {"glBindFramebuffer", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glBindFramebuffer)},
+        {"glClear", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glClear)},
+        {"glClearColor", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glClearColor)},
+        // Software BCn fallback (Mali has no S3TC/RGTC/BPTC).
+        {"glTexStorage2D", reinterpret_cast<VoidFn>(VexaGL_glTexStorage2D)},
+        {"glTexStorage3D", reinterpret_cast<VoidFn>(VexaGL_glTexStorage3D)},
+        {"glCompressedTexImage2D", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexImage2D)},
+        {"glCompressedTexImage2DARB", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexImage2D)},
+        {"glCompressedTexSubImage2D", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexSubImage2D)},
+        {"glCompressedTexSubImage2DARB", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexSubImage2D)},
+        {"glCompressedTexImage3D", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexImage3D)},
+        {"glCompressedTexImage3DARB", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexImage3D)},
+        {"glCompressedTexSubImage3D", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexSubImage3D)},
+        {"glCompressedTexSubImage3DARB", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexSubImage3D)},
+    };
+    for (const auto& w : kDiagWraps) {
+      if (name_sv == w.name) {
+        fprintf(stderr, "[libGL-host] glXGetProcAddress('%s') => %p via diag-wrapper\n", proc_name,
+                reinterpret_cast<void*>(w.fn));
+        return w.fn;
+      }
+    }
+  }
   auto* android_name = proc_name;
   if (auto egl_proc = reinterpret_cast<VoidFn>(eglGetProcAddress(android_name)); egl_proc) {
     fprintf(stderr, "[libGL-host] glXGetProcAddress('%s') => %p via eglGetProcAddress\n",
@@ -2868,7 +4148,14 @@ void glDisableClientState(GLenum /*array*/) {
 GLenum fexfn_impl_libGL_glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
   GLHOST_TRACE_SCOPE();
   ScopedGLCallTimer timer {"glClientWaitSync"};
-  return ::glClientWaitSync(sync, flags, timeout);
+  GLenum r = ::glClientWaitSync(sync, flags, timeout);
+  ++g_vexa_diag_waits;
+  if ((g_vexa_diag_waits & 31) == 0 || r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
+    fprintf(stderr, "[VEXA][GL] clientwait n=%llu sync=%p flags=%x tmo=%llu -> %x tid=%ld\n",
+            (unsigned long long)g_vexa_diag_waits, sync, flags, (unsigned long long)timeout, r,
+            (long)syscall(SYS_gettid));
+  }
+  return r;
 }
 
 void fexfn_impl_libGL_glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
@@ -2886,6 +4173,12 @@ void fexfn_impl_libGL_glGetSynciv(GLsync sync, GLenum pname, GLsizei bufSize, GL
 void fexfn_impl_libGL_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels) {
   GLHOST_TRACE_SCOPE();
   ScopedGLCallTimer timer {"glReadPixels"};
+  static int rp_logged = 0;
+  if (rp_logged < 8) {
+    ++rp_logged;
+    fprintf(stderr, "[VEXA][GL] readpixels %d,%d %dx%d fmt=%x type=%x fbo=%u\n", x, y, width, height, format, type,
+            g_vexa_diag_curfbo);
+  }
   ::glReadPixels(x, y, width, height, format, type, pixels);
 }
 
@@ -2979,6 +4272,25 @@ void fexfn_impl_libGL_glShaderSourceARB(GLuint a_0, GLsizei count, guest_layout<
 void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
   GLHOST_TRACE_SCOPE();
   fexldr_ptr_libGL_glCompileShader(a_0);
+  GLint compiled = GL_FALSE;
+  ::glGetShaderiv(a_0, GL_COMPILE_STATUS, &compiled);
+  if (compiled != GL_TRUE) {
+    static std::atomic<int> logs {0};
+    if (logs.fetch_add(1) < 16) {
+      GLint shader_type = 0;
+      GLint log_len = 0;
+      ::glGetShaderiv(a_0, GL_SHADER_TYPE, &shader_type);
+      ::glGetShaderiv(a_0, GL_INFO_LOG_LENGTH, &log_len);
+      std::string info;
+      if (log_len > 1 && log_len < 4096) {
+        info.resize(static_cast<size_t>(log_len));
+        GLsizei written = 0;
+        ::glGetShaderInfoLog(a_0, log_len, &written, info.data());
+      }
+      fprintf(stderr, "[libGL-host] shader compile failed type=0x%x log=%.240s\n",
+              static_cast<unsigned>(shader_type), info.c_str());
+    }
+  }
 #if defined(VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR)
   LogFailedShaderCompile(a_0);
 #endif
@@ -3019,11 +4331,15 @@ void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1) {
     return;
   }
   if (a_0 == GL_MAJOR_VERSION) {
-    *a_1 = 3;
+    *a_1 = 4;
     return;
   }
   if (a_0 == GL_MINOR_VERSION) {
     *a_1 = 3;
+    return;
+  }
+  if (a_0 == GL_CONTEXT_PROFILE_MASK) {
+    *a_1 = GL_CONTEXT_CORE_PROFILE_BIT;
     return;
   }
   if (a_0 == GL_NUM_EXTENSIONS) {
@@ -3036,16 +4352,25 @@ void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1) {
     if (real_count < 0) {
       real_count = 0;
     }
-    *a_1 = real_count + 2;
+    *a_1 = real_count + static_cast<GLint>(kVexaDesktopSpoofExtCount);
     return;
   }
 
   if (fexldr_ptr_libGL_glGetIntegerv) {
     fexldr_ptr_libGL_glGetIntegerv(a_0, a_1);
-    return;
+  } else {
+    ::glGetIntegerv(a_0, a_1);
   }
-
-  ::glGetIntegerv(a_0, a_1);
+  // VEXA diag: engines may cache the "default framebuffer" from this query.
+  if (a_0 == GL_DRAW_FRAMEBUFFER_BINDING || a_0 == GL_READ_FRAMEBUFFER_BINDING) {
+    static int fbq_logged = 0;
+    if (fbq_logged < 40) {
+      ++fbq_logged;
+      fprintf(stderr, "[VEXA][GL] guest query %s -> %d tid=%ld\n",
+              a_0 == GL_DRAW_FRAMEBUFFER_BINDING ? "DRAW_FRAMEBUFFER_BINDING" : "READ_FRAMEBUFFER_BINDING", *a_1,
+              (long)syscall(SYS_gettid));
+    }
+  }
 }
 #endif
 

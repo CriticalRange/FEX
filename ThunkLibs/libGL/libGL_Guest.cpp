@@ -36,6 +36,7 @@ using __GLXextFuncPtr = void (*)();
 
 #include <dlfcn.h>
 #include <atomic>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,39 @@ using __GLXextFuncPtr = void (*)();
 #include <unordered_map>
 
 #include "common/Guest.h"
+
+#ifdef BUILD_ANDROID
+// VEXA_FIXES: Desktop GL 4.3 makes these core, and this GLES driver does not
+// export them. Unity treats the context as desktop GL (GLES: 0) and calls the
+// pointer unconditionally. Returning NULL becomes a guest call to address 0:
+// an empty L1 slot matches GuestCode 0 and the JIT blr's a null host pointer.
+// A no-op keeps init alive. These names are still absent from the extension
+// string, so caps that consult the string stay off.
+#define VEXA_NOOP_HIDDEN(name)                                                 \
+  extern "C" void VexaNoop_##name() {                                          \
+    static std::atomic<int> once {0};                                          \
+    if (once.fetch_add(1, std::memory_order_relaxed) == 0) {                   \
+      std::fprintf(stderr, "[libGL thunk] noop " #name "\n");                  \
+    }                                                                          \
+  }
+VEXA_NOOP_HIDDEN(glTextureView)
+VEXA_NOOP_HIDDEN(glTexPageCommitment)
+VEXA_NOOP_HIDDEN(glPatchParameteri)
+#undef VEXA_NOOP_HIDDEN
+
+static uintptr_t VexaHiddenCoreNoop(std::string_view name) {
+  if (name == "glTextureView" || name == "glTextureViewEXT" || name == "glTextureViewOES") {
+    return reinterpret_cast<uintptr_t>(VexaNoop_glTextureView);
+  }
+  if (name == "glTexPageCommitmentARB" || name == "glTexPageCommitmentEXT") {
+    return reinterpret_cast<uintptr_t>(VexaNoop_glTexPageCommitment);
+  }
+  if (name == "glPatchParameteri" || name == "glPatchParameteriEXT" || name == "glPatchParameteriOES") {
+    return reinterpret_cast<uintptr_t>(VexaNoop_glPatchParameteri);
+  }
+  return 0;
+}
+#endif
 
 #if defined(BUILD_ANDROID)
 static int VexaGLGuestFprintf(FILE* stream, const char* fmt, ...) {
@@ -657,6 +691,12 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
   }
 
 #ifdef BUILD_ANDROID
+  if (const uintptr_t hidden = VexaHiddenCoreNoop(procname_s)) {
+    fprintf(stderr, "[libGL thunk] glXGetProcAddress noop '%.*s'\n",
+            static_cast<int>(procname_s.size()), procname_s.data());
+    return reinterpret_cast<voidFunc*>(hidden);
+  }
+
   // Godot calls the pointer it stored, including optional fixed-function
   // entries. Return a stub that logs and returns 0 instead of aborting or
   // handing back NULL.
@@ -834,9 +874,58 @@ static void* g_vexa_current_context = nullptr;
 
 #define VEXA_GL_GUEST_EXPORT __attribute__((visibility("default")))
 
+// Ubuntu Xlib Visual / XVisualInfo, LP64. class sits at 0x10. A zeroed info
+// leaves visual NULL, and the next 32-bit load of visual->class faults there.
+struct VexaVisual {
+  void* ext_data;
+  unsigned long visualid;
+  int c_class;
+  unsigned long red_mask;
+  unsigned long green_mask;
+  unsigned long blue_mask;
+  int bits_per_rgb;
+  int map_entries;
+};
+struct VexaXVisualInfo {
+  VexaVisual* visual;
+  unsigned long visualid;
+  int screen;
+  int depth;
+  int c_class;
+  unsigned long red_mask;
+  unsigned long green_mask;
+  unsigned long blue_mask;
+  int colormap_size;
+  int bits_per_rgb;
+};
+static_assert(offsetof(VexaVisual, c_class) == 0x10, "Visual.class");
+static_assert(sizeof(VexaVisual) == 56, "Visual size");
+static_assert(offsetof(VexaXVisualInfo, c_class) == 24, "XVisualInfo.class");
+static_assert(sizeof(VexaXVisualInfo) == 64, "XVisualInfo size");
+
+static VexaVisual g_vexa_visual = {nullptr, 1, 4, 0x00ff0000, 0x0000ff00, 0x000000ff, 8, 256};
+
+static void* VexaGlxVisualInfo() {
+  auto* info = static_cast<VexaXVisualInfo*>(std::calloc(1, sizeof(VexaXVisualInfo)));
+  if (!info) {
+    return nullptr;
+  }
+  info->visual = &g_vexa_visual;
+  info->visualid = g_vexa_visual.visualid;
+  info->screen = 0;
+  info->depth = 24;
+  info->c_class = g_vexa_visual.c_class;
+  info->red_mask = g_vexa_visual.red_mask;
+  info->green_mask = g_vexa_visual.green_mask;
+  info->blue_mask = g_vexa_visual.blue_mask;
+  info->colormap_size = g_vexa_visual.map_entries;
+  info->bits_per_rgb = g_vexa_visual.bits_per_rgb;
+  return info;
+}
+
 VEXA_GL_GUEST_EXPORT void* glXChooseVisual(void* /*display*/, int /*screen*/, int* /*attributes*/) {
   fprintf(stderr, "[libGL thunk] compat glXChooseVisual\n");
-  return std::calloc(1, 256);
+  return VexaGlxVisualInfo();
 }
 
 VEXA_GL_GUEST_EXPORT void* glXCreateContext(void* /*display*/, void* /*visual*/, void* /*share_list*/, int /*direct*/) {
@@ -887,9 +976,17 @@ VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawabl
   g_vexa_current_context = context;
   vexa_ff::init_matrices();
   if (!context) {
-    return 1;
+    const int released = fexfn_pack_VEXA_ReleaseGlxSurface();
+    if (!released) {
+      fprintf(stderr, "[libGL thunk] glXMakeCurrent release failed\n");
+    }
+    return released;
   }
-  return fexfn_pack_VEXA_BindGlxSurface();
+  const int bound = fexfn_pack_VEXA_BindGlxSurface();
+  if (!bound) {
+    fprintf(stderr, "[libGL thunk] glXMakeCurrent bind failed\n");
+  }
+  return bound;
 }
 
 VEXA_GL_GUEST_EXPORT void glXSwapBuffers(void* /*display*/, unsigned long drawable) {
@@ -977,7 +1074,8 @@ VEXA_GL_GUEST_EXPORT void glXDestroyPbuffer(void* /*display*/, unsigned long pbu
 }
 
 VEXA_GL_GUEST_EXPORT void* glXGetVisualFromFBConfig(void* /*display*/, void* /*config*/) {
-  return std::calloc(1, 256);
+  fprintf(stderr, "[libGL thunk] compat glXGetVisualFromFBConfig\n");
+  return VexaGlxVisualInfo();
 }
 
 static int vexa_glx_attrib(int attribute, int* value) {
@@ -1087,7 +1185,11 @@ VEXA_GL_GUEST_EXPORT void glLineWidth(GLfloat width) {
   fprintf(stderr, "[libGL thunk] compat glLineWidth width=%f (no-op)\n", static_cast<double>(width));
 }
 
-VEXA_GL_GUEST_EXPORT void glPolygonMode(GLenum /*face*/, GLenum /*mode*/) {
+VEXA_GL_GUEST_EXPORT void glPolygonMode(GLenum face, GLenum mode) {
+  static std::atomic<int> once {0};
+  if (once.fetch_add(1, std::memory_order_relaxed) == 0) {
+    fprintf(stderr, "[libGL thunk] noop glPolygonMode face=0x%x mode=0x%x\n", face, mode);
+  }
 }
 
 VEXA_GL_GUEST_EXPORT void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {

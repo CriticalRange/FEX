@@ -73,7 +73,14 @@ constexpr uint64_t kThunkSDLGLSwapWindow = 0x53444C330005ULL;
 using RuntimeNativeWindowGetter = ANativeWindow* (*)();
 using RuntimeSurfaceSerialGetter = uint64_t (*)();
 
-#define SDL3_LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+static bool SDL3VerboseLogging() {
+  static const bool verbose = [] {
+    const char* v = getenv("VEXA_SDL3_TRACE");
+    return v && v[0] && v[0] != '0';
+  }();
+  return verbose;
+}
+#define SDL3_LOGI(...) do { if (SDL3VerboseLogging()) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); } while (0)
 #define SDL3_LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define SDL3_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
@@ -1814,6 +1821,26 @@ static SDL_Surface* fexfn_impl_libSDL3_FEX_SDL_ScaleSurface(SDL_Surface* surface
   return fn(surface, width, height, scaleMode);
 }
 
+static bool fexfn_impl_libSDL3_FEX_SDL_BlitSurfaceScaled(SDL_Surface* src, const SDL_Rect* srcrect, SDL_Surface* dst, const SDL_Rect* dstrect, SDL_ScaleMode scaleMode) {
+  using BlitScaledFn = bool (*)(SDL_Surface*, const SDL_Rect*, SDL_Surface*, const SDL_Rect*, SDL_ScaleMode);
+  static BlitScaledFn fn = reinterpret_cast<BlitScaledFn>(ResolveRuntimeSymbol("SDL_BlitSurfaceScaled"));
+  if (!fn) {
+    SDL3_LOGE("SDL_BlitSurfaceScaled bridge missing runtime symbol");
+    return false;
+  }
+  return fn(src, srcrect, dst, dstrect, scaleMode);
+}
+
+static bool fexfn_impl_libSDL3_FEX_SDL_SetSurfaceBlendMode(SDL_Surface* surface, SDL_BlendMode blendMode) {
+  using SetBlendModeFn = bool (*)(SDL_Surface*, SDL_BlendMode);
+  static SetBlendModeFn fn = reinterpret_cast<SetBlendModeFn>(ResolveRuntimeSymbol("SDL_SetSurfaceBlendMode"));
+  if (!fn) {
+    SDL3_LOGE("SDL_SetSurfaceBlendMode bridge missing runtime symbol");
+    return false;
+  }
+  return fn(surface, blendMode);
+}
+
 
 // VEXA_FIXES: Avoid host SDL cursor APIs on Android runtime worker threads.
 // These paths can touch JNI/thread state from non-Java threads and trigger ART
@@ -1941,6 +1968,8 @@ FEX_SDL_EXPORT_VOID(DestroyCursor, (SDL_Cursor* cursor), (cursor));
 FEX_SDL_EXPORT_RET(bool, ShowCursor, (), ());
 FEX_SDL_EXPORT_RET(bool, HideCursor, (), ());
 FEX_SDL_EXPORT_RET(bool, CursorVisible, (), ());
+FEX_SDL_EXPORT_RET(bool, BlitSurfaceScaled, (SDL_Surface* src, const SDL_Rect* srcrect, SDL_Surface* dst, const SDL_Rect* dstrect, SDL_ScaleMode scaleMode), (src, srcrect, dst, dstrect, scaleMode));
+FEX_SDL_EXPORT_RET(bool, SetSurfaceBlendMode, (SDL_Surface* surface, SDL_BlendMode blendMode), (surface, blendMode));
 
 #undef FEX_SDL_EXPORT_VOID
 #undef FEX_SDL_EXPORT_RET

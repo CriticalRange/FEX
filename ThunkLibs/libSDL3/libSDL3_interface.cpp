@@ -63,6 +63,8 @@ void FEX_SDL_DestroyCursor(SDL_Cursor* cursor);
 bool FEX_SDL_ShowCursor();
 bool FEX_SDL_HideCursor();
 bool FEX_SDL_CursorVisible();
+bool FEX_SDL_BlitSurfaceScaled(SDL_Surface* src, const SDL_Rect* srcrect, SDL_Surface* dst, const SDL_Rect* dstrect, SDL_ScaleMode scaleMode);
+bool FEX_SDL_SetSurfaceBlendMode(SDL_Surface* surface, SDL_BlendMode blendMode);
 
 // VEXA_FIXES: SDL3 on Android is backed by custom host implementations rather
 // than direct host symbol forwarding for this function set.
@@ -124,3 +126,7 @@ template<>
 struct fex_gen_config<FEX_SDL_HideCursor> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<FEX_SDL_CursorVisible> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<FEX_SDL_BlitSurfaceScaled> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<FEX_SDL_SetSurfaceBlendMode> : fexgen::custom_host_impl {};

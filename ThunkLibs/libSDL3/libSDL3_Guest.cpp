@@ -59,7 +59,18 @@ extern "C" {
 #include "common/Guest.h"
 
 #if defined(BUILD_ANDROID)
+static bool VexaSDL3Verbose() {
+  static const bool verbose = [] {
+    const char* v = getenv("VEXA_SDL3_TRACE");
+    return v && v[0] && v[0] != '0';
+  }();
+  return verbose;
+}
+
 static int VexaSDL3GuestVfprintf(FILE* stream, const char* fmt, va_list args) {
+  if (stream == stderr && !VexaSDL3Verbose() && std::strncmp(fmt, "[SDL3 thunk]", 12) == 0) {
+    return 0;
+  }
   va_list copy;
   va_copy(copy, args);
   const int rc = vfprintf(stream, fmt, args);
@@ -2968,7 +2979,10 @@ extern "C" SDL_FunctionPointer SDL_GL_GetProcAddress(const char* proc) {
   return nullptr;
 }
 
+void VexaPollPointerEvents();
+
 extern "C" bool SDL_PollEvent(SDL_Event* event) {
+  VexaPollPointerEvents();
   fprintf(stderr, "[SDL3 thunk] SDL_PollEvent(event=%p)\n", event);
   {
     std::scoped_lock lock {SyntheticEventQueueMutex};
@@ -3399,5 +3413,7 @@ extern "C" void SDL_UnloadObject(SDL_SharedObject* handle) {
     dlclose(handle);
   }
 }
+
+#include "libSDL3_Compat.inc"
 
 LOAD_LIB(libSDL3)

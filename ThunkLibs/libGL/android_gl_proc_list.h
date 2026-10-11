@@ -123,6 +123,39 @@
   OP(glDrawElements) \
   OP(glDrawArraysInstanced) \
   OP(glDrawElementsInstanced) \
+  OP(glDrawElementsIndirect) \
+  OP(glDrawArraysIndirect) \
+  OP(glDrawElementsBaseVertex) \
+  OP(glDrawElementsInstancedBaseVertex) \
+  OP(glDispatchCompute) \
+  OP(glDispatchComputeIndirect) \
+  OP(glMemoryBarrier) \
+  OP(glBindImageTexture) \
+  OP(glGetProgramInterfaceiv) \
+  OP(glGetProgramResourceIndex) \
+  OP(glGetProgramResourceName) \
+  OP(glGetProgramResourceiv) \
+  OP(glGetIntegeri_v) \
+  OP(glCopyBufferSubData) \
+  OP(glCopyImageSubData) \
+  OP(glGetInternalformativ) \
+  OP(glProgramParameteri) \
+  OP(glTexStorage3D) \
+  OP(glTexStorage2DMultisample) \
+  OP(glFramebufferTexture) \
+  OP(glUniform1uiv) \
+  OP(glUniform2iv) \
+  OP(glUniform2uiv) \
+  OP(glUniform3iv) \
+  OP(glUniform3uiv) \
+  OP(glUniform4iv) \
+  OP(glUniform4uiv) \
+  OP(glGetActiveUniformBlockiv) \
+  OP(glClearBufferuiv) \
+  OP(glColorMaski) \
+  OP(glBlendEquationi) \
+  OP(glFlushMappedBufferRange) \
+  OP(glVertexAttribDivisor) \
   OP(glReadBuffer) \
   OP(glReadPixels) \
   OP(glFenceSync) \
@@ -180,15 +213,76 @@
   OP(glUniform3i) \
   OP(glUniform4i) \
   OP(glPixelStorei) \
-  OP(glDisableClientState)
+  OP(glDisableClientState) \
+  OP(glGetUniformiv) \
+  OP(glGetUniformIndices) \
+  OP(glGetActiveUniformsiv) \
+  OP(glGetActiveUniformBlockName) \
+  OP(glGetQueryiv) \
+  OP(glValidateProgram) \
+  OP(glGetShaderSource) \
+  OP(glGetShaderPrecisionFormat) \
+  OP(glClearBufferfi) \
+  OP(glCompressedTexImage3D) \
+  OP(glCompressedTexSubImage2D) \
+  OP(glCompressedTexSubImage3D) \
+  OP(glProgramBinary) \
+  OP(glGetProgramBinary) \
+  OP(glProgramUniform1iv) \
+  OP(glProgramUniform1fv) \
+  OP(glProgramUniform1uiv) \
+  OP(glProgramUniform2iv) \
+  OP(glProgramUniform2fv) \
+  OP(glProgramUniform2uiv) \
+  OP(glProgramUniform3iv) \
+  OP(glProgramUniform3fv) \
+  OP(glProgramUniform3uiv) \
+  OP(glProgramUniform4iv) \
+  OP(glProgramUniform4fv) \
+  OP(glProgramUniform4uiv) \
+  OP(glProgramUniformMatrix2fv) \
+  OP(glProgramUniformMatrix3fv) \
+  OP(glProgramUniformMatrix4fv) \
+  OP(glProgramUniformMatrix2x3fv) \
+  OP(glProgramUniformMatrix3x2fv) \
+  OP(glProgramUniformMatrix2x4fv) \
+  OP(glProgramUniformMatrix4x2fv) \
+  OP(glProgramUniformMatrix3x4fv) \
+  OP(glProgramUniformMatrix4x3fv) \
+  OP(glTexImage2DMultisample) \
+  OP(glTexStorage3DMultisample) \
+  OP(glGetTextureParameteriv) \
+  OP(glGetTextureLevelParameteriv) \
+  OP(glMapBufferOES) \
+  OP(glBlendBarrierKHR) \
+  OP(glBlendEquationSeparatei) \
+  OP(glDebugMessageCallback) \
+  OP(glDebugMessageControl) \
+  OP(glDebugMessageInsert) \
+  OP(glGetObjectLabel) \
+  OP(glGetObjectLabelEXT) \
+  OP(glLabelObjectEXT) \
+  OP(glFramebufferTexture2DMultisampleEXT) \
+  OP(glEGLImageTargetTexture2DOES) \
+  OP(glDrawRangeElements) \
+  OP(glDrawRangeElementsBaseVertex) \
+  OP(glDrawArraysInstancedBaseInstance) \
+  OP(glDrawElementsInstancedBaseInstance) \
+  OP(glDrawElementsInstancedBaseVertexBaseInstance) \
+  OP(glMultiDrawArrays) \
+  OP(glMultiDrawElements) \
+  OP(glMultiDrawElementsBaseVertex) \
+  OP(glDrawTransformFeedback) \
+  OP(glDrawTransformFeedbackInstanced) \
+  OP(glDrawTransformFeedbackStream) \
+  OP(glDrawTransformFeedbackStreamInstanced) \
+  OP(glResolveMultisampleFramebufferAPPLE)
 
 // VEXA_FIXES: Thunkgen list intentionally excludes custom-bridged entries (for example
 // glShaderSource) that are handled via dedicated host implementations.
 #define FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN(OP) \
   OP(glGetString) \
   OP(glGetStringi) \
-  OP(glClear) \
-  OP(glClearColor) \
   OP(glClearStencil) \
   OP(glClearDepthf) \
   OP(glClearDepthfOES) \
@@ -216,7 +310,6 @@
   OP(glAttachShader) \
   OP(glDetachShader) \
   OP(glLinkProgram) \
-  OP(glUseProgram) \
   OP(glGetProgramiv) \
   OP(glGetProgramInfoLog) \
   OP(glBindAttribLocation) \
@@ -276,7 +369,6 @@
   OP(glGenerateMipmap) \
   OP(glGenFramebuffers) \
   OP(glDeleteFramebuffers) \
-  OP(glBindFramebuffer) \
   OP(glFramebufferTexture2D) \
   OP(glFramebufferTextureLayer) \
   OP(glInvalidateFramebuffer) \
@@ -294,16 +386,32 @@
   OP(glBindSampler) \
   OP(glSamplerParameterf) \
   OP(glSamplerParameteri) \
-  OP(glDrawArrays) \
-  OP(glDrawElements) \
-  OP(glDrawArraysInstanced) \
-  OP(glDrawElementsInstanced) \
+  OP(glBindImageTexture) \
+  OP(glGetProgramInterfaceiv) \
+  OP(glGetProgramResourceIndex) \
+  OP(glGetProgramResourceName) \
+  OP(glGetProgramResourceiv) \
+  OP(glGetIntegeri_v) \
+  OP(glCopyBufferSubData) \
+  OP(glCopyImageSubData) \
+  OP(glGetInternalformativ) \
+  OP(glProgramParameteri) \
+  OP(glTexStorage3D) \
+  OP(glTexStorage2DMultisample) \
+  OP(glFramebufferTexture) \
+  OP(glUniform1uiv) \
+  OP(glUniform2iv) \
+  OP(glUniform2uiv) \
+  OP(glUniform3iv) \
+  OP(glUniform3uiv) \
+  OP(glUniform4iv) \
+  OP(glUniform4uiv) \
+  OP(glGetActiveUniformBlockiv) \
+  OP(glColorMaski) \
+  OP(glBlendEquationi) \
+  OP(glFlushMappedBufferRange) \
+  OP(glVertexAttribDivisor) \
   OP(glReadBuffer) \
-  OP(glReadPixels) \
-  OP(glFenceSync) \
-  OP(glClientWaitSync) \
-  OP(glGetSynciv) \
-  OP(glDeleteSync) \
   OP(glFlush) \
   OP(glGetError) \
   OP(glGetBooleanv) \
@@ -322,21 +430,15 @@
   OP(glPopDebugGroup) \
   OP(glPushGroupMarkerEXT) \
   OP(glPopGroupMarkerEXT) \
-  OP(glBeginQuery) \
   OP(glBeginTransformFeedback) \
   OP(glBindBufferBase) \
   OP(glBlendEquationSeparate) \
   OP(glBlendFuncSeparatei) \
   OP(glBlendFunci) \
-  OP(glClearBufferfv) \
   OP(glCopyTexSubImage2D) \
   OP(glDeleteQueries) \
   OP(glDrawBuffers) \
-  OP(glEndQuery) \
   OP(glEndTransformFeedback) \
-  OP(glGenQueries) \
-  OP(glGetQueryObjectui64v) \
-  OP(glGetQueryObjectuiv) \
   OP(glHint) \
   OP(glPointSize) \
   OP(glPolygonOffset) \
@@ -374,6 +476,71 @@ void glPushGroupMarkerEXT(GLsizei length, const GLchar* marker);
 void glPopGroupMarkerEXT(void);
 void glClearDepthfOES(GLfloat depth);
 void glDisableClientState(GLenum array);
+
+// VEXA_FIXES: Signatures for guest-visible procs that are absent from the GLES
+// headers but thunkable through eglGetProcAddress-backed host shims.
+void glGetUniformiv(GLuint program, GLint location, GLint* params);
+void glGetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar* const* uniformNames, GLuint* uniformIndices);
+void glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint* uniformIndices, GLenum pname, GLint* params);
+void glGetActiveUniformBlockName(GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei* length, GLchar* uniformBlockName);
+void glGetQueryiv(GLenum target, GLenum pname, GLint* params);
+void glValidateProgram(GLuint program);
+void glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* source);
+void glGetShaderPrecisionFormat(GLenum shaderType, GLenum precisionType, GLint* range, GLint* precision);
+void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
+void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void* data);
+void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void* data);
+void glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void* data);
+void glProgramBinary(GLuint program, GLenum binaryFormat, const void* binary, GLsizei length);
+void glGetProgramBinary(GLuint program, GLsizei bufSize, GLsizei* length, GLenum* binaryFormat, void* binary);
+void glProgramUniform1iv(GLuint program, GLint location, GLsizei count, const GLint* value);
+void glProgramUniform1fv(GLuint program, GLint location, GLsizei count, const GLfloat* value);
+void glProgramUniform1uiv(GLuint program, GLint location, GLsizei count, const GLuint* value);
+void glProgramUniform2iv(GLuint program, GLint location, GLsizei count, const GLint* value);
+void glProgramUniform2fv(GLuint program, GLint location, GLsizei count, const GLfloat* value);
+void glProgramUniform2uiv(GLuint program, GLint location, GLsizei count, const GLuint* value);
+void glProgramUniform3iv(GLuint program, GLint location, GLsizei count, const GLint* value);
+void glProgramUniform3fv(GLuint program, GLint location, GLsizei count, const GLfloat* value);
+void glProgramUniform3uiv(GLuint program, GLint location, GLsizei count, const GLuint* value);
+void glProgramUniform4iv(GLuint program, GLint location, GLsizei count, const GLint* value);
+void glProgramUniform4fv(GLuint program, GLint location, GLsizei count, const GLfloat* value);
+void glProgramUniform4uiv(GLuint program, GLint location, GLsizei count, const GLuint* value);
+void glProgramUniformMatrix2fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix3fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix2x3fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix3x2fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix2x4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix4x2fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix3x4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glProgramUniformMatrix4x3fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations);
+void glTexStorage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations);
+void glGetTextureParameteriv(GLuint texture, GLenum pname, GLint* params);
+void glGetTextureLevelParameteriv(GLuint texture, GLint level, GLenum pname, GLint* params);
+void* glMapBufferOES(GLenum target, GLenum access);
+void glBlendBarrierKHR(void);
+void glBlendEquationSeparatei(GLuint buf, GLenum modeRGB, GLenum modeAlpha);
+typedef void (*VEXA_GLDEBUGPROC)(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam);
+void glDebugMessageCallback(VEXA_GLDEBUGPROC callback, const void* userParam);
+void glDebugMessageControl(GLenum source, GLenum type, GLenum severity, GLsizei count, const GLuint* ids, GLboolean enabled);
+void glDebugMessageInsert(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* buf);
+void glGetObjectLabel(GLenum identifier, GLuint name, GLsizei bufSize, GLsizei* length, GLchar* label);
+void glGetObjectLabelEXT(GLenum type, GLuint object, GLsizei bufSize, GLsizei* length, GLchar* label);
+void glLabelObjectEXT(GLenum type, GLuint object, GLsizei length, const GLchar* label);
+void glFramebufferTexture2DMultisampleEXT(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLsizei samples);
+void glEGLImageTargetTexture2DOES(GLenum target, void* image);
+void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices);
+void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices, GLint basevertex);
+void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei primcount, GLuint baseinstance);
+void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount, GLuint baseinstance);
+void glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount, GLint basevertex, GLuint baseinstance);
+void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount);
+void glDrawTransformFeedback(GLenum mode, GLuint id);
+void glDrawTransformFeedbackInstanced(GLenum mode, GLuint id, GLsizei primcount);
+void glDrawTransformFeedbackStream(GLenum mode, GLuint id, GLuint stream);
+void glDrawTransformFeedbackStreamInstanced(GLenum mode, GLuint id, GLuint stream, GLsizei primcount);
+void glResolveMultisampleFramebufferAPPLE(void);
 }
 #endif
 
