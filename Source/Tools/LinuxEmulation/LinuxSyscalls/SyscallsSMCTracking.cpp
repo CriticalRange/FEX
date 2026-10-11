@@ -333,6 +333,25 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
     // To be more optimal the frontend should provide this code with a valid Thread object earlier.
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(VMATracking.Mutex, Thread);
 
+    // VEXA_DIAG: full-range coverage check, same intent as GuestMprotect.
+    if (reinterpret_cast<uintptr_t>(addr) >= 0x1'0000'0000ULL) {
+      uintptr_t Cur = reinterpret_cast<uintptr_t>(addr);
+      const uintptr_t End = Cur + length;
+      bool gap = false;
+      while (!gap && Cur < End) {
+        auto It = VMATracking.FindVMAEntry(Cur);
+        if (It == VMATracking.VMAs.end() || It->second.Base > Cur) {
+          gap = true;
+        } else {
+          Cur = It->second.Base + It->second.Length;
+        }
+      }
+      if (gap) {
+        fprintf(stderr, "[VEXA][MUNMAP-MISS] addr=%p len=%lx rip=%lx\n", addr, length,
+                Thread ? Thread->CurrentFrame->State.rip : 0);
+      }
+    }
+
     if (reinterpret_cast<uintptr_t>(addr) < 0x1'0000'0000ULL) {
       Result = Get32BitAllocator()->Munmap(addr, length);
       if (FEX::HLE::HasSyscallError(Result)) {
@@ -419,6 +438,26 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
+    // VEXA_DIAG: flag mprotect calls whose range isn't fully covered by guest
+    // VMA tracking. Those punch holes into host-internal mappings (scudo heap,
+    // FEX arenas, InternalThreadState pages) and corrupt FEX later on.
+    {
+      uintptr_t Cur = reinterpret_cast<uintptr_t>(addr);
+      const uintptr_t End = Cur + len;
+      bool gap = false;
+      while (!gap && Cur < End) {
+        auto It = VMATracking.FindVMAEntry(Cur);
+        if (It == VMATracking.VMAs.end() || It->second.Base > Cur) {
+          gap = true;
+        } else {
+          Cur = It->second.Base + It->second.Length;
+        }
+      }
+      if (gap) {
+        fprintf(stderr, "[VEXA][MPROTECT-MISS] addr=%p len=%zx prot=%x rip=%lx\n", addr, len, prot,
+                Thread ? Thread->CurrentFrame->State.rip : 0);
+      }
+    }
     Result = ::mprotect(addr, len, prot);
     if (Result == -1) {
       return -errno;

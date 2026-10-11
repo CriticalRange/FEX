@@ -16,6 +16,7 @@
 extern "C" using __GLXextFuncPtr = void (*)(void);
 extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
 extern "C" int VEXA_BindGlxSurface(void);
+extern "C" int VEXA_ReleaseGlxSurface(void);
 extern "C" void VEXA_SwapGlxBuffers(void);
 extern "C" int VEXA_SetSwapInterval(int interval);
 // One host transition uploads or draws a baked fixed-function mesh.
@@ -52,6 +53,8 @@ struct fex_gen_config<glXGetProcAddress> : fexgen::custom_host_impl, fexgen::cus
 #ifdef BUILD_ANDROID
 template<>
 struct fex_gen_config<VEXA_BindGlxSurface> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_ReleaseGlxSurface> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_SwapGlxBuffers> : fexgen::custom_host_impl {};
 template<>
@@ -140,6 +143,9 @@ struct fex_gen_config<FEX_glShaderSource> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<glTransformFeedbackVaryings, 2, const GLchar* const*> : fexgen::assume_compatible_data_layout {};
 
+template<>
+struct fex_gen_param<glGetUniformIndices, 2, const GLchar* const*> : fexgen::assume_compatible_data_layout {};
+
 #define FEX_ANDROID_GL_CONFIG(name) \
 template<> \
 struct fex_gen_config<name> {};
@@ -154,6 +160,126 @@ template<>
 struct fex_gen_config<glBlitFramebuffer> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glBlitFramebufferEXT> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glClear> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glClearColor> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glUseProgram> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glBindFramebuffer> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawArrays> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawElements> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawArraysInstanced> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawElementsInstanced> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawElementsIndirect> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawArraysIndirect> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawElementsBaseVertex> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDrawElementsInstancedBaseVertex> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDispatchCompute> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDispatchComputeIndirect> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glMemoryBarrier> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glClearBufferuiv> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glClearBufferfv> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glFenceSync> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glClientWaitSync> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glGetSynciv> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDeleteSync> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glReadPixels> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glBeginQuery> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glEndQuery> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glGenQueries> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glGetQueryObjectui64v> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glGetQueryObjectuiv> : fexgen::custom_host_impl {};
+
+#define FEX_ANDROID_GL_CUSTOM(name) \
+template<> \
+struct fex_gen_config<name> : fexgen::custom_host_impl {};
+FEX_ANDROID_GL_CUSTOM(glGetUniformiv)
+FEX_ANDROID_GL_CUSTOM(glGetUniformIndices)
+FEX_ANDROID_GL_CUSTOM(glGetActiveUniformsiv)
+FEX_ANDROID_GL_CUSTOM(glGetActiveUniformBlockName)
+FEX_ANDROID_GL_CUSTOM(glGetQueryiv)
+FEX_ANDROID_GL_CUSTOM(glValidateProgram)
+FEX_ANDROID_GL_CUSTOM(glGetShaderSource)
+FEX_ANDROID_GL_CUSTOM(glGetShaderPrecisionFormat)
+FEX_ANDROID_GL_CUSTOM(glClearBufferfi)
+FEX_ANDROID_GL_CUSTOM(glCompressedTexImage3D)
+FEX_ANDROID_GL_CUSTOM(glCompressedTexSubImage2D)
+FEX_ANDROID_GL_CUSTOM(glCompressedTexSubImage3D)
+FEX_ANDROID_GL_CUSTOM(glProgramBinary)
+FEX_ANDROID_GL_CUSTOM(glGetProgramBinary)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform1iv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform1fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform1uiv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform2iv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform2fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform2uiv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform3iv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform3fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform3uiv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform4iv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform4fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniform4uiv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix2fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix3fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix4fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix2x3fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix3x2fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix2x4fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix4x2fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix3x4fv)
+FEX_ANDROID_GL_CUSTOM(glProgramUniformMatrix4x3fv)
+FEX_ANDROID_GL_CUSTOM(glTexImage2DMultisample)
+FEX_ANDROID_GL_CUSTOM(glTexStorage3DMultisample)
+FEX_ANDROID_GL_CUSTOM(glGetTextureParameteriv)
+FEX_ANDROID_GL_CUSTOM(glGetTextureLevelParameteriv)
+FEX_ANDROID_GL_CUSTOM(glMapBufferOES)
+FEX_ANDROID_GL_CUSTOM(glBlendBarrierKHR)
+FEX_ANDROID_GL_CUSTOM(glBlendEquationSeparatei)
+FEX_ANDROID_GL_CUSTOM(glDebugMessageCallback)
+FEX_ANDROID_GL_CUSTOM(glDebugMessageControl)
+FEX_ANDROID_GL_CUSTOM(glDebugMessageInsert)
+FEX_ANDROID_GL_CUSTOM(glGetObjectLabel)
+FEX_ANDROID_GL_CUSTOM(glGetObjectLabelEXT)
+FEX_ANDROID_GL_CUSTOM(glLabelObjectEXT)
+FEX_ANDROID_GL_CUSTOM(glFramebufferTexture2DMultisampleEXT)
+FEX_ANDROID_GL_CUSTOM(glEGLImageTargetTexture2DOES)
+FEX_ANDROID_GL_CUSTOM(glResolveMultisampleFramebufferAPPLE)
+FEX_ANDROID_GL_CUSTOM(glDrawRangeElements)
+FEX_ANDROID_GL_CUSTOM(glDrawRangeElementsBaseVertex)
+FEX_ANDROID_GL_CUSTOM(glDrawArraysInstancedBaseInstance)
+FEX_ANDROID_GL_CUSTOM(glDrawElementsInstancedBaseInstance)
+FEX_ANDROID_GL_CUSTOM(glDrawElementsInstancedBaseVertexBaseInstance)
+FEX_ANDROID_GL_CUSTOM(glMultiDrawArrays)
+FEX_ANDROID_GL_CUSTOM(glDrawTransformFeedback)
+FEX_ANDROID_GL_CUSTOM(glDrawTransformFeedbackInstanced)
+FEX_ANDROID_GL_CUSTOM(glDrawTransformFeedbackStream)
+FEX_ANDROID_GL_CUSTOM(glDrawTransformFeedbackStreamInstanced)
+#undef FEX_ANDROID_GL_CUSTOM
 
 #else
 template<>

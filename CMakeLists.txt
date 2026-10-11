@@ -57,6 +57,7 @@ set(X86_DEV_ROOTFS "/" CACHE FILEPATH "Path to the sysroot used for cross-compil
 set(DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(HOSTLIBS_DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(THUNKGEN_EXECUTABLE "" CACHE FILEPATH "Path to host-built thunkgen for cross builds") # VEXA_FIXES: Android cross-builds cannot execute a target-built thunkgen binary for the guest arch; use a host-built thunkgen path explicitly.
+set(VEXA_SDL2_PREFIX "" CACHE PATH "SDL2 source prefix (headers)") # VEXA_FIXES: SDL2 headers prefix for guest/host thunk generation; forwarded into the guest-libs ExternalProject and picked up by HostLibs via add_subdirectory.
 
 if (NOT DATA_DIRECTORY)
   set(DATA_DIRECTORY "${CMAKE_INSTALL_PREFIX}/share/fex-emu")
@@ -624,7 +625,8 @@ if (BUILD_THUNKS)
       "-DBUILD_ANDROID=${ANDROID}"
       "-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
       # VEXA_FIXES: Propagate Android dependency prefixes so guest thunk parsing/build
-      # can locate SDL3/SDL3_image/OpenAL includes in the external guest sub-build.
+      # can locate SDL2/SDL3/SDL3_image/OpenAL includes in the external guest sub-build.
+      "-DVEXA_SDL2_PREFIX=${VEXA_SDL2_PREFIX}"
       "-DVEXA_SDL3_PREFIX=${VEXA_SDL3_PREFIX}"
       "-DVEXA_SDL3_IMAGE_PREFIX=${VEXA_SDL3_IMAGE_PREFIX}"
       "-DVEXA_OPENAL_PREFIX=${VEXA_OPENAL_PREFIX}"
@@ -665,6 +667,7 @@ if (BUILD_THUNKS)
         "-DENABLE_VDSO_THUNKS=${ENABLE_VDSO_THUNKS}"
         # VEXA_FIXES: Keep 32-bit guest thunk sub-build aligned with 64-bit
         # for Android media dependency include prefixes.
+        "-DVEXA_SDL2_PREFIX=${VEXA_SDL2_PREFIX}"
         "-DVEXA_SDL3_PREFIX=${VEXA_SDL3_PREFIX}"
         "-DVEXA_SDL3_IMAGE_PREFIX=${VEXA_SDL3_IMAGE_PREFIX}"
         "-DVEXA_OPENAL_PREFIX=${VEXA_OPENAL_PREFIX}"

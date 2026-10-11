@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD 20)
 option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
 # VEXA_FIXES: These prefixes point to Android-built host-side dependency trees.
-# They provide headers/libs for generating and compiling host thunks for SDL3/SDL3_image/OpenAL.
+# They provide headers/libs for generating and compiling host thunks for SDL2/SDL3/SDL3_image/OpenAL.
+set(VEXA_SDL2_PREFIX "" CACHE PATH "SDL2 source prefix (headers)")
 set(VEXA_SDL3_PREFIX "" CACHE PATH "SDL3 Android prefix")
 set(VEXA_SDL3_IMAGE_PREFIX "" CACHE PATH "SDL3_image Android prefix")
 set(VEXA_OPENAL_PREFIX "" CACHE PATH "OpenAL Android prefix")
@@ -192,12 +193,6 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
     generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
     add_host_lib(asound ${GUEST_BITNESS})
 
-  # disabled for now, headers are platform specific
-  # find_package(SDL2 REQUIRED)
-  # generate(libSDL2)
-  # add_host_lib(SDL2 ${GUEST_BITNESS})
-  # target_include_directories(SDL2-host PRIVATE ${SDL2_INCLUDE_DIRS})
-
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
   target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
@@ -222,6 +217,17 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
       ${VEXA_SDL3_PREFIX}/include
       ${VEXA_SDL3_IMAGE_PREFIX}/include)
     add_host_lib(SDL3_image ${GUEST_BITNESS})
+
+    # VEXA_FIXES: Build Android host thunk for SDL2 so guest `libSDL2` imports route
+    # to the Android SDL2 host library through the FEX thunk bridge.
+    if (ANDROID AND NOT VEXA_SDL2_PREFIX STREQUAL "")
+      generate(libSDL2 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL2/libSDL2_interface.cpp ${GUEST_BITNESS})
+      target_include_directories(libSDL2-${GUEST_BITNESS}-deps INTERFACE ${VEXA_SDL2_PREFIX}/include)
+      add_host_lib(SDL2 ${GUEST_BITNESS})
+      # VEXA_FIXES: SDL2 host thunk embeds EGL + ANativeWindow + log usage for
+      # managed context creation and diagnostics on Android.
+      target_link_libraries(SDL2-host-${GUEST_BITNESS} PRIVATE EGL GLESv3 log android)
+    endif()
   endif()
   # VEXA_FIXES: OpenAL host thunk plays for the guest libasound shim. It does not
   # require the SDL3 prefix.

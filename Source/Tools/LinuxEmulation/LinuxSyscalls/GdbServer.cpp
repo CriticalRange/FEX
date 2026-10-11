@@ -942,6 +942,30 @@ GdbServer::HandledPacketType GdbServer::CommandQuery(const fextl::string& packet
     ss << "m" << std::hex << Threads->at(0)->ThreadInfo.TID;
     return {ss.str(), HandledPacketType::TYPE_ACK};
   }
+  if (match("qVexaThreads")) {
+    // VEXA addition: live snapshot of every guest thread's key registers
+    // without pausing the process (TM.Pause can deadlock on spin-heavy
+    // workloads). Format: tid:rip:rsp:rbx:rbp:rsi:rdi[,...] all hex.
+    // gregs[] follows Intel encoding: rax=0 rcx=1 rdx=2 rbx=3 rsp=4
+    // rbp=5 rsi=6 rdi=7.
+    auto Threads = SyscallHandler->TM.GetThreads();
+    fextl::ostringstream ss;
+    bool first = true;
+    for (auto* T : *Threads) {
+      auto* Frame = T->Thread ? T->Thread->CurrentFrame : nullptr;
+      if (!Frame) {
+        continue;
+      }
+      if (!first) {
+        ss << ",";
+      }
+      first = false;
+      ss << std::hex << T->ThreadInfo.TID << ":" << Frame->State.rip << ":" << Frame->State.gregs[4] << ":"
+         << Frame->State.gregs[3] << ":" << Frame->State.gregs[5] << ":" << Frame->State.gregs[6] << ":"
+         << Frame->State.gregs[7];
+    }
+    return {ss.str(), HandledPacketType::TYPE_ACK};
+  }
   if (match("QStartNoAckMode")) {
     SettingNoAckMode = true;
     return {"OK", HandledPacketType::TYPE_ACK};
@@ -1380,13 +1404,26 @@ GdbServer::MatchPacket(fextl::vector<std::byte>::iterator begin, fextl::vector<s
     break;
   }
 
-  default: ERROR_AND_DIE_FMT("Unexpected character at beginning of GDB packet: {}", CommsBuffer[0]);
+  default:
+    // Skip the unexpected byte instead of taking down the guest - a stray
+    // character from a probing client must not be fatal.
+    LogMan::Msg::EFmt("[GdbServer] skipping unexpected byte {:02x}", static_cast<uint8_t>(CommsBuffer[0]));
+    return std::make_pair(std::next(begin), true);
   }
 }
 
 void GdbServer::HandlePacket(fasio::error ec, size_t BytesInMessage) {
   if (ec != fasio::error::success || BytesInMessage == 0) {
-    ERROR_AND_DIE_FMT("Failed");
+    // Client disconnected (or socket error). Drop the session and let the
+    // acceptor arm a fresh debugger connection. Killing the whole guest here
+    // makes debugging flaky clients impossible.
+    LogMan::Msg::IFmt("[GdbServer] debugger disconnected, waiting for reconnect");
+    std::lock_guard lk(sendMutex);
+    if (CommsSocket) {
+      close(CommsSocket->FD);
+      CommsSocket.reset();
+    }
+    return;
   }
 
   char c = (char)CommsBuffer[0];
@@ -1491,6 +1528,24 @@ void GdbServer::OpenListenSocket() {
     return;
   }
 
+#ifdef __ANDROID__
+  // On Android the filesystem socket lives in app-private storage with 0600
+  // permissions, so no debugger outside the app UID can ever connect to it.
+  // Use an abstract AF_UNIX socket instead - it has no filesystem entry and
+  // can be reached via `adb forward tcp:<port> localabstract:<name>`.
+  GdbUnixSocketPath = fextl::fmt::format("fexgdb{}", ::getpid());
+  Acceptor = fasio::tcp_acceptor::create(Reactor, true, GdbUnixSocketPath, 1);
+
+  if (!Acceptor) {
+    LogMan::Msg::EFmt("[GdbServer] Couldn't bind abstract AF_UNIX socket '{}': {} {}\n", GdbUnixSocketPath, errno,
+                      strerror(errno));
+    return;
+  }
+
+  LogMan::Msg::IFmt("[GdbServer] Waiting for connection on abstract socket {}", GdbUnixSocketPath);
+  LogMan::Msg::IFmt("[GdbServer] adb forward tcp:<port> localabstract:{}", GdbUnixSocketPath);
+  return;
+#else
   GdbUnixSocketPath = fextl::fmt::format("{}{}-gdb", GdbUnixPath, ::getpid());
 
   for (int attempt = 0; attempt < 2; ++attempt) {
@@ -1511,6 +1566,7 @@ void GdbServer::OpenListenSocket() {
 
   LogMan::Msg::IFmt("[GdbServer] Waiting for connection on {}", GdbUnixSocketPath);
   LogMan::Msg::IFmt("[GdbServer] gdb-multiarch -ex \"set debug remote 1\" -ex \"target extended-remote {}\"", GdbUnixSocketPath);
+#endif
 }
 
 void GdbServer::CloseListenSocket() {

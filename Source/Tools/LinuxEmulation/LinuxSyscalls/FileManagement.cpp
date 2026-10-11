@@ -889,6 +889,18 @@ uint64_t FileManager::FAccessat2(int dirfd, const char* pathname, int mode, int 
 
   FDPathTmpData TmpFilename;
   auto Path = GetEmulatedFDPath(dirfd, SelfPath, (flags & AT_SYMLINK_NOFOLLOW) == 0, TmpFilename);
+#if defined(__ANDROID__)
+  // VEXA_FIXES: Android app seccomp kills faccessat2 with SIGSYS.
+  // Steam uses it as an existence check. The walk above already honors
+  // AT_SYMLINK_NOFOLLOW; faccessat is the allowed syscall.
+  if (Path.FD != -1) {
+    uint64_t Result = ::syscall(SYSCALL_DEF(faccessat), Path.FD, Path.Path, mode);
+    if (Result != -1) {
+      return Result;
+    }
+  }
+  return ::syscall(SYS_faccessat, dirfd, SelfPath, mode);
+#else
   if (Path.FD != -1) {
     uint64_t Result = ::syscall(SYSCALL_DEF(faccessat2), Path.FD, Path.Path, mode, flags);
     if (Result != -1) {
@@ -897,6 +909,7 @@ uint64_t FileManager::FAccessat2(int dirfd, const char* pathname, int mode, int 
   }
 
   return ::syscall(SYSCALL_DEF(faccessat2), dirfd, SelfPath, mode, flags);
+#endif
 }
 
 uint64_t FileManager::Readlink(const char* pathname, char* buf, size_t bufsiz) {

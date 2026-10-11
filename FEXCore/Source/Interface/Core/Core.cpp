@@ -813,7 +813,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       for (auto& Subblock : DebugData->Subblocks) {
         auto BlockBasePtr = FragmentBasePtr + Subblock.HostCodeOffset;
         if (GuestRIPLookup) {
-          Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, CompiledCode.Size, GuestRIPLookup->FileInfo.Filename,
+          Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, Subblock.HostCodeSize, GuestRIPLookup->FileInfo.Filename,
                            GuestRIP - GuestRIPLookup->FileStartVA);
         } else {
           Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, GuestRIP, Subblock.HostCodeSize);

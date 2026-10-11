@@ -6,6 +6,7 @@ option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
 # VEXA_FIXES: These prefixes point to Android-built dependency bundles used by
 # the thunk parser/compiler (headers) during cross-build.
+set(VEXA_SDL2_PREFIX "" CACHE PATH "SDL2 source prefix (headers)")
 set(VEXA_SDL3_PREFIX "" CACHE PATH "SDL3 Android prefix")
 set(VEXA_SDL3_IMAGE_PREFIX "" CACHE PATH "SDL3_image Android prefix")
 set(VEXA_OPENAL_PREFIX "" CACHE PATH "OpenAL Android prefix")
@@ -213,6 +214,9 @@ if (BITNESS EQUAL 64)
   if ((NOT ANDROID AND NOT BUILD_ANDROID) OR NOT VEXA_SDL3_PREFIX STREQUAL "")
   generate(libSDL3 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_interface.cpp)
   add_guest_lib(SDL3 "libSDL3.so")
+  # VEXA_FIXES: Real SDL3 exports every symbol under SDL3_0.0.0; consumers like FAudio/FNA3D link against that version node.
+  target_link_options(SDL3-guest PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_Guest.map")
+  set_property(TARGET SDL3-guest APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../libSDL3/libSDL3_Guest.map")
   target_include_directories(libSDL3-guest-deps INTERFACE ${VEXA_SDL3_PREFIX}/include)
 
   # VEXA_FIXES: Add SDL3_image guest thunk for image-loading API parity used by SDL3 stacks.
@@ -232,13 +236,19 @@ if (BITNESS EQUAL 64)
   target_include_directories(libopenal-guest-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
   endif()
 
-  # disabled for now, headers are platform specific
-  # find_package(SDL2 REQUIRED)
-  # generate(libSDL2)
-  # add_guest_lib(SDL2)
-  # target_include_directories(SDL2-guest PRIVATE ${SDL2_INCLUDE_DIRS})
-  # target_link_libraries(SDL2-guest PRIVATE GL)
-  # target_link_libraries(SDL2-guest PRIVATE dl)
+  # VEXA_FIXES: SDL2 guest thunk (interface+impl based; replaces old stock stub).
+  # SONAME must match the real SDL2 soname so dlopen("libSDL2-2.0.so.0", RTLD_NOLOAD)
+  # re-finds this thunk after the first load (see soname override in add_guest_lib).
+  # SDL2 exports unversioned symbols, so no --version-script/map file is needed.
+  if ((NOT ANDROID AND NOT BUILD_ANDROID) OR NOT VEXA_SDL2_PREFIX STREQUAL "")
+  generate(libSDL2 ${CMAKE_CURRENT_SOURCE_DIR}/../libSDL2/libSDL2_interface.cpp)
+  add_guest_lib(SDL2 "libSDL2-2.0.so.0")
+  target_include_directories(libSDL2-guest-deps INTERFACE ${VEXA_SDL2_PREFIX}/include)
+  # VEXA_FIXES: SDL_vulkan.h pulls vulkan/vulkan.h; reuse the Vulkan-Headers tree.
+  target_include_directories(libSDL2-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+  # VEXA_FIXES: SDL2 guest compat shim dlopens libopenal/libiconv at runtime.
+  target_link_libraries(SDL2-guest PRIVATE dl)
+  endif()
 
   # VEXA_FIXES: Disable Vulkan thunk build when not needed (Hytale is OpenGL-first).
   # Vulkan thunk path pulls Linux desktop headers from Vulkan-Headers (eg xcb),

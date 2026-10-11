@@ -42,6 +42,14 @@ $end_info$
 #endif
 
 namespace FEX::HLE {
+// VEXA_FIXES: Android scudo stores an MTE/TBI tag in the top byte of heap pointers.
+// The kernel reports si_addr with that byte cleared, so a tagged Thread pointer never
+// matches InterruptFaultPage or the JIT guard. The deliberate fault then looks fatal.
+static inline uintptr_t VexaUntagHostPtr(uintptr_t Ptr) {
+  return Ptr & 0x00FF'FFFF'FFFF'FFFFULL;
+}
+
+
 #ifdef ARCHITECTURE_x86_64
 __attribute__((naked)) static void sigrestore() {
   __asm volatile("syscall;" ::"a"(0xF) : "memory");
@@ -727,8 +735,12 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState* 
   }
 
 #ifdef ARCHITECTURE_arm64
-  if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr >= reinterpret_cast<void*>(Thread->JITGuardPage) &&
-      SigInfo.si_addr < reinterpret_cast<void*>(Thread->JITGuardPage + FEXCore::Utils::FEX_PAGE_SIZE)) {
+  const auto VexaFaultAddr = VexaUntagHostPtr(reinterpret_cast<uintptr_t>(SigInfo.si_addr));
+  const auto VexaJitGuard = VexaUntagHostPtr(Thread->JITGuardPage);
+  // VEXA_FIXES: some Android vendor kernels report PROT_NONE faults with SEGV_MAPERR
+  // instead of SEGV_ACCERR. The JIT guard page is always deliberate, so accept both.
+  if (Signal == SIGSEGV && (SigInfo.si_code == SEGV_ACCERR || SigInfo.si_code == SEGV_MAPERR) && VexaJitGuard != 0 &&
+      VexaFaultAddr >= VexaJitGuard && VexaFaultAddr < VexaJitGuard + FEXCore::Utils::FEX_PAGE_SIZE) {
     FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->RestartJump, Thread->JITGuardOverflowArgument,
                                                     ArchHelpers::Context::GetArmGPRs(UContext), ArchHelpers::Context::GetArmFPRs(UContext),
                                                     ArchHelpers::Context::GetArmPc(UContext));
@@ -745,7 +757,12 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   auto SigInfo = *static_cast<siginfo_t*>(Info);
 
   auto MustDeferSignal = (Thread->CurrentFrame->State.DeferredSignalRefCount.Load() != 0);
-  if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr == reinterpret_cast<void*>(&Thread->InterruptFaultPage)) {
+  const auto VexaFaultAddr = VexaUntagHostPtr(reinterpret_cast<uintptr_t>(SigInfo.si_addr));
+  const auto VexaInterruptPage = VexaUntagHostPtr(reinterpret_cast<uintptr_t>(&Thread->InterruptFaultPage));
+  // VEXA_FIXES: some Android vendor kernels report PROT_NONE faults with SEGV_MAPERR
+  // instead of SEGV_ACCERR. A fault at exactly InterruptFaultPage is always deliberate.
+  if (Signal == SIGSEGV && (SigInfo.si_code == SEGV_ACCERR || SigInfo.si_code == SEGV_MAPERR) &&
+      VexaFaultAddr == VexaInterruptPage) {
     if (!MustDeferSignal) {
       // We just reached the end of the outermost signal-deferring section and faulted to check for pending signals.
       // Pull a signal frame off the stack.
