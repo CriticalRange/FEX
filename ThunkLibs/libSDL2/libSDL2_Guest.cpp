@@ -266,6 +266,21 @@ SDL_Scancode CompatScancodeFromKeycode(SDL_Keycode key) {
     return SDL_SCANCODE_SPACE;
   }
 
+  switch (key_value) {
+  case '`': return SDL_SCANCODE_GRAVE;
+  case '-': return SDL_SCANCODE_MINUS;
+  case '=': return SDL_SCANCODE_EQUALS;
+  case '[': return SDL_SCANCODE_LEFTBRACKET;
+  case ']': return SDL_SCANCODE_RIGHTBRACKET;
+  case '\\': return SDL_SCANCODE_BACKSLASH;
+  case ';': return SDL_SCANCODE_SEMICOLON;
+  case '\'': return SDL_SCANCODE_APOSTROPHE;
+  case ',': return SDL_SCANCODE_COMMA;
+  case '.': return SDL_SCANCODE_PERIOD;
+  case '/': return SDL_SCANCODE_SLASH;
+  default: break;
+  }
+
   return SDL_SCANCODE_UNKNOWN;
 }
 

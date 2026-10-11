@@ -1242,6 +1242,43 @@ extern uint64_t g_vexa_diag_draws;
 static int g_vexa_trace_frame = 0;
 // VEXA: set when the guest draws/clears/blits into FB0 during the current frame.
 static bool g_vexa_fb0_drawn = false;
+
+// Per-frame record of which FBOs received draws. Unity GLCore finishes the
+// frame in an offscreen FBO but does not leave it bound at swap time, so the
+// present fallback must find it by draw activity, not by binding.
+struct VexaFrameFbo {
+  GLuint fbo = 0;
+  uint32_t draws = 0;
+  GLint vp_w = 0;
+  GLint vp_h = 0;
+};
+static VexaFrameFbo g_vexa_frame_fbos[32];
+static size_t g_vexa_frame_fbo_count = 0;
+
+static void VexaTrackFrameFbo(GLuint fbo) {
+  if (fbo == 0) {
+    g_vexa_fb0_drawn = true;
+    return;
+  }
+  GLint vp[4] = {};
+  for (size_t i = 0; i < g_vexa_frame_fbo_count; ++i) {
+    if (g_vexa_frame_fbos[i].fbo == fbo) {
+      ++g_vexa_frame_fbos[i].draws;
+      ::glGetIntegerv(GL_VIEWPORT, vp);
+      g_vexa_frame_fbos[i].vp_w = vp[2];
+      g_vexa_frame_fbos[i].vp_h = vp[3];
+      return;
+    }
+  }
+  if (g_vexa_frame_fbo_count < sizeof(g_vexa_frame_fbos) / sizeof(g_vexa_frame_fbos[0])) {
+    ::glGetIntegerv(GL_VIEWPORT, vp);
+    auto& e = g_vexa_frame_fbos[g_vexa_frame_fbo_count++];
+    e.fbo = fbo;
+    e.draws = 1;
+    e.vp_w = vp[2];
+    e.vp_h = vp[3];
+  }
+}
 extern uint64_t g_vexa_diag_clears;
 extern uint64_t g_vexa_diag_useprog;
 extern uint64_t g_vexa_diag_bindfbo;
@@ -1398,12 +1435,18 @@ using VexaGLDebugProc = void(GL_APIENTRYP)(GLenum, GLenum, GLuint, GLenum, GLsiz
 static void GL_APIENTRY VexaGLDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length,
                                             const GLchar* message, const void*) {
   static int logged = 0;
-  if (type != kVexaGLDebugTypeError || logged >= 40) {
+  static std::string last_msg;
+  if (type != kVexaGLDebugTypeError || logged >= 80) {
     return;
   }
+  const std::string msg = message ? message : "";
+  if (msg == last_msg) {
+    return;
+  }
+  last_msg = msg;
   ++logged;
   fprintf(stderr, "[VEXA][GLDBG] src=%x type=%x id=%u sev=%x tid=%ld: %.*s\n", source, type, id, severity,
-          (long)syscall(SYS_gettid), length > 0 ? (int)length : 512, message ? message : "");
+          (long)syscall(SYS_gettid), length > 0 ? (int)length : 512, msg.c_str());
 }
 
 static void VexaInstallGLDebugOnce() {
@@ -1433,37 +1476,59 @@ static void VexaInstallGLDebugOnce() {
 static void VexaPresentFallback() {
   const bool drew_fb0 = g_vexa_fb0_drawn;
   g_vexa_fb0_drawn = false;
-  if (drew_fb0) {
+  const size_t nfbo = g_vexa_frame_fbo_count;
+  g_vexa_frame_fbo_count = 0;
+  if (drew_fb0 || nfbo == 0) {
     return;
   }
-  GLint dfbo = 0;
-  ::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
-  if (dfbo == 0) {
-    return;
-  }
-  GLint type = 0, name = 0;
-  ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
-  ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
-  GLint w = 0, h = 0;
-  if (type == GL_TEXTURE) {
-    GLint level = 0;
-    ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                            GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
-    GLint prev_tex = 0;
-    ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
-    ::glBindTexture(GL_TEXTURE_2D, name);
-    ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_WIDTH, &w);
-    ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_HEIGHT, &h);
-    ::glBindTexture(GL_TEXTURE_2D, prev_tex);
-  } else if (type == GL_RENDERBUFFER) {
-    GLint prev_rb = 0;
-    ::glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
-    ::glBindRenderbuffer(GL_RENDERBUFFER, name);
-    ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &w);
-    ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &h);
-    ::glBindRenderbuffer(GL_RENDERBUFFER, prev_rb);
+  GLint prev_draw_fbo = 0, prev_read_fbo = 0;
+  ::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+  ::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+  // Pick the FBO that actually holds the finished frame: among the FBOs that
+  // received draws this frame, prefer the largest color attachment. A texture
+  // attachment can be presented by the quad path; renderbuffers need the blit.
+  GLint dfbo = 0, type = 0, name = 0, w = 0, h = 0;
+  GLint best_area = 0, best_draws = 0;
+  for (size_t i = 0; i < nfbo; ++i) {
+    const GLuint cand = g_vexa_frame_fbos[i].fbo;
+    ::glBindFramebuffer(GL_READ_FRAMEBUFFER, cand);
+    GLint ctype = 0, cname = 0;
+    ::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &ctype);
+    ::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &cname);
+    GLint cw = 0, ch = 0;
+    if (ctype == GL_TEXTURE) {
+      GLint level = 0, prev_tex = 0;
+      ::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                              GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+      ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+      ::glBindTexture(GL_TEXTURE_2D, cname);
+      ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_WIDTH, &cw);
+      ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_HEIGHT, &ch);
+      ::glBindTexture(GL_TEXTURE_2D, prev_tex);
+    } else if (ctype == GL_RENDERBUFFER) {
+      GLint prev_rb = 0;
+      ::glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
+      ::glBindRenderbuffer(GL_RENDERBUFFER, cname);
+      ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &cw);
+      ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &ch);
+      ::glBindRenderbuffer(GL_RENDERBUFFER, prev_rb);
+    }
+    const GLint area = cw * ch;
+    const bool better =
+        area > best_area || (area == best_area && area > 0 &&
+                             ((ctype == GL_TEXTURE && type != GL_TEXTURE) ||
+                              g_vexa_frame_fbos[i].draws > best_draws));
+    if (better) {
+      best_area = area;
+      best_draws = g_vexa_frame_fbos[i].draws;
+      dfbo = cand;
+      type = ctype;
+      name = cname;
+      w = cw;
+      h = ch;
+    }
   }
   EGLint sw = 0, sh = 0;
   eglQuerySurface(g_vexa_glx.display, g_vexa_glx.surface, EGL_WIDTH, &sw);
@@ -1471,32 +1536,175 @@ static void VexaPresentFallback() {
   static int logged = 0;
   if (logged < 3) {
     ++logged;
-    fprintf(stderr, "[VEXA][PRESENT] fallback fbo=%d att_type=0x%x name=%d %dx%d -> surface %dx%d\n", dfbo, type, name,
-            w, h, sw, sh);
+    fprintf(stderr, "[VEXA][PRESENT] fallback fbo=%d att_type=0x%x name=%d %dx%d draws=%d -> surface %dx%d\n", dfbo,
+            type, name, w, h, best_draws, sw, sh);
   }
   if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0) {
+    ::glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
     return;
   }
-  GLint rfbo = 0;
-  ::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfbo);
-  GLint read_buf = GL_COLOR_ATTACHMENT0;
-  const GLboolean scissor = ::glIsEnabled(GL_SCISSOR_TEST);
-  ::glDisable(GL_SCISSOR_TEST);
-  ::glBindFramebuffer(GL_READ_FRAMEBUFFER, dfbo);
-  ::glGetIntegerv(GL_READ_BUFFER, &read_buf);
-  ::glReadBuffer(GL_COLOR_ATTACHMENT0);
-  ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-  ::glBlitFramebuffer(0, 0, w, h, 0, 0, sw, sh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-  const GLenum err = ::glGetError();
-  if (err != GL_NO_ERROR && logged < 6) {
-    ++logged;
-    fprintf(stderr, "[VEXA][PRESENT] fallback blit err=0x%x\n", err);
+  // Sample the winner's pixels at a few points in time: tells us whether the
+  // frame FBO actually contains rendered content or the game outputs black.
+  {
+    static int calls = 0, sampled = 0;
+    ++calls;
+    if (calls == 5 || calls == 500 || calls == 1500 || calls == 3000 || calls == 8000) {
+      ++sampled;
+      ::glBindFramebuffer(GL_READ_FRAMEBUFFER, dfbo);
+      while (::glGetError() != GL_NO_ERROR) {
+      }
+      ::glReadBuffer(GL_COLOR_ATTACHMENT0);
+      GLubyte px[9 * 4];
+      int nonzero = 0;
+      for (int i = 0; i < 9; ++i) {
+        ::glReadPixels(w * (i % 3 + 1) / 4, h * (i / 3 + 1) / 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px + i * 4);
+      }
+      const GLenum serr = ::glGetError();
+      for (int i = 0; i < 9; ++i) {
+        if (px[i * 4] || px[i * 4 + 1] || px[i * 4 + 2]) {
+          ++nonzero;
+        }
+      }
+      fprintf(stderr,
+              "[VEXA][PRESENT] fbo%d src nz=%d err=0x%x: %02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x "
+              "%02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x\n",
+              dfbo, nonzero, serr, px[0], px[1], px[2], px[4], px[5], px[6], px[8], px[9], px[10], px[12], px[13],
+              px[14], px[16], px[17], px[18], px[20], px[21], px[22], px[24], px[25], px[26], px[28], px[29], px[30],
+              px[32], px[33], px[34]);
+      if (w > 0 && h > 0 && w <= 4096 && h <= 4096) {
+        std::vector<GLubyte> img(static_cast<size_t>(w) * h * 4);
+        ::glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+        char path[128];
+        snprintf(path, sizeof(path), "/data/data/com.critical.vexaemulator/files/artifacts/megabonk/fbo%d_%d.ppm",
+                 dfbo, sampled);
+        if (FILE* f = fopen(path, "wb")) {
+          fprintf(f, "P6\n%d %d\n255\n", w, h);
+          for (int y = h - 1; y >= 0; --y) {
+            for (int x = 0; x < w; ++x) {
+              const GLubyte* p = img.data() + (static_cast<size_t>(y) * w + x) * 4;
+              fwrite(p, 1, 3, f);
+            }
+          }
+          fclose(f);
+          fprintf(stderr, "[VEXA][PRESENT] dumped %dx%d fbo%d to %s\n", w, h, dfbo, path);
+        }
+      }
+      ::glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
+    }
   }
-  ::glReadBuffer(read_buf);
-  ::glBindFramebuffer(GL_READ_FRAMEBUFFER, rfbo);
-  ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dfbo);
-  if (scissor) {
-    ::glEnable(GL_SCISSOR_TEST);
+  // The blit path fails on ES when the guest FBO's color format differs from
+  // the surface (e.g. RGBA16F -> RGBA8), which is exactly what Unity GLCore
+  // does. A textured quad draw converts formats in the shader instead.
+  bool presented = false;
+  if (type == GL_TEXTURE && w > 0 && h > 0) {
+    static GLuint quad_prog = 0;
+    static GLuint quad_vao = 0;
+    if (quad_prog == 0) {
+      const char* vs_src =
+          "#version 320 es\n"
+          "layout(location=0) out vec2 uv;\n"
+          "void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+          "  uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }";
+      const char* fs_src =
+          "#version 320 es\n"
+          "precision mediump float;\n"
+          "layout(location=0) in vec2 uv;\n"
+          "layout(location=0) out vec4 frag;\n"
+          "uniform sampler2D tex;\n"
+          "void main() { frag = texture(tex, uv); }";
+      GLuint vs = ::glCreateShader(GL_VERTEX_SHADER);
+      GLuint fs = ::glCreateShader(GL_FRAGMENT_SHADER);
+      ::glShaderSource(vs, 1, &vs_src, nullptr);
+      ::glShaderSource(fs, 1, &fs_src, nullptr);
+      ::glCompileShader(vs);
+      ::glCompileShader(fs);
+      quad_prog = ::glCreateProgram();
+      ::glAttachShader(quad_prog, vs);
+      ::glAttachShader(quad_prog, fs);
+      ::glLinkProgram(quad_prog);
+      GLint ok = 0;
+      ::glGetProgramiv(quad_prog, GL_LINK_STATUS, &ok);
+      if (!ok) {
+        ::glDeleteProgram(quad_prog);
+        quad_prog = 0;
+      }
+      ::glDeleteShader(vs);
+      ::glDeleteShader(fs);
+      ::glGenVertexArrays(1, &quad_vao);
+    }
+    if (quad_prog != 0) {
+      while (::glGetError() != GL_NO_ERROR) {
+      }
+      GLint prev_prog = 0, prev_vao = 0, prev_tex = 0, prev_active = 0;
+      GLint prev_vp[4] = {};
+      ::glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+      ::glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
+      ::glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+      ::glActiveTexture(GL_TEXTURE0);
+      ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+      ::glGetIntegerv(GL_VIEWPORT, prev_vp);
+      const GLboolean was_scissor = ::glIsEnabled(GL_SCISSOR_TEST);
+      const GLboolean was_depth = ::glIsEnabled(GL_DEPTH_TEST);
+      const GLboolean was_stencil = ::glIsEnabled(GL_STENCIL_TEST);
+      const GLboolean was_blend = ::glIsEnabled(GL_BLEND);
+      const GLboolean was_cull = ::glIsEnabled(GL_CULL_FACE);
+      const GLboolean was_discard = ::glIsEnabled(GL_RASTERIZER_DISCARD);
+      ::glDisable(GL_SCISSOR_TEST);
+      ::glDisable(GL_DEPTH_TEST);
+      ::glDisable(GL_STENCIL_TEST);
+      ::glDisable(GL_BLEND);
+      ::glDisable(GL_CULL_FACE);
+      ::glDisable(GL_RASTERIZER_DISCARD);
+      ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+      ::glViewport(0, 0, sw, sh);
+      ::glUseProgram(quad_prog);
+      ::glBindVertexArray(quad_vao);
+      ::glBindTexture(GL_TEXTURE_2D, name);
+      ::glDrawArrays(GL_TRIANGLES, 0, 3);
+      const GLenum err = ::glGetError();
+      if (err != GL_NO_ERROR && logged < 6) {
+        ++logged;
+        fprintf(stderr, "[VEXA][PRESENT] fallback quad err=0x%x\n", err);
+      } else if (logged < 6) {
+        ++logged;
+        fprintf(stderr, "[VEXA][PRESENT] fallback quad drew tex=%d\n", name);
+      }
+      presented = true;
+      ::glBindTexture(GL_TEXTURE_2D, prev_tex);
+      ::glActiveTexture(prev_active);
+      ::glBindVertexArray(prev_vao);
+      ::glUseProgram(prev_prog);
+      ::glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+      if (was_scissor) ::glEnable(GL_SCISSOR_TEST);
+      if (was_depth) ::glEnable(GL_DEPTH_TEST);
+      if (was_stencil) ::glEnable(GL_STENCIL_TEST);
+      if (was_blend) ::glEnable(GL_BLEND);
+      if (was_cull) ::glEnable(GL_CULL_FACE);
+      if (was_discard) ::glEnable(GL_RASTERIZER_DISCARD);
+      ::glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
+      ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw_fbo);
+    }
+  }
+  if (!presented) {
+    GLint read_buf = GL_COLOR_ATTACHMENT0;
+    const GLboolean scissor = ::glIsEnabled(GL_SCISSOR_TEST);
+    ::glDisable(GL_SCISSOR_TEST);
+    ::glBindFramebuffer(GL_READ_FRAMEBUFFER, dfbo);
+    ::glGetIntegerv(GL_READ_BUFFER, &read_buf);
+    ::glReadBuffer(GL_COLOR_ATTACHMENT0);
+    ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    ::glBlitFramebuffer(0, 0, w, h, 0, 0, sw, sh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    const GLenum err = ::glGetError();
+    if (err != GL_NO_ERROR && logged < 6) {
+      ++logged;
+      fprintf(stderr, "[VEXA][PRESENT] fallback blit err=0x%x\n", err);
+    }
+    ::glReadBuffer(read_buf);
+    ::glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
+    ::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw_fbo);
+    if (scissor) {
+      ::glEnable(GL_SCISSOR_TEST);
+    }
   }
 }
 
@@ -1990,9 +2198,7 @@ static GLuint g_vexa_diag_drawfbo = 0;
 
 static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
   ++g_vexa_diag_draws;
-  if (g_vexa_diag_drawfbo == 0) {
-    g_vexa_fb0_drawn = true;
-  }
+  VexaTrackFrameFbo(g_vexa_diag_drawfbo);
   if (g_vexa_trace_frame) {
     GLint dfbo = -1;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
@@ -2006,6 +2212,64 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
             (unsigned long long)g_vexa_diag_draws, name, mode, count, g_vexa_diag_curfbo,
             g_vexa_diag_curprog, (unsigned long long)g_vexa_diag_clears, err);
   }
+}
+
+// Diagnose a failed draw: report the framebuffer completeness, its color
+// attachment, and the program link state while state is still current.
+static void VexaPostDrawDiag() {
+  const GLenum err = ::glGetError();
+  if (err == GL_NO_ERROR) {
+    return;
+  }
+  static int logged = 0;
+  if (logged >= 20) {
+    return;
+  }
+  ++logged;
+  GLint dfbo = -1, prog = -1, link = -1, st = -1, atype = 0, aname = 0;
+  ::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+  ::glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+  if (prog > 0) {
+    ::glGetProgramiv(prog, GL_LINK_STATUS, &link);
+  }
+  if (dfbo > 0) {
+    st = ::glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &atype);
+    ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &aname);
+  }
+  GLint vao = -1, ab = -1, eab = -1;
+  ::glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+  ::glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &ab);
+  ::glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &eab);
+  // Feedback-loop check: is the draw FBO's texture bound for sampling?
+  int feedback_unit = -1;
+  if (atype == GL_TEXTURE && aname > 0) {
+    GLint prev_active = GL_TEXTURE0;
+    ::glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    for (int u = 0; u < 16; ++u) {
+      ::glActiveTexture(GL_TEXTURE0 + u);
+      GLint bound = 0;
+      ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+      if (bound == aname) {
+        feedback_unit = u;
+        break;
+      }
+    }
+    ::glActiveTexture(prev_active);
+  }
+  int attribs_on = 0;
+  for (int a = 0; a < 16; ++a) {
+    GLint en = 0;
+    ::glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
+    if (en) {
+      attribs_on |= 1 << a;
+    }
+  }
+  fprintf(stderr,
+          "[VEXA][GL] drawfail err=0x%x fbo=%d status=0x%x att=0x%x/%d prog=%d link=%d vao=%d ab=%d eab=%d attribs=0x%x fbunit=%d\n",
+          err, dfbo, st, atype, aname, prog, link, vao, ab, eab, attribs_on, feedback_unit);
 }
 
 static void fexfn_impl_libGL_glUseProgram(GLuint program) {
@@ -2059,22 +2323,26 @@ static void fexfn_impl_libGL_glClear(GLbitfield mask) {
 static void fexfn_impl_libGL_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   VexaDiagDraw("arrays", mode, count);
   ::glDrawArrays(mode, first, count);
+  VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
   VexaDiagDraw("elements", mode, count);
   ::glDrawElements(mode, count, type, indices);
+  VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
   VexaDiagDraw("arrays_inst", mode, count * primcount);
   ::glDrawArraysInstanced(mode, first, count, primcount);
+  VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                      GLsizei primcount) {
   VexaDiagDraw("elements_inst", mode, count * primcount);
   ::glDrawElementsInstanced(mode, count, type, indices, primcount);
+  VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
@@ -2091,6 +2359,7 @@ static void fexfn_impl_libGL_glDrawElementsBaseVertex(GLenum mode, GLsizei count
                                                       GLint basevertex) {
   VexaDiagDraw("elements_basev", mode, count);
   ::glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+  VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type,
@@ -2707,12 +2976,14 @@ static void fexfn_impl_libGL_glDrawRangeElements(GLenum mode, GLuint start, GLui
   (void)start; (void)end;
   VexaDiagDraw("range_elements", mode, count);
   ::glDrawElements(mode, count, type, indices);
+  VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices, GLint basevertex) {
   (void)start; (void)end;
   VexaDiagDraw("range_elements_bv", mode, count);
   ::glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+  VexaPostDrawDiag();
 }
 
 using VexaDrawArraysInstBIFn = void (*)(GLenum, GLint, GLsizei, GLsizei, GLuint);
@@ -2721,6 +2992,7 @@ static void fexfn_impl_libGL_glDrawArraysInstancedBaseInstance(GLenum mode, GLin
   static auto fn = reinterpret_cast<VexaDrawArraysInstBIFn>(eglGetProcAddress("glDrawArraysInstancedBaseInstanceEXT"));
   if (fn) { fn(mode, first, count, primcount, baseinstance); return; }
   ::glDrawArraysInstanced(mode, first, count, primcount);
+  VexaPostDrawDiag();
 }
 
 using VexaDrawElemsInstBIFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLuint);
@@ -2729,6 +3001,7 @@ static void fexfn_impl_libGL_glDrawElementsInstancedBaseInstance(GLenum mode, GL
   static auto fn = reinterpret_cast<VexaDrawElemsInstBIFn>(eglGetProcAddress("glDrawElementsInstancedBaseInstanceEXT"));
   if (fn) { fn(mode, count, type, indices, primcount, baseinstance); return; }
   ::glDrawElementsInstanced(mode, count, type, indices, primcount);
+  VexaPostDrawDiag();
 }
 
 using VexaDrawElemsInstBVBiIFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint, GLuint);
@@ -3420,11 +3693,12 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
   }
   const GLubyte* result = ::glGetString(name);
   if (!result) {
+    static const GLubyte kNoContextString[] = "";
     fprintf(stderr,
-                 "[libGL-host] glGetString(name=0x%x/%s) => null\n",
+                 "[libGL-host] glGetString(name=0x%x/%s) => null; returning empty string\n",
                  static_cast<unsigned>(name),
                  GLHostGLStringName(name));
-    return nullptr;
+    return kNoContextString;
   }
 
   fprintf(stderr,
