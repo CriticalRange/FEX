@@ -3586,6 +3586,72 @@ static void VexaStripDesktopArbExtensions(std::string* source) {
 #endif
 
 // VEXA_FIXES: Central shader-source bridge used by both glShaderSource and glShaderSourceARB.
+//
+// A note on the grass shader, since it looks like an easy fix and is not.
+// Mali reports GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS == 0, so Unity's
+// `Custom/GrassShaderOptimized` - which emits a vertex SSBO indexed by
+// gl_InstanceID - cannot link, and Unity draws the grass with a black
+// fallback. Rewriting `buffer` to `uniform` gets past the link error and then
+// fails with S0018, because ES forbids an unsized array in a uniform block.
+// Sizing it does not help either: Unity binds its instance data on the
+// shader-storage binding point, so a uniform block at the same binding point
+// has nothing behind it. Lowering the reported GL version does not help
+// either - Unity picks its shader target from the extension list, not from
+// GL_VERSION, and emits `#version 430` regardless. Two dead ends, both tried,
+// both reverted. What is left is dumping the source when a shader fails so the
+// next failure can be reasoned about from the outside.
+
+#include <mutex>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unordered_map>
+
+// VEXA_FIXES: Keep the last source we handed to each shader so a compile failure
+// can be dumped in full. The driver only reports a line and column, which is not
+// enough to reason about a rewritten shader from the outside.
+static std::mutex VexaShaderSourceMutex;
+static std::unordered_map<GLuint, std::string> VexaShaderSourceById;
+
+static void VexaRememberShaderSource(GLuint shader, const std::string& source) {
+  if (source.empty()) {
+    return;
+  }
+  std::lock_guard lk(VexaShaderSourceMutex);
+  if (VexaShaderSourceById.size() > 512) {
+    VexaShaderSourceById.clear();
+  }
+  VexaShaderSourceById[shader] = source;
+}
+
+static void VexaDumpFailedShaderSource(GLuint shader, const char* info) {
+  std::string source;
+  {
+    std::lock_guard lk(VexaShaderSourceMutex);
+    const auto it = VexaShaderSourceById.find(shader);
+    if (it == VexaShaderSourceById.end()) {
+      return;
+    }
+    source = it->second;
+  }
+  // The dump directory lives in app-private storage and is not created by the
+  // runtime, so make it on first use.
+  ::mkdir("/data/data/com.critical.vexaemulator/files/artifacts", 0755);
+  ::mkdir("/data/data/com.critical.vexaemulator/files/artifacts/shaders", 0755);
+  char path[256];
+  std::snprintf(path, sizeof(path), "/data/data/com.critical.vexaemulator/files/artifacts/shaders/failed_%u.glsl",
+                static_cast<unsigned>(shader));
+  FILE* f = fopen(path, "wb");
+  if (!f) {
+    fprintf(stderr, "[libGL-host] dump failed for shader %u: cannot open %s\n", static_cast<unsigned>(shader), path);
+    return;
+  }
+  fprintf(f, "// driver log: %s\n", info ? info : "");
+  fwrite(source.data(), 1, source.size(), f);
+  fclose(f);
+  fprintf(stderr, "[libGL-host] dumped failed shader %u -> %s (%zu bytes)\n",
+          static_cast<unsigned>(shader), path, source.size());
+}
+
 static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length) {
   GLHOST_TRACE_SCOPE();
   const auto host_strings = reinterpret_cast<const GLchar* const*>(strings);
@@ -3734,6 +3800,13 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
                 static_cast<unsigned>(shader_type),
                 source.size(),
                 source.find("layout(binding") != std::string::npos ? 1 : 0);
+        if (shader_type == GL_VERTEX_SHADER) {
+          // Diagnostic only: report whether a vertex SSBO was present. The
+          // buffer->uniform rewrite that used to live here was a dead end -
+          // Unity binds its instance data on the shader-storage binding point,
+          // so a uniform block at the same binding point reads nothing.
+          VexaRememberShaderSource(shader, source);
+        }
         const GLchar* rewritten = source.c_str();
         ::glShaderSource(shader, 1, &rewritten, nullptr);
         return;
@@ -3772,15 +3845,18 @@ GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVis
 // Godot 3's Linux export is GLES-over-GL and rejects anything below desktop
 // OpenGL 3.3, and needs a desktop framebuffer extension name before it will
 // create a device. Framebuffer objects are core on this GLES 3.2 driver; only
-// the name differs. The compute / SSBO / image / indirect names are the ones
-// Unity checks before it allows compute, shader storage buffers, images and
-// indirect draws.
+// the name differs.
+//
+// GL_ARB_shader_storage_buffer_object is deliberately absent. Unity picks its
+// shader target from the extension list rather than GL_VERSION, so with the
+// name present it keeps emitting `#version 430` and a vertex SSBO, which this
+// Mali cannot link (GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS == 0). Without the name
+// it emits the 3.3 uniform-block form instead.
 static const char* const kVexaDesktopSpoofExts[] = {
   "GL_ARB_framebuffer_object",
   "GL_EXT_framebuffer_object",
   "GL_ARB_draw_indirect",
   "GL_ARB_compute_shader",
-  "GL_ARB_shader_storage_buffer_object",
   "GL_ARB_shader_image_load_store",
 };
 static constexpr unsigned kVexaDesktopSpoofExtCount =
@@ -3795,6 +3871,9 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
   // OpenGL 3.3. Mali reports "OpenGL ES 3.2", so both the GLES3 and GLES2
   // viability checks fail before a frame is drawn.
   if (name == GL_VERSION) {
+    // 4.3 is required: Unity's shader target selection ignores this value and
+    // the extension list, and emits `#version 430` either way. Reporting 3.3
+    // changes nothing except the driver's expectations, so keep 4.3.
     static const GLubyte kDesktopVersion[] = "4.3.0";
     fprintf(stderr,
                  "[libGL-host] glGetString(GL_VERSION) desktop spoof => '%s'\n",
@@ -4689,6 +4768,7 @@ void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
       }
       fprintf(stderr, "[libGL-host] shader compile failed type=0x%x log=%.240s\n",
               static_cast<unsigned>(shader_type), info.c_str());
+      VexaDumpFailedShaderSource(a_0, info.c_str());
     }
   }
 #if defined(VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR)
