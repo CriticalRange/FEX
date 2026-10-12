@@ -2284,6 +2284,11 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
 // Diagnose a failed draw: report the framebuffer completeness, its color
 // attachment, and the program link state while state is still current.
 static void VexaPostDrawDiag() {
+  // glGetError() on a tiled GPU drains the command pipeline, so calling it
+  // after every draw costs real frame time. Diagnostic only.
+  if (!GLHostTraceEnabled()) {
+    return;
+  }
   const GLenum err = ::glGetError();
   if (err == GL_NO_ERROR) {
     return;
@@ -2393,6 +2398,12 @@ static void fexfn_impl_libGL_glClear(GLbitfield mask) {
 // once (to drive a desktop->GLES allowlist) and drains the error queue so stale
 // state cannot leak into the guest's later glGetError reads.
 static void VexaGLEnumCompat(const char* what, GLenum value) {
+  // Draining the error queue costs a round trip to the driver, and Unity sets
+  // these caps several times per draw. Behind a trace flag only: otherwise the
+  // guest's own glGetError sees the error, which is where it belongs anyway.
+  if (!GLHostTraceEnabled()) {
+    return;
+  }
   static GLenum seen[64];
   static int seen_n = 0;
   while (::glGetError() != GL_NO_ERROR) {
