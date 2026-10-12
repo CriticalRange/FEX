@@ -287,8 +287,6 @@
   OP(glClearDepthf) \
   OP(glClearDepthfOES) \
   OP(glClearDepth) \
-  OP(glEnable) \
-  OP(glDisable) \
   OP(glBlendFunc) \
   OP(glBlendFuncSeparate) \
   OP(glBlendEquation) \
@@ -360,8 +358,6 @@
   OP(glBindTexture) \
   OP(glTexImage2D) \
   OP(glTexSubImage2D) \
-  OP(glTexParameteri) \
-  OP(glTexParameterf) \
   OP(glTexStorage2D) \
   OP(glGetTexParameteriv) \
   OP(glCompressedTexImage2D) \
