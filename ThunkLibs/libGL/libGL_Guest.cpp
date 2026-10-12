@@ -870,7 +870,8 @@ constexpr uintptr_t kCompatVisual = 0x47585649ULL;   // "GXVI"
 constexpr uintptr_t kCompatFBConfig = 0x47584642ULL; // "GXFB"
 constexpr unsigned long kCompatDrawable = 1UL;
 constexpr unsigned long kCompatPbuffer = 1UL;
-static void* g_vexa_current_context = nullptr;
+static thread_local void* g_vexa_current_context = nullptr;
+static thread_local unsigned long g_vexa_current_drawable = 0;
 
 #define VEXA_GL_GUEST_EXPORT __attribute__((visibility("default")))
 
@@ -928,15 +929,15 @@ VEXA_GL_GUEST_EXPORT void* glXChooseVisual(void* /*display*/, int /*screen*/, in
   return VexaGlxVisualInfo();
 }
 
-VEXA_GL_GUEST_EXPORT void* glXCreateContext(void* /*display*/, void* /*visual*/, void* /*share_list*/, int /*direct*/) {
+VEXA_GL_GUEST_EXPORT void* glXCreateContext(void* /*display*/, void* /*visual*/, void* share_list, int /*direct*/) {
   fprintf(stderr, "[libGL thunk] compat glXCreateContext\n");
-  return reinterpret_cast<void*>(kCompatContext);
+  return reinterpret_cast<void*>(fexfn_pack_VEXA_CreateGlxContext(reinterpret_cast<uintptr_t>(share_list)));
 }
 
-VEXA_GL_GUEST_EXPORT void* glXCreateContextAttribsARB(void* /*display*/, void* /*config*/, void* /*share_list*/, int /*direct*/,
+VEXA_GL_GUEST_EXPORT void* glXCreateContextAttribsARB(void* /*display*/, void* /*config*/, void* share_list, int /*direct*/,
                                                       const int* /*attribs*/) {
   fprintf(stderr, "[libGL thunk] compat glXCreateContextAttribsARB\n");
-  return reinterpret_cast<void*>(kCompatContext);
+  return reinterpret_cast<void*>(fexfn_pack_VEXA_CreateGlxContext(reinterpret_cast<uintptr_t>(share_list)));
 }
 
 // Desktop GL attaches one slice of a 3D texture with glFramebufferTexture3D.
@@ -961,6 +962,7 @@ VEXA_GL_GUEST_EXPORT void VexaCompat_glFramebufferTexture1D(unsigned int target,
 
 VEXA_GL_GUEST_EXPORT void glXDestroyContext(void* /*display*/, void* context) {
   fprintf(stderr, "[libGL thunk] compat glXDestroyContext context=%p\n", context);
+  fexfn_pack_VEXA_DestroyGlxContext(reinterpret_cast<uintptr_t>(context));
 }
 
 VEXA_GL_GUEST_EXPORT void* glXGetCurrentContext() {
@@ -968,12 +970,13 @@ VEXA_GL_GUEST_EXPORT void* glXGetCurrentContext() {
 }
 
 VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentDrawable() {
-  return kCompatDrawable;
+  return g_vexa_current_drawable;
 }
 
 VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawable, void* context) {
   fprintf(stderr, "[libGL thunk] compat glXMakeCurrent drawable=%lu context=%p\n", drawable, context);
   g_vexa_current_context = context;
+  g_vexa_current_drawable = context ? drawable : 0;
   vexa_ff::init_matrices();
   if (!context) {
     const int released = fexfn_pack_VEXA_ReleaseGlxSurface();
@@ -982,7 +985,7 @@ VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawabl
     }
     return released;
   }
-  const int bound = fexfn_pack_VEXA_BindGlxSurface();
+  const int bound = fexfn_pack_VEXA_BindGlxSurface(reinterpret_cast<uintptr_t>(context));
   if (!bound) {
     fprintf(stderr, "[libGL thunk] glXMakeCurrent bind failed\n");
   }
@@ -990,6 +993,60 @@ VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawabl
 }
 
 VEXA_GL_GUEST_EXPORT void glXSwapBuffers(void* /*display*/, unsigned long drawable) {
+  static unsigned diag_swaps;
+  if (++diag_swaps % 120 == 0 && access("/tmp/vexa-unity-refresh", F_OK) == 0) {
+    Dl_info info {};
+    const unsigned char build_id[] = {0xb4,0x4d,0x37,0x66,0x01,0xaf,0x15,0xf4,0x48,0x66,0xad,0x62,0x23,0x20,0xc9,0xa8,0x4d,0xfe,0xa7,0x87};
+    if (dladdr(__builtin_return_address(0), &info) && info.dli_fbase && info.dli_fname && strstr(info.dli_fname,"UnityPlayer.so")) {
+      auto base = reinterpret_cast<unsigned char*>(info.dli_fbase);
+      if (!memcmp(base + 0x2b8, build_id, sizeof(build_id))) {
+        auto geti = [&](uintptr_t offset) { return reinterpret_cast<int (*)(void)>(base + offset)(); };
+        auto getf = [&](uintptr_t offset) { return reinterpret_cast<float (*)(void)>(base + offset)(); };
+        fprintf(stderr, "[VEXA][DIAG] Unity frame=%d time=%f scale=%f screen=%dx%d focused=%d cameras=%d\n",
+                geti(0x782f50), getf(0x782ab0), getf(0x782f20), geti(0x765570), geti(0x765580), static_cast<int>(reinterpret_cast<unsigned char (*)(void)>(base + 0x75f240)()), geti(0x762970));
+        if (diag_swaps == 120) {
+          int w=0,h=0;
+          reinterpret_cast<void (*)(int,int*,int*)>(base+0x765460)(0,&w,&h);
+          fprintf(stderr,"[VEXA][DIAG] display BEFORE count=%d render=%dx%d\n",geti(0xde0670),w,h);
+          reinterpret_cast<unsigned char (*)(void)>(base+0xde04c0)();
+          reinterpret_cast<void (*)(int,int*,int*)>(base+0x765460)(0,&w,&h);
+          fprintf(stderr,"[VEXA][DIAG] display AFTER count=%d render=%dx%d\n",geti(0xde0670),w,h);
+        }
+        if (diag_swaps == 120 || diag_swaps == 1200) {
+          auto mgr = *reinterpret_cast<unsigned char**>(base + 0x1f2e730);
+          for (int list : {0x10, 0x38}) {
+            auto ids = *reinterpret_cast<int**>(mgr + list);
+            int count = *reinterpret_cast<int*>(mgr + list + 0x10);
+            fprintf(stderr, "[VEXA][DIAG] camera list=%x count=%d\n", list, count);
+            for (int i=0; ids && i<count && i<16; ++i) {
+              auto obj = reinterpret_cast<unsigned char* (*)(int)>(base + 0x780940)(ids[i]);
+              auto cam = obj ? *reinterpret_cast<unsigned char**>(obj + 0x10) : nullptr;
+              auto global = *reinterpret_cast<unsigned char***>(base+0x1ee55f0);
+              auto table = global ? *global : nullptr;
+              if (table) {
+                auto records = *reinterpret_cast<unsigned char**>(table);
+                auto mask = *reinterpret_cast<unsigned int*>(table+8);
+                fprintf(stderr, "[VEXA][DIAG] obj=%p cached=%p hashmask=%x\n", obj,cam,mask);
+                if (records && mask < 0x1000000) for (size_t o=0; o < (size_t(mask)+8)*3; o+=24) {
+                  if (*reinterpret_cast<int*>(records+o+8)==ids[i]) {
+                    cam=*reinterpret_cast<unsigned char**>(records+o+16);
+                    break;
+                  }
+                }
+              }
+              if (!cam) continue;
+              auto ci = [&](uintptr_t off) { return reinterpret_cast<int (*)(void*)>(base+off)(cam); };
+              auto rt = reinterpret_cast<void* (*)(void*)>(base+0x93e490)(cam);
+              float rect[4]{};
+              reinterpret_cast<void (*)(void*,float*)>(base+0x761f20)(cam, rect);
+              fprintf(stderr, "[VEXA][DIAG] camera id=%d native=%p size=%dx%d rect=%f,%f,%f,%f mask=%x target=%p display=%d clear=%d\n", ids[i], cam, ci(0x761f50), ci(0x761f60), rect[0],rect[1],rect[2],rect[3],ci(0x7618b0),rt,ci(0x762000),ci(0x761b80));
+            }
+          }
+        }
+
+      }
+    }
+  }
   if (GLGuestTraceEnabled()) {
     fprintf(stderr, "[libGL thunk] compat glXSwapBuffers drawable=%lu\n", drawable);
   }
@@ -1100,6 +1157,21 @@ static int vexa_glx_attrib(int attribute, int* value) {
     case 0x8011: *value = 1; break;
     case 0x8012: *value = 1; break;
     case 0x8013: *value = 1; break;
+    // Size limits. Unity clamps its backbuffer to GLX_MAX_BUFFER_SIZE, and a
+    // zero here makes it fall back to a tiny fixed swapchain instead of the real
+    // window size, so report the Android surface scale rather than nothing.
+    case 0x8043:  // GLX_MAX_BUFFER_SIZE
+    case 0x8073:  // GLX_MAX_TEXTURE_SIZE
+    case 0x8016:  // GLX_MAX_TEXTURE_WIDTH
+    case 0x8017:  // GLX_MAX_TEXTURE_HEIGHT
+    case 0x801E: {  // GLX_MAX_RENDERBUFFER_SIZE
+      unsigned int w = 1280, h = 720;
+      VexaGuestWindowSize(&w, &h);
+      const int limit = (w > h ? w : h) * 4;
+      *value = limit < 4096 ? 4096 : limit;
+      break;
+    }
+    case 0x80A9: *value = 0; break;  // GLX_SAMPLES
     default: *value = 0; break;
   }
   return 0;
@@ -1162,7 +1234,7 @@ VEXA_GL_GUEST_EXPORT unsigned long glXCreatePixmap(void*, void*, unsigned long, 
 VEXA_GL_GUEST_EXPORT unsigned long glXCreateWindow(void*, void*, unsigned long, const int*) { return kCompatDrawable; }
 VEXA_GL_GUEST_EXPORT void glXDestroyPixmap(void*, unsigned long) {}
 VEXA_GL_GUEST_EXPORT void glXDestroyWindow(void*, unsigned long) {}
-VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentReadDrawable(void) { return kCompatDrawable; }
+VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentReadDrawable(void) { return g_vexa_current_drawable; }
 VEXA_GL_GUEST_EXPORT int glXQueryContext(void*, void*, int attribute, int* value) {
   return vexa_glx_attrib(attribute, value);
 }

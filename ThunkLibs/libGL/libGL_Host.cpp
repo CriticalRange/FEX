@@ -1405,8 +1405,79 @@ static bool VexaEnsureGlx() {
   return true;
 }
 
-static auto fexfn_impl_libGL_VEXA_BindGlxSurface() -> int {
-  return VexaEnsureGlx() ? 1 : 0;
+struct VexaGuestGlxContext {
+  EGLContext context = EGL_NO_CONTEXT;
+  EGLSurface pbuffer = EGL_NO_SURFACE;
+  bool window = false;
+};
+static std::mutex g_vexa_context_mutex;
+static std::unordered_map<uintptr_t, VexaGuestGlxContext> g_vexa_contexts;
+
+static auto fexfn_impl_libGL_VEXA_CreateGlxContext(uintptr_t share) -> uintptr_t {
+  std::lock_guard lock(g_vexa_context_mutex);
+  // Initialize the shared display/config/surface once. The bootstrap context
+  // is only used to select a supported GLES version, never returned to guests.
+  if (!g_vexa_glx.ready) {
+    if (!VexaEnsureGlx()) return 0;
+    eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  }
+  EGLContext shared = EGL_NO_CONTEXT;
+  if (share) {
+    auto it = g_vexa_contexts.find(share);
+    if (it == g_vexa_contexts.end()) return 0;
+    shared = it->second.context;
+  }
+  EGLint major = 3, minor = 0;
+  eglQueryContext(g_vexa_glx.display, g_vexa_glx.context, EGL_CONTEXT_CLIENT_VERSION, &major);
+  eglQueryContext(g_vexa_glx.display, g_vexa_glx.context, EGL_CONTEXT_MINOR_VERSION, &minor);
+  const EGLint attrs[] = {EGL_CONTEXT_MAJOR_VERSION, major, EGL_CONTEXT_MINOR_VERSION, minor, EGL_NONE};
+  EGLContext context = eglCreateContext(g_vexa_glx.display, g_vexa_glx.config, shared, attrs);
+  if (context == EGL_NO_CONTEXT) {
+    fprintf(stderr, "[VEXA][GLX] create context failed 0x%x\n", eglGetError());
+    return 0;
+  }
+  bool window = true;
+  for (const auto& [id, c] : g_vexa_contexts) if (c.window) window = false;
+  EGLSurface pbuffer = EGL_NO_SURFACE;
+  {
+    const EGLint pbattrs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    pbuffer = eglCreatePbufferSurface(g_vexa_glx.display, g_vexa_glx.config, pbattrs);
+    if (pbuffer == EGL_NO_SURFACE) {
+      eglDestroyContext(g_vexa_glx.display, context);
+      return 0;
+    }
+  }
+  const uintptr_t id = reinterpret_cast<uintptr_t>(context);
+  g_vexa_contexts.emplace(id, VexaGuestGlxContext {context, pbuffer, window});
+  fprintf(stderr, "[VEXA][GLX] create context=%p share=%p window=%d\n", context,
+          reinterpret_cast<void*>(share), window);
+  return id;
+}
+
+static auto fexfn_impl_libGL_VEXA_DestroyGlxContext(uintptr_t id) -> void {
+  std::lock_guard lock(g_vexa_context_mutex);
+  auto it = g_vexa_contexts.find(id);
+  if (it == g_vexa_contexts.end()) return;
+  if (eglGetCurrentContext() == it->second.context)
+    eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglDestroyContext(g_vexa_glx.display, it->second.context);
+  if (it->second.pbuffer != EGL_NO_SURFACE) eglDestroySurface(g_vexa_glx.display, it->second.pbuffer);
+  g_vexa_contexts.erase(it);
+}
+
+static auto fexfn_impl_libGL_VEXA_BindGlxSurface(uintptr_t id) -> int {
+  std::lock_guard lock(g_vexa_context_mutex);
+  auto it = g_vexa_contexts.find(id);
+  if (it == g_vexa_contexts.end()) return 0;
+  const auto& c = it->second;
+  if (eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, c.context) == EGL_TRUE) return 1;
+  const EGLint error = eglGetError();
+  // A resource-upload context can be current concurrently with the render
+  // context. EGL surfaces cannot be current on two threads at once.
+  if (error == EGL_BAD_ACCESS &&
+      eglMakeCurrent(g_vexa_glx.display, c.pbuffer, c.pbuffer, c.context) == EGL_TRUE) return 1;
+  fprintf(stderr, "[VEXA][GLX] bind context=%p failed 0x%x\n", c.context, error);
+  return 0;
 }
 
 static auto fexfn_impl_libGL_VEXA_ReleaseGlxSurface() -> int {
@@ -1516,6 +1587,17 @@ static void VexaPresentFallback() {
       ::glBindRenderbuffer(GL_RENDERBUFFER, prev_rb);
     }
     const GLint area = cw * ch;
+    // Log what the guest actually rendered into, with the real attachment size.
+    // A guest that renders offscreen (Unity 2022+ URP) never touches FB0, so the
+    // present fallback can only pick the right target if these sizes are known.
+    {
+      static int logged_targets = 0;
+      if (logged_targets < 12) {
+        ++logged_targets;
+        fprintf(stderr, "[VEXA][PRESENT] target fbo=%u draws=%u att=0x%x dim=%dx%d vp=%dx%d\n", cand,
+                g_vexa_frame_fbos[i].draws, ctype, cw, ch, g_vexa_frame_fbos[i].vp_w, g_vexa_frame_fbos[i].vp_h);
+      }
+    }
     const bool better =
         area > best_area || (area == best_area && area > 0 &&
                              ((ctype == GL_TEXTURE && type != GL_TEXTURE) ||
@@ -1712,43 +1794,17 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
   if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
     return;
   }
+  if (eglGetCurrentSurface(EGL_DRAW) != g_vexa_glx.surface) {
+    const EGLContext context = eglGetCurrentContext();
+    if (context == EGL_NO_CONTEXT ||
+        eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, context) != EGL_TRUE) {
+      fprintf(stderr, "[VEXA][GLX] present context bind failed 0x%x\n", eglGetError());
+      return;
+    }
+  }
   VexaInstallGLDebugOnce();
   VexaCoverPresent();
   VexaPresentFallback();
-  // Debug: sample the presented framebuffer to verify guest content reaches FB0.
-  {
-    static int swap_count = 0;
-    ++swap_count;
-    if (swap_count == 60 || swap_count == 300 || swap_count == 900) {
-      eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, g_vexa_glx.context);
-      GLint draw_fbo = -1, read_fbo = -1;
-      glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
-      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
-      while (glGetError() != GL_NO_ERROR) {
-      }
-      GLubyte px[8 * 4];
-      int nonzero = 0;
-      GLenum first_err = GL_NO_ERROR;
-      for (int i = 0; i < 8; ++i) {
-        glReadPixels(100 + i * 300, 100 + i * 120, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px + i * 4);
-        const GLenum e = glGetError();
-        if (e != GL_NO_ERROR && first_err == GL_NO_ERROR) {
-          first_err = e;
-        }
-      }
-      for (int i = 0; i < 8; ++i) {
-        if (px[i * 4] || px[i * 4 + 1] || px[i * 4 + 2]) {
-          ++nonzero;
-        }
-      }
-      fprintf(stderr,
-              "[VEXA][GLX] fb0 sample n=%d nz=%d dfbo=%d rfbo=%d: %02x%02x%02x %02x%02x%02x %02x%02x%02x "
-              "%02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x err=0x%x\n",
-              swap_count, nonzero, draw_fbo, read_fbo, px[0], px[1], px[2], px[4], px[5], px[6], px[8], px[9],
-              px[10], px[12], px[13], px[14], px[16], px[17], px[18], px[20], px[21], px[22], px[24], px[25],
-              px[26], px[28], px[29], px[30], first_err);
-    }
-  }
   {
     static int diag_swaps = 0;
     ++diag_swaps;
@@ -2197,6 +2253,17 @@ static GLuint g_vexa_diag_curfbo = 0;
 static GLuint g_vexa_diag_drawfbo = 0;
 
 static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
+  if (g_vexa_trace_frame && access("/data/data/com.critical.vexaemulator/files/unity_shader_dump.flag", F_OK) == 0) {
+    GLint program = 0;
+    ::glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    for (const char* uniform : {"_Color", "_AlphaParam", "_MainTex", "_MainTex_ST", "hlslcc_mtx4x4unity_MatrixVP[0]", "hlslcc_mtx4x4unity_ObjectToWorld[0]"}) {
+      const GLint location = ::glGetUniformLocation(program, uniform);
+      if (location < 0) continue;
+      GLfloat values[16] = {};
+      ::glGetUniformfv(program, location, values);
+      fprintf(stderr, "[VEXA][UNIFORM] prog=%d %s loc=%d value=%g,%g,%g,%g\n", program, uniform, location, values[0], values[1], values[2], values[3]);
+    }
+  }
   ++g_vexa_diag_draws;
   VexaTrackFrameFbo(g_vexa_diag_drawfbo);
   if (g_vexa_trace_frame) {
@@ -2320,6 +2387,47 @@ static void fexfn_impl_libGL_glClear(GLbitfield mask) {
   ::glClear(mask);
 }
 
+// Desktop GL exposes a few enable/disable caps and tex-parameter names that
+// have no GLES 3.x equivalent. Unity GLCore sets some of them every frame and
+// the Mali driver answers GL_INVALID_ENUM. This helper logs each distinct value
+// once (to drive a desktop->GLES allowlist) and drains the error queue so stale
+// state cannot leak into the guest's later glGetError reads.
+static void VexaGLEnumCompat(const char* what, GLenum value) {
+  static GLenum seen[64];
+  static int seen_n = 0;
+  while (::glGetError() != GL_NO_ERROR) {
+  }
+  for (int i = 0; i < seen_n; ++i) {
+    if (seen[i] == value) {
+      return;
+    }
+  }
+  if (seen_n < static_cast<int>(sizeof(seen) / sizeof(seen[0]))) {
+    seen[seen_n++] = value;
+    fprintf(stderr, "[VEXA][GL] %s 0x%x\n", what, value);
+  }
+}
+
+static void fexfn_impl_libGL_glEnable(GLenum cap) {
+  ::glEnable(cap);
+  VexaGLEnumCompat("glEnable", cap);
+}
+
+static void fexfn_impl_libGL_glDisable(GLenum cap) {
+  ::glDisable(cap);
+  VexaGLEnumCompat("glDisable", cap);
+}
+
+static void fexfn_impl_libGL_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
+  ::glTexParameterf(target, pname, param);
+  VexaGLEnumCompat("glTexParameterf", pname);
+}
+
+static void fexfn_impl_libGL_glTexParameteri(GLenum target, GLenum pname, GLint param) {
+  ::glTexParameteri(target, pname, param);
+  VexaGLEnumCompat("glTexParameteri", pname);
+}
+
 static void fexfn_impl_libGL_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   VexaDiagDraw("arrays", mode, count);
   ::glDrawArrays(mode, first, count);
@@ -2434,6 +2542,14 @@ static void fexfn_impl_libGL_glBeginQuery(GLenum target, GLuint id) {
 static void fexfn_impl_libGL_glEndQuery(GLenum target) { ::glEndQuery(target); }
 
 static void fexfn_impl_libGL_glGenQueries(GLsizei n, GLuint* ids) { ::glGenQueries(n, ids); }
+
+static void fexfn_impl_libGL_glGetInternalformativ(GLenum target, GLenum internalformat, GLenum pname, GLsizei count, GLint* params) {
+  ::glGetInternalformativ(target, internalformat, pname, count, params);
+  static unsigned logged;
+  if (logged++ < 80 && params && count > 0) {
+    fprintf(stderr, "[VEXA][FORMAT] target=%x fmt=%x pname=%x value=%d err=%x\n", target, internalformat, pname, params[0], ::glGetError());
+  }
+}
 
 static void fexfn_impl_libGL_glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64* params) {
   ::glGetQueryObjectui64v(id, pname, params);
@@ -3653,11 +3769,12 @@ GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVis
 #endif
 
 #ifdef BUILD_ANDROID
-// Unity enables DrawMeshInstancedIndirect only when the desktop level has compute
-// (4.3) and draw-indirect. 4.5 would also turn on core direct-state-access; the
-// guest proc lookup returns a non-null stub for missing names, so Unity would
-// call texture-view and DSA entry points this driver path does not implement.
-// 4.3 still satisfies Godot 3's desktop >= 3.3 check.
+// Godot 3's Linux export is GLES-over-GL and rejects anything below desktop
+// OpenGL 3.3, and needs a desktop framebuffer extension name before it will
+// create a device. Framebuffer objects are core on this GLES 3.2 driver; only
+// the name differs. The compute / SSBO / image / indirect names are the ones
+// Unity checks before it allows compute, shader storage buffers, images and
+// indirect draws.
 static const char* const kVexaDesktopSpoofExts[] = {
   "GL_ARB_framebuffer_object",
   "GL_EXT_framebuffer_object",
@@ -4028,6 +4145,9 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
                         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), 11);
     return result;
   }
+  if (name_sv == "glGetInternalformativ") {
+    return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetInternalformativ);
+  }
   if (name_sv == "glGetIntegerv") {
     auto result = reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetIntegerv);
     fprintf(stderr, "[libGL-host] glXGetProcAddress('%s') => %p via getintegerv-wrapper\n",
@@ -4094,6 +4214,12 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
         {"glBindFramebuffer", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glBindFramebuffer)},
         {"glClear", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glClear)},
         {"glClearColor", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glClearColor)},
+        // Desktop-only caps/pnames Unity GLCore sets are rejected by Mali with
+        // GL_INVALID_ENUM; route through wrappers that drain the error.
+        {"glEnable", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glEnable)},
+        {"glDisable", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDisable)},
+        {"glTexParameterf", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glTexParameterf)},
+        {"glTexParameteri", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glTexParameteri)},
         // Software BCn fallback (Mali has no S3TC/RGTC/BPTC).
         {"glTexStorage2D", reinterpret_cast<VoidFn>(VexaGL_glTexStorage2D)},
         {"glTexStorage3D", reinterpret_cast<VoidFn>(VexaGL_glTexStorage3D)},
@@ -4574,6 +4700,21 @@ void fexfn_impl_libGL_glLinkProgram(GLuint a_0) {
   GLHOST_TRACE_SCOPE();
   fprintf(stderr, "[libGL-host] glLinkProgram(%u) enter\n", static_cast<unsigned>(a_0));
   fexldr_ptr_libGL_glLinkProgram(a_0);
+  if (access("/data/data/com.critical.vexaemulator/files/unity_shader_dump.flag", F_OK) == 0) {
+    GLuint shaders[8] = {};
+    GLsizei count = 0;
+    ::glGetAttachedShaders(a_0, 8, &count, shaders);
+    for (int i = 0; i < count; ++i) {
+      GLint length = 0;
+      ::glGetShaderiv(shaders[i], GL_SHADER_SOURCE_LENGTH, &length);
+      if (length <= 0 || length > 1000000) continue;
+      std::string source(length, '\0');
+      ::glGetShaderSource(shaders[i], length, nullptr, source.data());
+      char path[256];
+      snprintf(path, sizeof(path), "/data/data/com.critical.vexaemulator/files/artifacts/unity-program-%u-%d.glsl", a_0, i);
+      if (FILE* file = fopen(path, "wb")) { fwrite(source.data(), 1, source.size(), file); fclose(file); }
+    }
+  }
   GLint link_status = 0;
   ::glGetProgramiv(a_0, GL_LINK_STATUS, &link_status);
   GLint log_len = 0;

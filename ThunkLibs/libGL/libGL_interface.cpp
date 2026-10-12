@@ -15,7 +15,9 @@
 
 extern "C" using __GLXextFuncPtr = void (*)(void);
 extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
-extern "C" int VEXA_BindGlxSurface(void);
+extern "C" uintptr_t VEXA_CreateGlxContext(uintptr_t share);
+extern "C" void VEXA_DestroyGlxContext(uintptr_t context);
+extern "C" int VEXA_BindGlxSurface(uintptr_t context);
 extern "C" int VEXA_ReleaseGlxSurface(void);
 extern "C" void VEXA_SwapGlxBuffers(void);
 extern "C" int VEXA_SetSwapInterval(int interval);
@@ -51,6 +53,10 @@ template<>
 struct fex_gen_config<glXGetProcAddress> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint, fexgen::returns_guest_pointer {};
 
 #ifdef BUILD_ANDROID
+template<>
+struct fex_gen_config<VEXA_CreateGlxContext> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_DestroyGlxContext> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_BindGlxSurface> : fexgen::custom_host_impl {};
 template<>
@@ -214,6 +220,14 @@ template<>
 struct fex_gen_config<glGetQueryObjectui64v> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glGetQueryObjectuiv> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glEnable> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glDisable> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glTexParameterf> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glTexParameteri> : fexgen::custom_host_impl {};
 
 #define FEX_ANDROID_GL_CUSTOM(name) \
 template<> \

@@ -643,6 +643,19 @@ void VexaSDL2PollPointerEvents() {
       std::memcpy(&x, rec + 4, 4);
       std::memcpy(&y, rec + 8, 4);
       std::memcpy(&state, rec + 12, 4);
+      if (type == 7) {
+        // VEXA pad record: x = SDL_GameControllerButton (0-14) or
+        // 100 + SDL_GameControllerAxis; y = button state or signed axis value.
+        if (x >= 0 && x < SDL_CONTROLLER_BUTTON_MAX) {
+          CompatPadButtons[x] = y != 0 ? 1 : 0;
+        } else {
+          const int axis = x - 100;
+          if (axis >= 0 && axis < SDL_CONTROLLER_AXIS_MAX) {
+            CompatPadAxes[axis] = static_cast<Sint16>(y);
+          }
+        }
+        continue;
+      }
       if (type == 4 || type == 5) {
         CompatPadButtonRecord(type, state);
       }
