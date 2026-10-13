@@ -865,7 +865,6 @@ extern "C" {
 constexpr const char* kCompatGLXExts =
   "GLX_ARB_create_context GLX_EXT_framebuffer_sRGB GLX_EXT_swap_control GLX_MESA_swap_control";
 constexpr uintptr_t kCompatDisplay = 0x47584453ULL;  // "GXDS"
-constexpr uintptr_t kCompatContext = 0x47584354ULL;  // "GXCT"
 constexpr uintptr_t kCompatVisual = 0x47585649ULL;   // "GXVI"
 constexpr uintptr_t kCompatFBConfig = 0x47584642ULL; // "GXFB"
 constexpr unsigned long kCompatDrawable = 1UL;
@@ -975,78 +974,21 @@ VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentDrawable() {
 
 VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawable, void* context) {
   fprintf(stderr, "[libGL thunk] compat glXMakeCurrent drawable=%lu context=%p\n", drawable, context);
-  g_vexa_current_context = context;
-  g_vexa_current_drawable = context ? drawable : 0;
-  vexa_ff::init_matrices();
-  if (!context) {
-    const int released = fexfn_pack_VEXA_ReleaseGlxSurface();
-    if (!released) {
-      fprintf(stderr, "[libGL thunk] glXMakeCurrent release failed\n");
-    }
-    return released;
+  const int result = context
+    ? fexfn_pack_VEXA_BindGlxSurface(reinterpret_cast<uintptr_t>(context))
+    : fexfn_pack_VEXA_ReleaseGlxSurface();
+  // A failed MakeCurrent must preserve the previous current context/drawable.
+  if (result) {
+    g_vexa_current_context = context;
+    g_vexa_current_drawable = context ? drawable : 0;
+    vexa_ff::init_matrices();
+  } else {
+    fprintf(stderr, "[libGL thunk] glXMakeCurrent failed\n");
   }
-  const int bound = fexfn_pack_VEXA_BindGlxSurface(reinterpret_cast<uintptr_t>(context));
-  if (!bound) {
-    fprintf(stderr, "[libGL thunk] glXMakeCurrent bind failed\n");
-  }
-  return bound;
+  return result;
 }
 
 VEXA_GL_GUEST_EXPORT void glXSwapBuffers(void* /*display*/, unsigned long drawable) {
-  static unsigned diag_swaps;
-  if (++diag_swaps % 120 == 0 && access("/tmp/vexa-unity-refresh", F_OK) == 0) {
-    Dl_info info {};
-    const unsigned char build_id[] = {0xb4,0x4d,0x37,0x66,0x01,0xaf,0x15,0xf4,0x48,0x66,0xad,0x62,0x23,0x20,0xc9,0xa8,0x4d,0xfe,0xa7,0x87};
-    if (dladdr(__builtin_return_address(0), &info) && info.dli_fbase && info.dli_fname && strstr(info.dli_fname,"UnityPlayer.so")) {
-      auto base = reinterpret_cast<unsigned char*>(info.dli_fbase);
-      if (!memcmp(base + 0x2b8, build_id, sizeof(build_id))) {
-        auto geti = [&](uintptr_t offset) { return reinterpret_cast<int (*)(void)>(base + offset)(); };
-        auto getf = [&](uintptr_t offset) { return reinterpret_cast<float (*)(void)>(base + offset)(); };
-        fprintf(stderr, "[VEXA][DIAG] Unity frame=%d time=%f scale=%f screen=%dx%d focused=%d cameras=%d\n",
-                geti(0x782f50), getf(0x782ab0), getf(0x782f20), geti(0x765570), geti(0x765580), static_cast<int>(reinterpret_cast<unsigned char (*)(void)>(base + 0x75f240)()), geti(0x762970));
-        if (diag_swaps == 120) {
-          int w=0,h=0;
-          reinterpret_cast<void (*)(int,int*,int*)>(base+0x765460)(0,&w,&h);
-          fprintf(stderr,"[VEXA][DIAG] display BEFORE count=%d render=%dx%d\n",geti(0xde0670),w,h);
-          reinterpret_cast<unsigned char (*)(void)>(base+0xde04c0)();
-          reinterpret_cast<void (*)(int,int*,int*)>(base+0x765460)(0,&w,&h);
-          fprintf(stderr,"[VEXA][DIAG] display AFTER count=%d render=%dx%d\n",geti(0xde0670),w,h);
-        }
-        if (diag_swaps == 120 || diag_swaps == 1200) {
-          auto mgr = *reinterpret_cast<unsigned char**>(base + 0x1f2e730);
-          for (int list : {0x10, 0x38}) {
-            auto ids = *reinterpret_cast<int**>(mgr + list);
-            int count = *reinterpret_cast<int*>(mgr + list + 0x10);
-            fprintf(stderr, "[VEXA][DIAG] camera list=%x count=%d\n", list, count);
-            for (int i=0; ids && i<count && i<16; ++i) {
-              auto obj = reinterpret_cast<unsigned char* (*)(int)>(base + 0x780940)(ids[i]);
-              auto cam = obj ? *reinterpret_cast<unsigned char**>(obj + 0x10) : nullptr;
-              auto global = *reinterpret_cast<unsigned char***>(base+0x1ee55f0);
-              auto table = global ? *global : nullptr;
-              if (table) {
-                auto records = *reinterpret_cast<unsigned char**>(table);
-                auto mask = *reinterpret_cast<unsigned int*>(table+8);
-                fprintf(stderr, "[VEXA][DIAG] obj=%p cached=%p hashmask=%x\n", obj,cam,mask);
-                if (records && mask < 0x1000000) for (size_t o=0; o < (size_t(mask)+8)*3; o+=24) {
-                  if (*reinterpret_cast<int*>(records+o+8)==ids[i]) {
-                    cam=*reinterpret_cast<unsigned char**>(records+o+16);
-                    break;
-                  }
-                }
-              }
-              if (!cam) continue;
-              auto ci = [&](uintptr_t off) { return reinterpret_cast<int (*)(void*)>(base+off)(cam); };
-              auto rt = reinterpret_cast<void* (*)(void*)>(base+0x93e490)(cam);
-              float rect[4]{};
-              reinterpret_cast<void (*)(void*,float*)>(base+0x761f20)(cam, rect);
-              fprintf(stderr, "[VEXA][DIAG] camera id=%d native=%p size=%dx%d rect=%f,%f,%f,%f mask=%x target=%p display=%d clear=%d\n", ids[i], cam, ci(0x761f50), ci(0x761f60), rect[0],rect[1],rect[2],rect[3],ci(0x7618b0),rt,ci(0x762000),ci(0x761b80));
-            }
-          }
-        }
-
-      }
-    }
-  }
   if (GLGuestTraceEnabled()) {
     fprintf(stderr, "[libGL thunk] compat glXSwapBuffers drawable=%lu\n", drawable);
   }
@@ -1201,9 +1143,9 @@ VEXA_GL_GUEST_EXPORT const char* glXQueryServerString(void*, int, int name) {
   return glXGetClientString(nullptr, name);
 }
 
-VEXA_GL_GUEST_EXPORT void* glXCreateNewContext(void*, void*, int, void*, int) {
+VEXA_GL_GUEST_EXPORT void* glXCreateNewContext(void*, void*, int, void* share_context, int) {
   fprintf(stderr, "[libGL thunk] compat glXCreateNewContext\n");
-  return reinterpret_cast<void*>(kCompatContext);
+  return reinterpret_cast<void*>(fexfn_pack_VEXA_CreateGlxContext(reinterpret_cast<uintptr_t>(share_context)));
 }
 
 VEXA_GL_GUEST_EXPORT int glXGetFBConfigAttrib(void*, void*, int attribute, int* value) {
