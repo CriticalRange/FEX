@@ -1285,33 +1285,42 @@ extern uint64_t g_vexa_diag_bindfbo;
 
 static VexaGlxState g_vexa_glx;
 
+// Called with g_vexa_context_mutex held. Keep the old surface on creation
+// failure so a later bind/swap can retry. Do not bind the bootstrap context:
+// Unity's render and resource threads own separate guest contexts.
+static bool VexaRefreshGlxSurface() {
+  const uint64_t serial = VexaRuntimeSurfaceSerial();
+  if (!serial || serial == g_vexa_glx.window_serial) return true;
+  ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
+  if (!window) return false;
+  if (window == g_vexa_glx.window) {
+    g_vexa_glx.window_serial = serial;
+    ANativeWindow_release(window);
+    return true;
+  }
+  if (g_vexa_glx.buffer_format)
+    ANativeWindow_setBuffersGeometry(window, 0, 0, g_vexa_glx.buffer_format);
+  EGLSurface surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, nullptr);
+  if (surface == EGL_NO_SURFACE) {
+    fprintf(stderr, "[VEXA][GLX] surface rebuild failed 0x%x\n", eglGetError());
+    ANativeWindow_release(window);
+    return false;
+  }
+  // EGL defers destruction while the old surface is current on any thread.
+  // Bind/swap below move the caller's existing context to the replacement.
+  eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
+  ANativeWindow_release(g_vexa_glx.window);
+  g_vexa_glx.surface = surface;
+  g_vexa_glx.window = window;
+  g_vexa_glx.window_serial = serial;
+  fprintf(stderr, "[VEXA][GLX] surface rebuilt serial=%llu\n", (unsigned long long)serial);
+  return true;
+}
+
 static bool VexaEnsureGlx() {
   if (g_vexa_glx.ready && g_vexa_glx.display != EGL_NO_DISPLAY && g_vexa_glx.context != EGL_NO_CONTEXT &&
       g_vexa_glx.surface != EGL_NO_SURFACE) {
-    const uint64_t serial = VexaRuntimeSurfaceSerial();
-    if (serial != 0 && g_vexa_glx.window_serial != 0 && serial != g_vexa_glx.window_serial) {
-      ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
-      if (window) {
-        eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
-        ANativeWindow_release(g_vexa_glx.window);
-        if (g_vexa_glx.buffer_format != 0) {
-          ANativeWindow_setBuffersGeometry(window, 0, 0, g_vexa_glx.buffer_format);
-        }
-        EGLSurface surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, nullptr);
-        if (surface != EGL_NO_SURFACE) {
-          fprintf(stderr, "[VEXA][GLX] surface rebuilt for window %p serial %llu->%llu\n", window,
-                  (unsigned long long)g_vexa_glx.window_serial, (unsigned long long)serial);
-          g_vexa_glx.surface = surface;
-          g_vexa_glx.window = window;
-          g_vexa_glx.window_serial = serial;
-        } else {
-          fprintf(stderr, "[VEXA][GLX] surface rebuild failed 0x%x\n", eglGetError());
-          ANativeWindow_release(window);
-          return false;
-        }
-      }
-    }
+    if (!VexaRefreshGlxSurface()) return false;
     if (eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, g_vexa_glx.context) == EGL_TRUE) {
       return true;
     }
@@ -1332,7 +1341,7 @@ static bool VexaEnsureGlx() {
 #define EGL_OPENGL_ES3_BIT 0x00000040
 #endif
   const EGLint config_attribs[] = {
-    EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+    EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
     EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT,
     EGL_RED_SIZE, 8,
     EGL_GREEN_SIZE, 8,
@@ -1469,6 +1478,7 @@ static auto fexfn_impl_libGL_VEXA_BindGlxSurface(uintptr_t id) -> int {
   std::lock_guard lock(g_vexa_context_mutex);
   auto it = g_vexa_contexts.find(id);
   if (it == g_vexa_contexts.end()) return 0;
+  if (!VexaRefreshGlxSurface()) return 0;
   const auto& c = it->second;
   if (eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, c.context) == EGL_TRUE) return 1;
   const EGLint error = eglGetError();
@@ -1791,9 +1801,11 @@ static void VexaPresentFallback() {
 }
 
 static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
+  std::lock_guard lock(g_vexa_context_mutex);
   if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
     return;
   }
+  if (!VexaRefreshGlxSurface()) return;
   if (eglGetCurrentSurface(EGL_DRAW) != g_vexa_glx.surface) {
     const EGLContext context = eglGetCurrentContext();
     if (context == EGL_NO_CONTEXT ||
@@ -1831,6 +1843,7 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
 }
 
 static auto fexfn_impl_libGL_VEXA_SetSwapInterval(int interval) -> int {
+  std::lock_guard lock(g_vexa_context_mutex);
   EGLDisplay display = eglGetCurrentDisplay();
   if (display == EGL_NO_DISPLAY) {
     if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
