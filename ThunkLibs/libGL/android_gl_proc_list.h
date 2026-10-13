@@ -378,8 +378,6 @@
   OP(glGenRenderbuffers) \
   OP(glDeleteRenderbuffers) \
   OP(glBindRenderbuffer) \
-  OP(glRenderbufferStorage) \
-  OP(glRenderbufferStorageMultisample) \
   OP(glRenderbufferStorageMultisampleEXT) \
   OP(glFramebufferRenderbuffer) \
   OP(glGetRenderbufferParameteriv) \

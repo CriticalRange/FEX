@@ -553,6 +553,27 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
     dirfd = AT_FDCWD;
   }
 
+  // LD_LIBRARY_PATH=. opens bundled libraries relative to the process cwd.
+  // Match those against the same thunk overlays as absolute library opens.
+  // Otherwise a bundled OpenAL can call the ALSA bridge, which loads that
+  // same OpenAL again and recursively opens ALSA until the guest stack ends.
+  if (pathname[0] != '/' && dirfd == AT_FDCWD) {
+    const std::filesystem::path Relative {pathname};
+    // Do not collapse '..' across a symlink; leave those paths to the kernel.
+    const bool HasParent = std::any_of(Relative.begin(), Relative.end(),
+                                     [](const auto& Part) { return Part == ".."; });
+    char Cwd[PATH_MAX + 1] {};
+    if (!HasParent && ::getcwd(Cwd, sizeof(Cwd))) {
+      std::filesystem::path Combined {Cwd};
+      Combined /= pathname;
+      const auto Normalized = Combined.lexically_normal().string();
+      auto thunkOverlay = ThunkOverlays.find(fextl::string {Normalized.c_str()});
+      if (thunkOverlay != ThunkOverlays.end()) {
+        return EmulatedFDPathResult {AT_FDCWD, thunkOverlay->second.c_str()};
+      }
+    }
+  }
+
   // VEXA_FIXES: Some guests probe library names through openat with a non-AT_FDCWD
   // dirfd (eg /proc) and a relative filename (eg "SDL3.so").
   // Resolve "dirfd + relative" and match overlays before the generic early-return.
