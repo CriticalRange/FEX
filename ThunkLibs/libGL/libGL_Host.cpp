@@ -2422,6 +2422,29 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
             "[VEXA][GL] draws=%llu last=%s mode=%x n=%d fbo=%u prog=%u clears=%llu err=%x\n",
             (unsigned long long)g_vexa_diag_draws, name, mode, count, g_vexa_diag_curfbo,
             g_vexa_diag_curprog, (unsigned long long)g_vexa_diag_clears, err);
+    static unsigned incomplete_logged = 0;
+    if (err == GL_INVALID_FRAMEBUFFER_OPERATION && incomplete_logged++ < 4) {
+      GLint fbo = 0, texture = 0;
+      ::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+      ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+      fprintf(stderr, "[VEXA][FBO] id=%d status=%x\n", fbo, ::glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+      for (GLenum attachment : {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
+                                GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT}) {
+        GLint kind = 0, object = 0, format = 0, width = 0, height = 0;
+        ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+        if (kind == GL_NONE) continue;
+        ::glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &object);
+        if (kind == GL_TEXTURE) {
+          ::glBindTexture(GL_TEXTURE_2D, object);
+          ::glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+          ::glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+          ::glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+        }
+        fprintf(stderr, "[VEXA][FBO] attachment=%x kind=%x object=%d format=%x size=%dx%d\n", attachment, kind, object, format, width, height);
+      }
+      ::glBindTexture(GL_TEXTURE_2D, texture);
+      while (::glGetError() != GL_NO_ERROR) {}
+    }
   }
 }
 
@@ -2611,6 +2634,20 @@ static void fexfn_impl_libGL_glDrawElementsInstanced(GLenum mode, GLsizei count,
 static void fexfn_impl_libGL_glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
   VexaDiagDraw("elements_indirect", mode, -1);
   ::glDrawElementsIndirect(mode, type, indirect);
+}
+
+static void fexfn_impl_libGL_glRenderbufferStorage(GLenum target, GLenum format, GLsizei width, GLsizei height) {
+  // Desktop accepts unsized packed depth/stencil; GLES requires a sized format.
+  if (format == GL_DEPTH_STENCIL) {
+    fprintf(stderr, "[VEXA][GL] renderbuffer DEPTH_STENCIL -> DEPTH24_STENCIL8 %dx%d\n", width, height);
+    format = GL_DEPTH24_STENCIL8;
+  }
+  ::glRenderbufferStorage(target, format, width, height);
+}
+
+static void fexfn_impl_libGL_glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum format, GLsizei width, GLsizei height) {
+  if (format == GL_DEPTH_STENCIL) format = GL_DEPTH24_STENCIL8;
+  ::glRenderbufferStorageMultisample(target, samples, format, width, height);
 }
 
 static void fexfn_impl_libGL_glDrawArraysIndirect(GLenum mode, const void* indirect) {
@@ -3962,13 +3999,76 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
       const char* rewritten_version = nullptr;
       if (desktop && (compute || desktop_version >= 400)) {
         rewritten_version = "#version 320 es";
-      } else if (desktop && line.find("330") != std::string::npos) {
+      } else if (desktop && desktop_version >= 130 && desktop_version <= 330) {
+        // Heaps/HashLink uses GLSL 150 with in/out interfaces. Like GLSL 330,
+        // its vertex/fragment shaders need an ESSL 300 version on Android.
         rewritten_version = "#version 300 es";
       } else if (desktop && desktop_version >= 110 && desktop_version <= 120) {
         rewritten_version = "#version 100";
       }
       if (rewritten_version) {
         source.replace(version_pos, line_len, rewritten_version);
+        // Desktop precision qualifiers have no effect. Leaving lowp/mediump
+        // active in ESSL loses coordinate and animation-time precision on Mali.
+        auto is_identifier = [](char c) {
+          return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '_';
+        };
+        unsigned precision_promotions = 0;
+        for (std::string_view qualifier : {std::string_view{"mediump"}, std::string_view{"lowp"}}) {
+          for (size_t pos = 0; (pos = source.find(qualifier, pos)) != std::string::npos;) {
+            const size_t end = pos + qualifier.size();
+            if ((pos == 0 || !is_identifier(source[pos - 1])) &&
+                (end == source.size() || !is_identifier(source[end]))) {
+              source.replace(pos, qualifier.size(), "highp");
+              ++precision_promotions;
+              pos += 5;
+            } else {
+              pos = end;
+            }
+          }
+        }
+        static unsigned precision_logs = 0;
+        if (precision_promotions && precision_logs++ < 4) {
+          fprintf(stderr, "[VEXA][GL] desktop precision -> highp shader=%u type=%x qualifiers=%u\n",
+                  shader, shader_type, precision_promotions);
+        }
+        if (desktop_version >= 130 && desktop_version < 400) {
+          // `sample` is a legal identifier in older desktop GLSL but reserved
+          // in ESSL 300. Rename whole identifiers, never substrings.
+          auto identifier = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_';
+          };
+          for (size_t pos = 0; (pos = source.find("sample", pos)) != std::string::npos;) {
+            if ((pos == 0 || !identifier(source[pos - 1])) &&
+                (pos + 6 == source.size() || !identifier(source[pos + 6]))) {
+              source.replace(pos, 6, "vexa_legacy_sample");
+              pos += 18;
+            } else {
+              pos += 6;
+            }
+          }
+          if (shader_type == GL_FRAGMENT_SHADER) {
+            // Heaps names its desktop MRT outputs OUTPUT1..OUTPUTn and binds
+            // them to attachments 0..n-1. GLES requires those locations in GLSL.
+            constexpr std::string_view prefix {"out vec4 OUTPUT"};
+            for (size_t pos = 0; (pos = source.find(prefix, pos)) != std::string::npos;) {
+              size_t end = pos + prefix.size();
+              unsigned output = 0;
+              while (end < source.size() && source[end] >= '0' && source[end] <= '9') {
+                output = output * 10 + unsigned(source[end++] - '0');
+              }
+              if (output > 0 && end < source.size() && source[end] == ';') {
+                const auto layout = "layout(location=" + std::to_string(output - 1) + ") ";
+                source.insert(pos, layout);
+                pos = end + layout.size() + 1;
+              } else {
+                pos = end;
+              }
+            }
+          }
+        }
         if (desktop_version >= 400 || compute) {
           VexaStripDesktopArbExtensions(&source);
         }
@@ -4487,6 +4587,8 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
         {"glDrawElementsInstancedBaseVertex",
          reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawElementsInstancedBaseVertex)},
         {"glDrawElementsIndirect", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawElementsIndirect)},
+        {"glRenderbufferStorage", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glRenderbufferStorage)},
+        {"glRenderbufferStorageMultisample", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glRenderbufferStorageMultisample)},
         {"glDrawArraysIndirect", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDrawArraysIndirect)},
         {"glDispatchCompute", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDispatchCompute)},
         {"glUseProgram", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glUseProgram)},

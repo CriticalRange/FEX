@@ -198,6 +198,10 @@ struct fex_gen_config<glDrawElementsIndirect> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glDrawArraysIndirect> : fexgen::custom_host_impl {};
 template<>
+struct fex_gen_config<glRenderbufferStorage> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<glRenderbufferStorageMultisample> : fexgen::custom_host_impl {};
+template<>
 struct fex_gen_config<glDrawElementsBaseVertex> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glDrawElementsInstancedBaseVertex> : fexgen::custom_host_impl {};
