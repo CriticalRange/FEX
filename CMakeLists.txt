@@ -11,6 +11,7 @@ option(ENABLE_WAYLAND_THUNKS "Build Wayland thunk libs" ON) # VEXA_FIXES Disable
 option(ENABLE_VDSO_THUNKS "Build VDSO thunk libs" ON) # VEXA_FIXES Temporarily disable VDSO thunk generation in Android bring-up
 option(BUILD_FEX_LINUX_TESTS "Build FEXLinuxTests (requires x86 compiler)" FALSE)
 option(BUILD_THUNKS "Build thunks" FALSE)
+option(VEXA_BUILD_32BIT_THUNKS "Build Android i386 GL thunk pair" OFF)
 option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
 option(ENABLE_CLANG_THUNKS "Build thunks with clang" TRUE)
 option(ENABLE_IWYU "Enable the Include What You Use sanitizer" FALSE)
@@ -648,8 +649,8 @@ if (BUILD_THUNKS)
       BUILD_ALWAYS ON
       DEPENDS ${THUNKGEN_DEPENDS})
 
-    # 32-bit guest thunks are not shipped on Android.
-    if (NOT ANDROID)
+    # Android i386 currently uses native guest SDL/audio and the GL bridge.
+    if (NOT ANDROID OR VEXA_BUILD_32BIT_THUNKS)
     # VEXA_FIXES: Mirror thunk feature toggles for 32-bit guest thunk sub-build.
     ExternalProject_Add(guest-libs-32
       PREFIX guest-libs-32
@@ -662,8 +663,8 @@ if (BUILD_THUNKS)
 "-DENABLE_DESKTOP_GL_THUNKS=${ENABLE_DESKTOP_GL_THUNKS}"
   "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
         "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
-        "-DENABLE_EGL_THUNKS=${ENABLE_EGL_THUNKS}"
-        "-DENABLE_VULKAN_THUNKS=${ENABLE_VULKAN_THUNKS}"
+        "-DENABLE_EGL_THUNKS=$<IF:$<BOOL:${ANDROID}>,OFF,${ENABLE_EGL_THUNKS}>"
+        "-DENABLE_VULKAN_THUNKS=$<IF:$<BOOL:${ANDROID}>,OFF,${ENABLE_VULKAN_THUNKS}>"
         "-DENABLE_VDSO_THUNKS=${ENABLE_VDSO_THUNKS}"
         # VEXA_FIXES: Keep 32-bit guest thunk sub-build aligned with 64-bit
         # for Android media dependency include prefixes.
@@ -677,6 +678,9 @@ if (BUILD_THUNKS)
         "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
         "-DGENERATOR_EXE=${GENERATOR_EXE}"
         "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+      "-DCMAKE_MAKE_PROGRAM=${VEXA_GUEST_NINJA}"
+        "-DVEXA_GUEST_CC=${VEXA_GUEST_CC}"
+        "-DVEXA_GUEST_CXX=${VEXA_GUEST_CXX}"
       INSTALL_COMMAND ""
       BUILD_ALWAYS ON
       DEPENDS ${THUNKGEN_DEPENDS})

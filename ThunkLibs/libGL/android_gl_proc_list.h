@@ -68,6 +68,7 @@
   OP(glBufferStorage) \
   OP(glBufferSubData) \
   OP(glMapBufferRange) \
+  OP(glGetBufferPointerv) \
   OP(glUnmapBuffer) \
   OP(glGenVertexArrays) \
   OP(glDeleteVertexArrays) \
@@ -160,6 +161,8 @@
   OP(glReadPixels) \
   OP(glFenceSync) \
   OP(glClientWaitSync) \
+  OP(glWaitSync) \
+  OP(glIsSync) \
   OP(glGetSynciv) \
   OP(glDeleteSync) \
   OP(glFlush) \
@@ -336,6 +339,9 @@
   OP(glBufferStorage) \
   OP(glBufferSubData) \
   OP(glMapBufferRange) \
+  OP(glGetBufferPointerv) \
+  OP(glWaitSync) \
+  OP(glIsSync) \
   OP(glUnmapBuffer) \
   OP(glGenVertexArrays) \
   OP(glDeleteVertexArrays) \

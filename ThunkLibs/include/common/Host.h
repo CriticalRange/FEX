@@ -631,12 +631,17 @@ struct CallbackUnpack<Result(Args...)> {
     PackedArguments<Result, guest_layout<Args>...> packed_args = {to_guest(to_host_layout(args))...};
 #else
     GuestStackBumpAllocator GuestStack;
-    auto& packed_args = *GuestStack.New<PackedArguments<Result, guest_layout<Args>...>>(to_guest(to_host_layout(args))...);
+    using GuestResult = std::conditional_t<std::is_void_v<Result>, void, guest_layout<Result>>;
+    auto& packed_args = *GuestStack.New<PackedArguments<GuestResult, guest_layout<Args>...>>(to_guest(to_host_layout(args))...);
 #endif
     guestcall->CallCallback(guestcall->GuestUnpacker, guestcall->GuestTarget, &packed_args);
 
     if constexpr (!std::is_void_v<Result>) {
+#ifdef IS_32BIT_THUNK
+      return host_layout<Result> {packed_args.rv}.data;
+#else
       return packed_args.rv;
+#endif
     }
   }
 };

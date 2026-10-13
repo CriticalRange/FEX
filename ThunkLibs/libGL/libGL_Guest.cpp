@@ -710,6 +710,21 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
     TraceGLProcLink(procname_s, reinterpret_cast<const void*>(self_addr), self_addr);
     return reinterpret_cast<voidFunc*>(glXGetProcAddress);
   }
+#ifdef IS_32BIT_THUNK
+  // A native Android function address cannot fit in an i386 function pointer.
+  // Return real guest entrypoints that invoke their generated ABI packers.
+  if (auto compat = ResolveAndroidCompatGuestProc(procname_s)) return reinterpret_cast<voidFunc*>(compat);
+  static const auto guestEntries = [] {
+    std::unordered_map<std::string_view, uintptr_t> entries;
+#define GUEST_ENTRY(name, unused) entries[#name] = reinterpret_cast<uintptr_t>(fexfn_pack_##name);
+    FOREACH_internal_SYMBOL(GUEST_ENTRY);
+#undef GUEST_ENTRY
+    return entries;
+  }();
+  auto entry = guestEntries.find(procname_s);
+  if (entry == guestEntries.end()) entry = guestEntries.find(ResolveGLInvokerAlias(procname_s));
+  return entry == guestEntries.end() ? nullptr : reinterpret_cast<voidFunc*>(entry->second);
+#endif
   if (procname_s == "glGetFramebufferAttachmentParameteriv" || procname_s == "glGetFramebufferAttachmentParameterivEXT") {
     EnsureFramebufferAttachmentCompatPrelinked();
     return reinterpret_cast<voidFunc*>(VexaCompat_glGetFramebufferAttachmentParameteriv);
@@ -833,8 +848,14 @@ static void* malloc_wrapper(size_t size) {
   return malloc(size);
 }
 
+static void free_wrapper(void* ptr) { free(ptr); }
+
 static void OnInit() {
   GLGUEST_TRACE_SCOPE();
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);
+  fexfn_pack_GL_SetGuestFree((uintptr_t)free_wrapper, (uintptr_t)CallbackUnpack<decltype(free_wrapper)>::Unpack);
+#endif
 #ifdef BUILD_ANDROID
   // VEXA_FIXES: Android build has no X11 dependency; keep init explicit so
   // missing callback wiring is clearly intentional in logs.
@@ -874,7 +895,7 @@ static thread_local unsigned long g_vexa_current_drawable = 0;
 
 #define VEXA_GL_GUEST_EXPORT __attribute__((visibility("default")))
 
-// Ubuntu Xlib Visual / XVisualInfo, LP64. class sits at 0x10. A zeroed info
+// Xlib Visual / XVisualInfo use the guest pointer and unsigned-long ABI. A zeroed info
 // leaves visual NULL, and the next 32-bit load of visual->class faults there.
 struct VexaVisual {
   void* ext_data;
@@ -898,10 +919,10 @@ struct VexaXVisualInfo {
   int colormap_size;
   int bits_per_rgb;
 };
-static_assert(offsetof(VexaVisual, c_class) == 0x10, "Visual.class");
-static_assert(sizeof(VexaVisual) == 56, "Visual size");
-static_assert(offsetof(VexaXVisualInfo, c_class) == 24, "XVisualInfo.class");
-static_assert(sizeof(VexaXVisualInfo) == 64, "XVisualInfo size");
+static_assert(offsetof(VexaVisual, c_class) == 2 * sizeof(void*), "Visual.class");
+static_assert(sizeof(VexaVisual) == (sizeof(void*) == 8 ? 56 : 32), "Visual size");
+static_assert(offsetof(VexaXVisualInfo, c_class) == 2 * sizeof(void*) + 8, "XVisualInfo.class");
+static_assert(sizeof(VexaXVisualInfo) == (sizeof(void*) == 8 ? 64 : 40), "XVisualInfo size");
 
 static VexaVisual g_vexa_visual = {nullptr, 1, 4, 0x00ff0000, 0x0000ff00, 0x000000ff, 8, 256};
 

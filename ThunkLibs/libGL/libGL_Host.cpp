@@ -82,7 +82,11 @@ static int VexaGLHostFprintf(FILE* stream, const char* fmt, ...) {
 // compile on Android while routing behavior through EGL/GLES.
 struct _XDisplay {};
 using Display = _XDisplay;
+#ifdef IS_32BIT_THUNK
+using guest_size_t = uint32_t;
+#else
 using guest_size_t = size_t;
+#endif
 struct Visual;
 using VisualID = unsigned long;
 
@@ -146,6 +150,15 @@ static X11Manager x11_manager;
 #endif
 
 static void* (*GuestMalloc)(guest_size_t) = nullptr;
+#ifdef BUILD_ANDROID
+static void (*GuestFree)(void*) = nullptr;
+static void fexfn_impl_libGL_GL_SetGuestFree(uintptr_t target, uintptr_t unpacker) {
+  MakeHostTrampolineForGuestFunctionAt(target, unpacker, &GuestFree);
+}
+#endif
+#ifdef BUILD_ANDROID
+#include "android_gl_guest32.h"
+#endif
 namespace {
 constexpr uint64_t kThunkGLXGetProcAddress = 0x4C4942474C0001ULL;
 constexpr uint64_t kThunkGLXCreateContext = 0x4C4942474C0002ULL;
@@ -1166,8 +1179,8 @@ static void* AndroidGuestMallocFallback(guest_size_t size) {
 
 static void fexfn_impl_libGL_GL_SetGuestMalloc(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   GLHOST_TRACE_SCOPE();
-#ifdef BUILD_ANDROID
-  // VEXA_FIXES: Android path does not rely on guest-provided malloc trampoline yet.
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  // The 64-bit guest shares the host pointer width. i386 needs guest allocation.
   fprintf(stderr, "[libGL-host] GL_SetGuestMalloc target=0x%llx unpacker=0x%llx\n",
                (unsigned long long)GuestTarget, (unsigned long long)GuestUnpacker);
   (void)GuestTarget;
@@ -1509,7 +1522,10 @@ static auto fexfn_impl_libGL_VEXA_CreateGlxContext(uintptr_t share) -> uintptr_t
       return 0;
     }
   }
-  const uintptr_t id = reinterpret_cast<uintptr_t>(context);
+  // Opaque IDs must fit both guest ABIs; EGL handles are host pointers.
+  static uint32_t next_id = 1;
+  uint32_t id;
+  do { id = next_id++; } while (!id || g_vexa_contexts.contains(id));
   g_vexa_contexts.emplace(id, VexaGuestGlxContext {context, pbuffer, window});
   fprintf(stderr, "[VEXA][GLX] create context=%p share=%p window=%d\n", context,
           reinterpret_cast<void*>(share), window);
@@ -2668,10 +2684,13 @@ static GLsync fexfn_impl_libGL_glFenceSync(GLenum condition, GLbitfield flags) {
     fprintf(stderr, "[VEXA][GL] fence n=%llu cond=%x -> %p err=%x\n",
             (unsigned long long)g_vexa_diag_fences, condition, s, glGetError());
   }
-  return s;
+  return VexaExportSync(s);
 }
 
-static void fexfn_impl_libGL_glDeleteSync(GLsync sync) { ::glDeleteSync(sync); }
+static void fexfn_impl_libGL_glDeleteSync(GLsync sync) { ::glDeleteSync(VexaImportSync(sync, true)); }
+#ifdef IS_32BIT_THUNK
+static GLboolean fexfn_impl_libGL_glIsSync(GLsync sync) { return ::glIsSync(VexaImportSync(sync)); }
+#endif
 
 static void fexfn_impl_libGL_glBeginQuery(GLenum target, GLuint id) {
   ++g_vexa_diag_queries;
@@ -2710,7 +2729,12 @@ static void fexfn_impl_libGL_glGetUniformiv(GLuint program, GLint location, GLin
 }
 
 static void fexfn_impl_libGL_glGetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar* const* uniformNames, GLuint* uniformIndices) {
+#ifdef IS_32BIT_THUNK
+  auto names = VexaExpandStrings32(uniformCount, uniformNames);
+  ::glGetUniformIndices(program, uniformCount, names.data(), uniformIndices);
+#else
   ::glGetUniformIndices(program, uniformCount, uniformNames, uniformIndices);
+#endif
 }
 
 static void fexfn_impl_libGL_glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint* uniformIndices, GLenum pname, GLint* params) {
@@ -3135,6 +3159,15 @@ static void fexfn_impl_libGL_glGetTextureLevelParameteriv(GLuint texture, GLint 
 
 using VexaMapBufferRangeFn = void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
 static void* fexfn_impl_libGL_glMapBufferOES(GLenum target, GLenum access) {
+#ifdef IS_32BIT_THUNK
+  GLint length = 0;
+  ::glGetBufferParameteriv(target, GL_BUFFER_SIZE, &length);
+  GLbitfield flags = access == GL_READ_ONLY ? GL_MAP_READ_BIT :
+                    access == GL_WRITE_ONLY ? GL_MAP_WRITE_BIT :
+                    access == GL_READ_WRITE ? GL_MAP_READ_BIT | GL_MAP_WRITE_BIT : 0;
+  return fexfn_impl_libGL_glMapBufferRange(target, 0, length, flags);
+#else
+
   static auto fn = reinterpret_cast<VexaMapBufferRangeFn>(eglGetProcAddress("glMapBufferRange"));
   if (!fn) {
     return nullptr;
@@ -3151,6 +3184,7 @@ static void* fexfn_impl_libGL_glMapBufferOES(GLenum target, GLenum access) {
     default:                        bits = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT; break;
   }
   return fn(target, 0, size, bits);
+#endif
 }
 
 using VexaBlendBarrierFn = void (*)(void);
@@ -3793,7 +3827,18 @@ static void VexaDumpFailedShaderSource(GLuint shader, const char* info) {
 
 static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const GLint* length) {
   GLHOST_TRACE_SCOPE();
+#ifdef IS_32BIT_THUNK
+  std::vector<const GLchar*> expanded;
+  if (strings && count > 0) {
+    const auto guest_strings = reinterpret_cast<const uint32_t*>(strings);
+    expanded.reserve(count);
+    for (GLsizei i = 0; i < count; ++i)
+      expanded.push_back(reinterpret_cast<const GLchar*>(uintptr_t {guest_strings[i]}));
+  }
+  const auto host_strings = expanded.empty() ? nullptr : expanded.data();
+#else
   const auto host_strings = reinterpret_cast<const GLchar* const*>(strings);
+#endif
 #if defined(BUILD_ANDROID) && defined(VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR)
   if (host_strings && count > 0) {
     GLint shader_type = 0;
@@ -3919,6 +3964,8 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
         rewritten_version = "#version 320 es";
       } else if (desktop && line.find("330") != std::string::npos) {
         rewritten_version = "#version 300 es";
+      } else if (desktop && desktop_version >= 110 && desktop_version <= 120) {
+        rewritten_version = "#version 100";
       }
       if (rewritten_version) {
         source.replace(version_pos, line_len, rewritten_version);
@@ -3926,11 +3973,19 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
           VexaStripDesktopArbExtensions(&source);
         }
         {
+          const bool to_es_100 = std::string_view{rewritten_version} == "#version 100";
           const bool to_es_320 = std::string_view{rewritten_version} == "#version 320 es";
           const size_t insert_at = VexaShaderPrecisionInsertPos(source);
-          source.insert(insert_at, kVexaShaderPrecisionEs300);
-          if (to_es_320) {
-            source.insert(insert_at + kVexaShaderPrecisionEs300.size(), kVexaShaderPrecisionEs320Extra);
+          if (to_es_100) {
+            constexpr std::string_view kVexaShaderPrecisionEs100 {
+                "precision highp float;\n"
+                "precision highp int;\n"};
+            source.insert(insert_at, kVexaShaderPrecisionEs100);
+          } else {
+            source.insert(insert_at, kVexaShaderPrecisionEs300);
+            if (to_es_320) {
+              source.insert(insert_at + kVexaShaderPrecisionEs300.size(), kVexaShaderPrecisionEs320Extra);
+            }
           }
         }
         fprintf(stderr, "[libGL-host] shader version %d -> %s type=0x%x len=%zu binding=%d\n",
@@ -3939,18 +3994,13 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
                 static_cast<unsigned>(shader_type),
                 source.size(),
                 source.find("layout(binding") != std::string::npos ? 1 : 0);
-        if (shader_type == GL_VERTEX_SHADER) {
-          // Diagnostic only: report whether a vertex SSBO was present. The
-          // buffer->uniform rewrite that used to live here was a dead end -
-          // Unity binds its instance data on the shader-storage binding point,
-          // so a uniform block at the same binding point reads nothing.
-          VexaRememberShaderSource(shader, source);
-        }
+        VexaRememberShaderSource(shader, source);
         const GLchar* rewritten = source.c_str();
         ::glShaderSource(shader, 1, &rewritten, nullptr);
         return;
       }
     }
+    VexaRememberShaderSource(shader, source);
   }
 #endif
   ::glShaderSource(shader, count, host_strings, length);
@@ -4017,14 +4067,14 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
     fprintf(stderr,
                  "[libGL-host] glGetString(GL_VERSION) desktop spoof => '%s'\n",
                  reinterpret_cast<const char*>(kDesktopVersion));
-    return kDesktopVersion;
+    return VexaGuestString(kDesktopVersion);
   }
   if (name == GL_SHADING_LANGUAGE_VERSION) {
     static const GLubyte kDesktopShading[] = "4.30";
     fprintf(stderr,
                  "[libGL-host] glGetString(GL_SHADING_LANGUAGE_VERSION) desktop spoof => '%s'\n",
                  reinterpret_cast<const char*>(kDesktopShading));
-    return kDesktopShading;
+    return VexaGuestString(kDesktopShading);
   }
   const GLubyte* result = ::glGetString(name);
   if (!result) {
@@ -4033,7 +4083,7 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
                  "[libGL-host] glGetString(name=0x%x/%s) => null; returning empty string\n",
                  static_cast<unsigned>(name),
                  GLHostGLStringName(name));
-    return kNoContextString;
+    return VexaGuestString(kNoContextString);
   }
 
   fprintf(stderr,
@@ -4042,7 +4092,7 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
                GLHostGLStringName(name),
                reinterpret_cast<const void*>(result),
                reinterpret_cast<const char*>(result));
-  return result;
+  return VexaGuestString(result);
 #else
   return fexldr_ptr_libGL_glGetString(name);
 #endif
@@ -4069,7 +4119,7 @@ const GLubyte* fexfn_impl_libGL_glGetStringi(GLenum name, GLuint index) {
                    "[libGL-host] glGetStringi(GL_EXTENSIONS index=%u) desktop spoof => '%s'\n",
                    static_cast<unsigned>(index),
                    ext);
-      return reinterpret_cast<const GLubyte*>(ext);
+      return VexaGuestString(reinterpret_cast<const GLubyte*>(ext));
     }
   }
   const GLubyte* result = ::glGetStringi(name, index);
@@ -4089,7 +4139,7 @@ const GLubyte* fexfn_impl_libGL_glGetStringi(GLenum name, GLuint index) {
                static_cast<unsigned>(index),
                reinterpret_cast<const void*>(result),
                reinterpret_cast<const char*>(result));
-  return result;
+  return VexaGuestString(result);
 #else
   return fexldr_ptr_libGL_glGetStringi(name, index);
 #endif
@@ -4138,7 +4188,7 @@ const char* fexfn_impl_libGL_glXGetClientString(Display* display, int name) {
                reinterpret_cast<void*>(display),
                name,
                result);
-  return result;
+  return VexaGuestString(result);
 #else
   return fexldr_ptr_libGL_glXGetClientString(display, name);
 #endif
@@ -4154,7 +4204,7 @@ const char* fexfn_impl_libGL_glXQueryServerString(Display* display, int screen, 
                screen,
                name,
                result ? result : "<null>");
-  return result;
+  return VexaGuestString(result);
 #else
   return fexldr_ptr_libGL_glXQueryServerString(display, screen, name);
 #endif
@@ -4243,6 +4293,17 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
   }
   std::string_view name_sv {proc_name};
 #ifdef BUILD_ANDROID
+#ifdef IS_32BIT_THUNK
+  if (name_sv == "glMapBufferRange") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glMapBufferRange);
+  if (name_sv == "glDeleteBuffers") return reinterpret_cast<VoidFn>(VexaDeleteBuffers32);
+  if (name_sv == "glGetBufferPointerv") return reinterpret_cast<VoidFn>(VexaGetBufferPointer32);
+  if (name_sv == "glUnmapBuffer") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glUnmapBuffer);
+  if (name_sv == "glFlushMappedBufferRange") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glFlushMappedBufferRange);
+  if (name_sv == "glIsSync") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glIsSync);
+  if (name_sv == "glGetUniformIndices") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetUniformIndices);
+  if (name_sv == "glTransformFeedbackVaryings") return reinterpret_cast<VoidFn>(VexaTransformFeedbackVaryings32);
+#endif
+
   fprintf(stderr, "[libGL-host] glXGetProcAddress('%s') lookup\n", proc_name);
   GLHostLogCurrentEGLState("glXGetProcAddress(entry)");
   VexaTraceThunkEvent(proc_name, VEXA_THUNK_EVENT_LOOKUP_FUNCTION, kThunkGLXGetProcAddress);
@@ -4766,7 +4827,7 @@ void glDisableClientState(GLenum /*array*/) {
 GLenum fexfn_impl_libGL_glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
   GLHOST_TRACE_SCOPE();
   ScopedGLCallTimer timer {"glClientWaitSync"};
-  GLenum r = ::glClientWaitSync(sync, flags, timeout);
+  GLenum r = ::glClientWaitSync(VexaImportSync(sync), flags, timeout);
   ++g_vexa_diag_waits;
   if ((g_vexa_diag_waits & 31) == 0 || r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
     fprintf(stderr, "[VEXA][GL] clientwait n=%llu sync=%p flags=%x tmo=%llu -> %x tid=%ld\n",
@@ -4779,13 +4840,13 @@ GLenum fexfn_impl_libGL_glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64
 void fexfn_impl_libGL_glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
   GLHOST_TRACE_SCOPE();
   ScopedGLCallTimer timer {"glWaitSync"};
-  ::glWaitSync(sync, flags, timeout);
+  ::glWaitSync(VexaImportSync(sync), flags, timeout);
 }
 
 void fexfn_impl_libGL_glGetSynciv(GLsync sync, GLenum pname, GLsizei bufSize, GLsizei* length, GLint* values) {
   GLHOST_TRACE_SCOPE();
   ScopedGLCallTimer timer {"glGetSynciv"};
-  ::glGetSynciv(sync, pname, bufSize, length, values);
+  ::glGetSynciv(VexaImportSync(sync), pname, bufSize, length, values);
 }
 
 void fexfn_impl_libGL_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels) {
@@ -4814,7 +4875,7 @@ void fexfn_impl_libGL_glFlush() {
 
 GLuint fexfn_impl_libGL_glCreateShader(GLenum a_0) {
   GLHOST_TRACE_SCOPE();
-  const GLuint shader = fexldr_ptr_libGL_glCreateShader(a_0);
+  const GLuint shader = ::glCreateShader(a_0);
   fprintf(stderr, "[libGL-host] glCreateShader(type=0x%x) => %u\n",
                static_cast<unsigned>(a_0), static_cast<unsigned>(shader));
   return shader;
@@ -4849,7 +4910,7 @@ void fexfn_impl_libGL_glAttachShader(GLuint a_0, GLuint a_1) {
                 static_cast<int>(source_len));
   LogShaderDriverError("attach-call", a_0, detail);
 #endif
-  fexldr_ptr_libGL_glAttachShader(a_0, a_1);
+  ::glAttachShader(a_0, a_1);
   fprintf(stderr, "[libGL-host] glAttachShader done program=%u shader=%u\n",
                static_cast<unsigned>(a_0), static_cast<unsigned>(a_1));
 }
@@ -4874,7 +4935,7 @@ void fexfn_impl_libGL_glDetachShader(GLuint a_0, GLuint a_1) {
                 static_cast<unsigned>(shader_type));
   LogShaderDriverError("detach-call", a_0, detail);
 #endif
-  fexldr_ptr_libGL_glDetachShader(a_0, a_1);
+  ::glDetachShader(a_0, a_1);
 }
 
 void fexfn_impl_libGL_glShaderSource(GLuint a_0, GLsizei count, guest_layout<const GLchar* const*> a_2, const GLint* a_3) {
@@ -4889,7 +4950,7 @@ void fexfn_impl_libGL_glShaderSourceARB(GLuint a_0, GLsizei count, guest_layout<
 
 void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
   GLHOST_TRACE_SCOPE();
-  fexldr_ptr_libGL_glCompileShader(a_0);
+  ::glCompileShader(a_0);
   GLint compiled = GL_FALSE;
   ::glGetShaderiv(a_0, GL_COMPILE_STATUS, &compiled);
   if (compiled != GL_TRUE) {
@@ -4918,7 +4979,7 @@ void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
 void fexfn_impl_libGL_glLinkProgram(GLuint a_0) {
   GLHOST_TRACE_SCOPE();
   fprintf(stderr, "[libGL-host] glLinkProgram(%u) enter\n", static_cast<unsigned>(a_0));
-  fexldr_ptr_libGL_glLinkProgram(a_0);
+  ::glLinkProgram(a_0);
   if (access("/data/data/com.critical.vexaemulator/files/unity_shader_dump.flag", F_OK) == 0) {
     GLuint shaders[8] = {};
     GLsizei count = 0;
@@ -4978,11 +5039,7 @@ void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1) {
   }
   if (a_0 == GL_NUM_EXTENSIONS) {
     GLint real_count = 0;
-    if (fexldr_ptr_libGL_glGetIntegerv) {
-      fexldr_ptr_libGL_glGetIntegerv(GL_NUM_EXTENSIONS, &real_count);
-    } else {
-      ::glGetIntegerv(GL_NUM_EXTENSIONS, &real_count);
-    }
+    ::glGetIntegerv(GL_NUM_EXTENSIONS, &real_count);
     if (real_count < 0) {
       real_count = 0;
     }
@@ -4990,11 +5047,7 @@ void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1) {
     return;
   }
 
-  if (fexldr_ptr_libGL_glGetIntegerv) {
-    fexldr_ptr_libGL_glGetIntegerv(a_0, a_1);
-  } else {
-    ::glGetIntegerv(a_0, a_1);
-  }
+  ::glGetIntegerv(a_0, a_1);
   // VEXA diag: engines may cache the "default framebuffer" from this query.
   if (a_0 == GL_DRAW_FRAMEBUFFER_BINDING || a_0 == GL_READ_FRAMEBUFFER_BINDING) {
     static int fbq_logged = 0;
@@ -5533,4 +5586,43 @@ void fexfn_impl_libGL_glXGetSelectedEventSGIX(Display* Display, GLXDrawable Draw
 }
 #endif
 
+#if defined(BUILD_ANDROID)
+extern "C" ExportEntry* fexthunks_exports_libGL() {
+  if (!fexldr_init_libGL()) return nullptr;
+  // Direct ELF PLT calls (e.g. Dead Cells sdl.hdll -> glGetString) and i386
+  // guest packers route through fexfn_unpack_libGL_<name> -> fexldr_ptr_libGL_<name>.
+  // Any proc in FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN that isn't marked
+  // custom_host_impl in libGL_interface.cpp must have its fexldr_ptr_libGL_<name>
+  // bound to the same VEXA wrapper returned by glXGetProcAddress.
+#define VEXA_BIND_HOST_WRAPPER(name) \
+  fexldr_ptr_libGL_##name = reinterpret_cast<fexldr_type_libGL_##name*>( \
+    fexfn_impl_libGL_glXGetProcAddress(reinterpret_cast<const GLubyte*>(#name)));
+  VEXA_BIND_HOST_WRAPPER(glGetString)
+  VEXA_BIND_HOST_WRAPPER(glGetStringi)
+  VEXA_BIND_HOST_WRAPPER(glGetIntegerv)
+  VEXA_BIND_HOST_WRAPPER(glGetInternalformativ)
+  VEXA_BIND_HOST_WRAPPER(glCreateShader)
+  VEXA_BIND_HOST_WRAPPER(glCompileShader)
+  VEXA_BIND_HOST_WRAPPER(glAttachShader)
+  VEXA_BIND_HOST_WRAPPER(glDetachShader)
+  VEXA_BIND_HOST_WRAPPER(glLinkProgram)
+  VEXA_BIND_HOST_WRAPPER(glFlush)
+  VEXA_BIND_HOST_WRAPPER(glWaitSync)
+  VEXA_BIND_HOST_WRAPPER(glTexStorage2D)
+  VEXA_BIND_HOST_WRAPPER(glTexStorage3D)
+  VEXA_BIND_HOST_WRAPPER(glCompressedTexImage2D)
+#ifdef IS_32BIT_THUNK
+  VEXA_BIND_HOST_WRAPPER(glMapBufferRange)
+  VEXA_BIND_HOST_WRAPPER(glDeleteBuffers)
+  VEXA_BIND_HOST_WRAPPER(glGetBufferPointerv)
+  VEXA_BIND_HOST_WRAPPER(glUnmapBuffer)
+  VEXA_BIND_HOST_WRAPPER(glFlushMappedBufferRange)
+  VEXA_BIND_HOST_WRAPPER(glIsSync)
+  VEXA_BIND_HOST_WRAPPER(glTransformFeedbackVaryings)
+#endif
+#undef VEXA_BIND_HOST_WRAPPER
+  return exports;
+}
+#else
 EXPORTS(libGL)
+#endif

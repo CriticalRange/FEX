@@ -228,14 +228,6 @@ if (BITNESS EQUAL 64)
 
   endif()
 
-  # VEXA_FIXES: OpenAL is independent of SDL3. The Android libasound shim
-  # dlopens libopenal.so.1 and this guest thunk forwards it to host OpenSL.
-  if ((NOT ANDROID AND NOT BUILD_ANDROID) OR NOT VEXA_OPENAL_PREFIX STREQUAL "")
-  generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp)
-  add_guest_lib(openal "libopenal.so.1")
-  target_include_directories(libopenal-guest-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
-  endif()
-
   # VEXA_FIXES: SDL2 guest thunk (interface+impl based; replaces old stock stub).
   # SONAME must match the real SDL2 soname so dlopen("libSDL2-2.0.so.0", RTLD_NOLOAD)
   # re-finds this thunk after the first load (see soname override in add_guest_lib).
@@ -269,6 +261,13 @@ if (BITNESS EQUAL 64)
     target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
     add_guest_lib(drm "libdrm.so.2")
   endif()
+endif()
+
+# VEXA_FIXES: OpenAL is independent of SDL3 and supports both 32-bit and 64-bit guests.
+if ((NOT ANDROID AND NOT BUILD_ANDROID) OR NOT VEXA_OPENAL_PREFIX STREQUAL "")
+  generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp)
+  add_guest_lib(openal "libopenal.so.1")
+  target_include_directories(libopenal-guest-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
 endif()
 
   # VEXA_FIXES: Keep Wayland guest thunk optional because Android toolchains/rootfs setups
