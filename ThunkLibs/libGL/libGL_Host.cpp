@@ -1220,6 +1220,40 @@ struct VexaGlxState {
   bool ready = false;
 };
 
+// Headless runs must not touch a SurfaceTexture-backed ANativeWindow at all:
+// eglSwapBuffers would queue a buffer, the consumer's frame-available callback
+// jumps into Java on this (guest render) thread, and a managed fault there is
+// eaten by the FEX host-signal handler instead of becoming an NPE. A pbuffer
+// keeps the whole present path inside EGL.
+static bool VexaHeadlessMode() {
+  static const bool headless = [] {
+    const char* e = getenv("VEXA_HEADLESS");
+    return e && (e[0] == '1' || !strcmp(e, "true"));
+  }();
+  return headless;
+}
+
+static int VexaHeadlessEnvInt(const char* name, int fallback) {
+  const char* v = getenv(name);
+  if (!v || !v[0]) return fallback;
+  const long n = strtol(v, nullptr, 10);
+  return n > 0 ? static_cast<int>(n) : fallback;
+}
+
+// The fake X11/RandR layer reads the guest-visible size from a file the app
+// publishes. With no real window nobody writes it; mirror the headless
+// SurfaceTexture dimensions so the guest does not believe the screen is 0x0.
+static void VexaPublishGuestSize(int w, int h) {
+  using Pub = void (*)(int, int);
+  static const Pub fn = [] {
+    if (void* vexa = dlopen("libvexa.so", RTLD_NOW | RTLD_NOLOAD)) {
+      return reinterpret_cast<Pub>(dlsym(vexa, "Vexa_PublishGuestWindowSize"));
+    }
+    return Pub{};
+  }();
+  if (fn) fn(w, h);
+}
+
 // The SurfaceView can hand us a new ANativeWindow at any time (surface
 // recreated). eglSwapBuffers against the old window still "works" — frames are
 // queued into a surface nobody composites — which is exactly a black screen.
@@ -1292,6 +1326,7 @@ static VexaGlxState g_vexa_glx;
 // failure so a later bind/swap can retry. Do not bind the bootstrap context:
 // Unity's render and resource threads own separate guest contexts.
 static bool VexaRefreshGlxSurface() {
+  if (VexaHeadlessMode()) return g_vexa_glx.surface != EGL_NO_SURFACE;
   const uint64_t serial = VexaRuntimeSurfaceSerial();
   if (!serial || serial == g_vexa_glx.window_serial) return true;
   ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
@@ -1330,13 +1365,14 @@ static bool VexaEnsureGlx() {
     fprintf(stderr, "[VEXA][GLX] eglMakeCurrent failed 0x%x\n", eglGetError());
     return false;
   }
-  ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
-  if (!window) {
+  const bool headless = VexaHeadlessMode();
+  ANativeWindow* window = headless ? nullptr : VexaAcquireRuntimeWindow(2000);
+  if (!window && !headless) {
     return false;
   }
   EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (display == EGL_NO_DISPLAY || eglInitialize(display, nullptr, nullptr) != EGL_TRUE) {
-    ANativeWindow_release(window);
+    if (window) ANativeWindow_release(window);
     fprintf(stderr, "[VEXA][GLX] eglInitialize failed 0x%x\n", eglGetError());
     return false;
   }
@@ -1356,18 +1392,29 @@ static bool VexaEnsureGlx() {
   EGLConfig config = nullptr;
   EGLint count = 0;
   if (eglChooseConfig(display, config_attribs, &config, 1, &count) != EGL_TRUE || count < 1) {
-    ANativeWindow_release(window);
+    if (window) ANativeWindow_release(window);
     fprintf(stderr, "[VEXA][GLX] eglChooseConfig failed 0x%x\n", eglGetError());
     return false;
   }
   EGLint format = 0;
-  if (eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format) == EGL_TRUE && format != 0) {
+  if (window &&
+      eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format) == EGL_TRUE && format != 0) {
     ANativeWindow_setBuffersGeometry(window, 0, 0, format);
   }
-  EGLSurface surface = eglCreateWindowSurface(display, config, window, nullptr);
+  EGLSurface surface = EGL_NO_SURFACE;
+  int headless_w = 0, headless_h = 0;
+  if (headless) {
+    headless_w = VexaHeadlessEnvInt("VEXA_HEADLESS_W", 1280);
+    headless_h = VexaHeadlessEnvInt("VEXA_HEADLESS_H", 720);
+    const EGLint pbattrs[] = {EGL_WIDTH, headless_w, EGL_HEIGHT, headless_h, EGL_NONE};
+    surface = eglCreatePbufferSurface(display, config, pbattrs);
+  } else {
+    surface = eglCreateWindowSurface(display, config, window, nullptr);
+  }
   if (surface == EGL_NO_SURFACE) {
-    fprintf(stderr, "[VEXA][GLX] eglCreateWindowSurface failed 0x%x\n", eglGetError());
-    ANativeWindow_release(window);
+    fprintf(stderr, "[VEXA][GLX] eglCreate%sSurface failed 0x%x\n",
+            headless ? "Pbuffer" : "Window", eglGetError());
+    if (window) ANativeWindow_release(window);
     return false;
   }
   // Indirect draws and compute need GLES 3.1. Fall back if the driver rejects a version.
@@ -1400,7 +1447,7 @@ static bool VexaEnsureGlx() {
   }
   if (context == EGL_NO_CONTEXT) {
     eglDestroySurface(display, surface);
-    ANativeWindow_release(window);
+    if (window) ANativeWindow_release(window);
     return false;
   }
   g_vexa_glx.display = display;
@@ -1411,8 +1458,11 @@ static bool VexaEnsureGlx() {
   g_vexa_glx.window = window;
   g_vexa_glx.window_serial = VexaRuntimeSurfaceSerial();
   g_vexa_glx.ready = true;
-  fprintf(stderr, "[VEXA][GLX] surface ready %p gles %s serial %llu\n", surface, ctx_name,
-          (unsigned long long)g_vexa_glx.window_serial);
+  fprintf(stderr, "[VEXA][GLX] surface ready %p gles %s serial %llu headless=%d\n", surface, ctx_name,
+          (unsigned long long)g_vexa_glx.window_serial, headless ? 1 : 0);
+  if (headless) {
+    VexaPublishGuestSize(headless_w, headless_h);
+  }
   fexfn_impl_libGL_glViewport(0, 0, 300, 300);
   return true;
 }
@@ -1933,14 +1983,19 @@ static VexaVisibleRect VexaVisibleRectFor(GLsizei width, GLsizei height) {
   static int surface_w = 0;
   static int surface_h = 0;
   if (surface_w <= 0 || surface_h <= 0 || surface_h > surface_w) {
-    ANativeWindow* window = VexaAcquireRuntimeWindow(0);
-    if (window) {
-      const int w = ANativeWindow_getWidth(window);
-      const int h = ANativeWindow_getHeight(window);
-      ANativeWindow_release(window);
-      if (w > 0 && h > 0) {
-        surface_w = w;
-        surface_h = h;
+    if (VexaHeadlessMode()) {
+      surface_w = VexaHeadlessEnvInt("VEXA_HEADLESS_W", 1280);
+      surface_h = VexaHeadlessEnvInt("VEXA_HEADLESS_H", 720);
+    } else {
+      ANativeWindow* window = VexaAcquireRuntimeWindow(0);
+      if (window) {
+        const int w = ANativeWindow_getWidth(window);
+        const int h = ANativeWindow_getHeight(window);
+        ANativeWindow_release(window);
+        if (w > 0 && h > 0) {
+          surface_w = w;
+          surface_h = h;
+        }
       }
     }
   }
