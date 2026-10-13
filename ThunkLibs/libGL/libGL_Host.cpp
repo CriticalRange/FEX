@@ -1238,6 +1238,9 @@ static uint64_t VexaRuntimeSurfaceSerial() {
 static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
 
 extern uint64_t g_vexa_diag_draws;
+// VEXA_FIXES: Swap counter, so a long frame can be lined up against what else
+// happened at that moment (shader compiles, buffer uploads).
+static uint64_t g_vexa_swap_no = 0;
 // VEXA diag: when non-zero, the diag wrappers log every call (one frame only).
 static int g_vexa_trace_frame = 0;
 // VEXA: set when the guest draws/clears/blits into FB0 during the current frame.
@@ -1832,10 +1835,67 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
     }
     if ((diag_swaps & 127) == 0) {
       fprintf(stderr,
-              "[VEXA][GLX] diag swaps=%d draws=%llu clears=%llu useprog=%llu bindfbo=%llu\n",
+              "[VEXA][GLX] diag swaps=%d draws=%llu clears=%llu useprog=%llu bindfbo=%llu calls=%llu calls/frame=%.1f\n",
               diag_swaps, (unsigned long long)g_vexa_diag_draws, (unsigned long long)g_vexa_diag_clears,
-              (unsigned long long)g_vexa_diag_useprog, (unsigned long long)g_vexa_diag_bindfbo);
+              (unsigned long long)g_vexa_diag_useprog, (unsigned long long)g_vexa_diag_bindfbo,
+              (unsigned long long)GLHostTraceSeq.load(),
+              diag_swaps > 0 ? (double)GLHostTraceSeq.load() / diag_swaps : 0.0);
     }
+  }
+  // Frame-time distribution. An average hides stutter completely: a run can
+  // average 20 ms while every twentieth frame takes 200 ms, and that is what
+  // the player feels. Report the tail, not just the mean.
+  {
+    static int frame_no = 0;
+    static uint64_t last_ns = 0;
+    static uint64_t ring[256];
+    static unsigned ring_pos = 0;
+    static unsigned ring_n = 0;
+    const uint64_t now_ns = GLHostNowNs();
+    if (last_ns != 0 && now_ns > last_ns) {
+      const uint64_t dt_ns = now_ns - last_ns;
+      const uint64_t prev_draws = g_vexa_diag_draws;
+      const uint64_t prev_useprog = g_vexa_diag_useprog;
+      const uint64_t prev_bindfbo = g_vexa_diag_bindfbo;
+      ring[ring_pos] = dt_ns;
+      ring_pos = (ring_pos + 1) % 256;
+      if (ring_n < 256) {
+        ++ring_n;
+      }
+      if (dt_ns > 33ull * 1000000ull) {
+        fprintf(stderr,
+                "[VEXA][SPIKE] swap=%llu frame=%.2fms draws=%llu->%llu useprog=%llu->%llu bindfbo=%llu\n",
+                static_cast<unsigned long long>(g_vexa_swap_no),
+                static_cast<double>(dt_ns) / 1e6,
+                static_cast<unsigned long long>(prev_draws), static_cast<unsigned long long>(g_vexa_diag_draws),
+                static_cast<unsigned long long>(prev_useprog), static_cast<unsigned long long>(g_vexa_diag_useprog),
+                static_cast<unsigned long long>(prev_bindfbo));
+      }
+      if ((frame_no & 127) == 0 && ring_n > 32) {
+        uint64_t sorted[256];
+        std::memcpy(sorted, ring, ring_n * sizeof(uint64_t));
+        std::sort(sorted, sorted + ring_n);
+        uint64_t sum = 0;
+        for (unsigned i = 0; i < ring_n; ++i) {
+          sum += sorted[i];
+        }
+        unsigned over_33 = 0;
+        for (unsigned i = 0; i < ring_n; ++i) {
+          if (sorted[i] > 33ull * 1000000ull) {
+            ++over_33;
+          }
+        }
+        const auto ms = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+        fprintf(stderr,
+                "[VEXA][FRAME] n=%u avg=%.2fms p50=%.2f p90=%.2f p99=%.2f max=%.2f over33=%u (%.1f%%)\n",
+                ring_n, ms(sum / ring_n), ms(sorted[ring_n / 2]), ms(sorted[(ring_n * 9) / 10]),
+                ms(sorted[(ring_n * 99) / 100]), ms(sorted[ring_n - 1]), over_33,
+                100.0 * over_33 / ring_n);
+      }
+    }
+    last_ns = now_ns;
+    ++frame_no;
+    ++g_vexa_swap_no;
   }
   if (eglSwapBuffers(g_vexa_glx.display, g_vexa_glx.surface) != EGL_TRUE) {
     fprintf(stderr, "[VEXA][GLX] eglSwapBuffers failed 0x%x\n", eglGetError());
