@@ -229,21 +229,23 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
       target_link_libraries(SDL2-host-${GUEST_BITNESS} PRIVATE EGL GLESv3 log android)
     endif()
   endif()
-  # VEXA_FIXES: OpenAL host thunk plays for the guest libasound shim. It does not
-  # require the SDL3 prefix.
+endforeach()
+
+if (ANDROID)
+  set(BITNESS_LIST "64")
+  if (VEXA_BUILD_32BIT_THUNKS)
+    list(APPEND BITNESS_LIST 32)
+  endif()
+else()
+  set(BITNESS_LIST "32;64")
+endif()
+foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
+  # VEXA_FIXES: OpenAL host thunk plays for the guest libasound shim and 32/64-bit OpenAL guests.
   if (ANDROID AND NOT VEXA_OPENAL_PREFIX STREQUAL "")
     generate(libopenal ${CMAKE_CURRENT_SOURCE_DIR}/../libopenal/libopenal_interface.cpp ${GUEST_BITNESS})
     target_include_directories(libopenal-${GUEST_BITNESS}-deps INTERFACE ${VEXA_OPENAL_PREFIX}/include)
     add_host_lib(openal ${GUEST_BITNESS})
   endif()
-endforeach()
-
-if (ANDROID)
-  set(BITNESS_LIST "64")
-else()
-  set(BITNESS_LIST "32;64")
-endif()
-foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   if (BUILD_FEX_LINUX_TESTS)
     generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp ${GUEST_BITNESS})
     add_host_lib(fex_thunk_test ${GUEST_BITNESS})
@@ -252,7 +254,7 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   # VEXA_FIXES: Disable Vulkan thunk build when not needed (Hytale is OpenGL-first).
   # Vulkan thunk path pulls Linux desktop headers from Vulkan-Headers (eg xcb),
   # which are not available in Android NDK cross-build environments.
-  if (ENABLE_VULKAN_THUNKS)
+  if (ENABLE_VULKAN_THUNKS AND (NOT ANDROID OR GUEST_BITNESS EQUAL 64))
     generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
     target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
     # VEXA_FIXES: Minimal X11/xcb stub headers so vulkan.h platform sections
@@ -273,7 +275,7 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   endif()
 
   # VEXA_FIXES: Keep EGL host thunk optional for Android-focused bring-up.
-  if (ENABLE_EGL_THUNKS)
+  if (ENABLE_EGL_THUNKS AND (NOT ANDROID OR GUEST_BITNESS EQUAL 64))
     generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp ${GUEST_BITNESS})
     add_host_lib(EGL ${GUEST_BITNESS})
     # VEXA_FIXES: Android GL host thunk stack resolves through system EGL, not desktop OpenGL.

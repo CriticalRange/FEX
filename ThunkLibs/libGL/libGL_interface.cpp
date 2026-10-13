@@ -79,6 +79,11 @@ struct fex_gen_config<VEXA_FFDelete> : fexgen::custom_host_impl {};
 // VEXA_FIXES: Host callback setters are runtime wiring hooks populated from
 // guest side during libGL thunk initialization.
 void GL_SetGuestMalloc(uintptr_t, uintptr_t);
+#ifdef BUILD_ANDROID
+void GL_SetGuestFree(uintptr_t, uintptr_t);
+template<>
+struct fex_gen_config<GL_SetGuestFree> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
+#endif
 void GL_SetGuestXSync(uintptr_t, uintptr_t);
 void GL_SetGuestXGetVisualInfo(uintptr_t, uintptr_t);
 void GL_SetGuestXDisplayString(uintptr_t, uintptr_t);
@@ -144,6 +149,12 @@ template<>
 struct fex_gen_config<FEX_glShaderSource> : fexgen::custom_host_impl {};
 
 #ifdef BUILD_ANDROID
+// No callback is invoked by Android's debug callback shim; avoid constructing
+// a native trampoline whose address would be truncated for i386.
+template<>
+struct fex_gen_param<glDebugMessageCallback, 0, GLDEBUGPROC> : fexgen::ptr_passthrough {};
+template<>
+struct fex_gen_param<glGetBufferPointerv, 2, void**> : fexgen::assume_compatible_data_layout {};
 // VEXA_FIXES: Generate custom config entries from Android proc allowlist to keep
 // thunkgen and host/guest proc maps aligned with android_gl_proc_list.h.
 template<>
