@@ -18,7 +18,10 @@ $end_info$
 
 #include "common/Host.h"
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -70,6 +73,72 @@ static void DoSetupWithInstance(VkInstance instance) {
 }
 
 #define FEXFN_IMPL(fn) fexfn_impl_libvulkan_##fn
+
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+// Opt-in host wall times distinguish buffer-queue/fence waits from guest work.
+// Each thread keeps its own counters; normal launches avoid reading the clock.
+struct VexaVkWallTime {
+  uint64_t Calls {}, Ns {}, CpuNs {}, MaxNs {};
+  static uint64_t ThreadCpuNs() {
+    timespec time {};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
+    return static_cast<uint64_t>(time.tv_sec) * 1000000000 + time.tv_nsec;
+  }
+  void Add(const char* name, std::chrono::steady_clock::time_point start, VkResult result, uint64_t cpuStart) {
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    ++Calls;
+    Ns += ns;
+    CpuNs += ThreadCpuNs() - cpuStart;
+    MaxNs = std::max(MaxNs, static_cast<uint64_t>(ns));
+    if (Calls % 256 == 0) {
+      fprintf(stderr, "[VEXA][VK-PERF] %s calls=%llu avg_ms=%.4f cpu_avg_ms=%.4f max_ms=%.4f result=%d\n", name,
+              static_cast<unsigned long long>(Calls), Ns / 256.0e6, CpuNs / 256.0e6, MaxNs / 1.0e6, static_cast<int>(result));
+      Ns = CpuNs = MaxNs = 0;
+    }
+  }
+};
+static bool VexaVkProfileEnabled() {
+  static const bool enabled = [] { const char* value = std::getenv("VEXA_VK_PROFILE"); return value && std::strcmp(value, "1") == 0; }();
+  return enabled;
+}
+static VkResult FEXFN_IMPL(vkAcquireNextImageKHR)(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                                VkSemaphore semaphore, VkFence fence, uint32_t* image) {
+  if (!VexaVkProfileEnabled()) return LDR_PTR(vkAcquireNextImageKHR)(device, swapchain, timeout, semaphore, fence, image);
+  const auto start = std::chrono::steady_clock::now();
+  const auto cpuStart = VexaVkWallTime::ThreadCpuNs();
+  const auto result = LDR_PTR(vkAcquireNextImageKHR)(device, swapchain, timeout, semaphore, fence, image);
+  static thread_local VexaVkWallTime stats;
+  stats.Add("acquire", start, result, cpuStart);
+  return result;
+}
+static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* info) {
+  if (!VexaVkProfileEnabled()) return LDR_PTR(vkQueuePresentKHR)(queue, info);
+  const auto start = std::chrono::steady_clock::now();
+  const auto cpuStart = VexaVkWallTime::ThreadCpuNs();
+  static thread_local uint64_t calls {};
+  if (++calls <= 4 || calls % 256 == 0) {
+    fprintf(stderr, "[VEXA][VK-PERF] present-info swapchains=%u waits=%u", info->swapchainCount, info->waitSemaphoreCount);
+    unsigned depth {};
+    for (auto next = static_cast<const VkBaseInStructure*>(info->pNext); next && depth++ < 8; next = next->pNext) {
+      fprintf(stderr, " next=%u", static_cast<unsigned>(next->sType));
+    }
+    fprintf(stderr, "\n");
+  }
+  const auto result = LDR_PTR(vkQueuePresentKHR)(queue, info);
+  static thread_local VexaVkWallTime stats;
+  stats.Add("present", start, result, cpuStart);
+  return result;
+}
+static VkResult FEXFN_IMPL(vkWaitForFences)(VkDevice device, uint32_t count, const VkFence* fences, VkBool32 all, uint64_t timeout) {
+  if (!VexaVkProfileEnabled()) return LDR_PTR(vkWaitForFences)(device, count, fences, all, timeout);
+  const auto start = std::chrono::steady_clock::now();
+  const auto cpuStart = VexaVkWallTime::ThreadCpuNs();
+  const auto result = LDR_PTR(vkWaitForFences)(device, count, fences, all, timeout);
+  static thread_local VexaVkWallTime stats;
+  stats.Add("fence", start, result, cpuStart);
+  return result;
+}
+#endif
 
 #if defined(BUILD_ANDROID)
 // VEXA_FIXES: Android has no X11/xcb server. The three Vulkan_SetGuestX* internal
@@ -322,6 +391,12 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
 // The device create info does not carry the physical device, and swapchain
 // extent checks need it for vkGetPhysicalDeviceSurfaceCapabilitiesKHR.
 static VkPhysicalDevice g_vexa_physical_device = VK_NULL_HANDLE;
+#ifndef IS_32BIT_THUNK
+static void VexaDestroyPassProfiles(VkDevice device);
+#include "vulkan_gpu_profile.inc"
+#include "vulkan_pass_profile.inc"
+#include "vulkan_shader_opt.inc"
+#endif
 
 static VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice a_0, VkSurfaceKHR a_1, VkSurfaceCapabilitiesKHR* a_2) {
   if (!LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)) {
@@ -353,6 +428,20 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
     return VK_ERROR_INITIALIZATION_FAILED;
   }
   VkSwapchainCreateInfoKHR copy = *a_1;
+  // Offscreen performance experiments may opt out of FIFO pacing. Never
+  // request a mode the actual Android surface does not advertise.
+  const char* mailbox = std::getenv("VEXA_VK_MAILBOX");
+  if (mailbox && std::strcmp(mailbox, "1") == 0 && g_vexa_physical_device && LDR_PTR(vkGetPhysicalDeviceSurfacePresentModesKHR)) {
+    uint32_t count {};
+    if (LDR_PTR(vkGetPhysicalDeviceSurfacePresentModesKHR)(g_vexa_physical_device, copy.surface, &count, nullptr) == VK_SUCCESS && count) {
+      std::vector<VkPresentModeKHR> modes(count);
+      if (LDR_PTR(vkGetPhysicalDeviceSurfacePresentModesKHR)(g_vexa_physical_device, copy.surface, &count, modes.data()) == VK_SUCCESS &&
+          std::find(modes.begin(), modes.begin() + count, VK_PRESENT_MODE_MAILBOX_KHR) != modes.begin() + count) {
+        fprintf(stderr, "[VEXA][VK] opt-in present mode %d -> MAILBOX\n", static_cast<int>(copy.presentMode));
+        copy.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+      }
+    }
+  }
   if (g_vexa_physical_device && copy.surface && LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)) {
     VkSurfaceCapabilitiesKHR caps {};
     const VkResult caps_result = LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(g_vexa_physical_device, copy.surface, &caps);
@@ -387,6 +476,13 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
     return VK_ERROR_EXTENSION_NOT_PRESENT;
   }
   const VkResult result = LDR_PTR(vkCreateSwapchainKHR)(a_0, &copy, nullptr, a_3);
+#ifndef IS_32BIT_THUNK
+  if (VexaVkProfileEnabled()) {
+    fprintf(stderr, "[VEXA][VK-PERF] swapchain result=%d extent=%ux%u images=%u mode=%d format=%d usage=0x%x\n",
+            static_cast<int>(result), copy.imageExtent.width, copy.imageExtent.height, copy.minImageCount,
+            static_cast<int>(copy.presentMode), static_cast<int>(copy.imageFormat), static_cast<unsigned>(copy.imageUsage));
+  }
+#endif
   if (result != VK_SUCCESS) {
     fprintf(stderr, "[VEXA][VK] vkCreateSwapchainKHR -> %d extent %ux%u format %d alpha 0x%x transform 0x%x\n", (int)result, copy.imageExtent.width,
             copy.imageExtent.height, (int)copy.imageFormat, (unsigned)copy.compositeAlpha, (unsigned)copy.preTransform);
@@ -400,7 +496,24 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
 static VkResult
 FEXFN_IMPL(vkCreateShaderModule)(VkDevice a_0, const VkShaderModuleCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkShaderModule* a_3) {
   (void*&)LDR_PTR(vkCreateShaderModule) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateShaderModule");
-  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);
+  const VkShaderModuleCreateInfo* effective = a_1;
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  auto optimized = VexaOptimizeShader(a_1);
+  VkShaderModuleCreateInfo copy {};
+  if (!optimized.empty()) { copy = *a_1; copy.pCode = optimized.data(); copy.codeSize = optimized.size() * sizeof(uint32_t); effective = &copy; }
+#endif
+  auto result = LDR_PTR(vkCreateShaderModule)(a_0, effective, nullptr, a_3);
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  if (result != VK_SUCCESS && effective != a_1) {
+    fprintf(stderr, "[VEXA][VK-OPT] optimized module rejected (%d); using original\n", static_cast<int>(result));
+    effective = a_1;
+    result = LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);
+  }
+#endif
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  if (result == VK_SUCCESS && VexaVkProfileEnabled()) VexaDumpShader(*a_3, effective);
+#endif
+  return result;
 }
 
 static VkBool32
@@ -675,6 +788,10 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
   } else if (a_1 == "vkGetPhysicalDeviceXlibPresentationSupportKHR"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportKHR;
 #if defined(BUILD_ANDROID)
+  } else if (a_1 == "vkCreateSwapchainKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateSwapchainKHR;
+  } else if (a_1 == "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
   } else if (a_1 == "vkCreateAndroidSurfaceKHR"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateAndroidSurfaceKHR;
   } else if (a_1 == "vkCreateXlibSurfaceKHR"sv) {
@@ -689,6 +806,42 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkEnumerateInstanceExtensionProperties;
   } else if (a_1 == "vkCreateDisplayPlaneSurfaceKHR"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDisplayPlaneSurfaceKHR;
+#ifndef IS_32BIT_THUNK
+  } else if (a_1 == "vkCmdBindPipeline"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdBindPipeline;
+  } else if (a_1 == "vkCmdExecuteCommands"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdExecuteCommands;
+  } else if (a_1 == "vkCreateCommandPool"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateCommandPool;
+  } else if (a_1 == "vkDestroyCommandPool"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyCommandPool;
+  } else if (a_1 == "vkAllocateCommandBuffers"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAllocateCommandBuffers;
+  } else if (a_1 == "vkFreeCommandBuffers"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeCommandBuffers;
+  } else if (a_1 == "vkBeginCommandBuffer"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkBeginCommandBuffer;
+  } else if (a_1 == "vkCmdBeginRenderPass"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdBeginRenderPass;
+  } else if (a_1 == "vkCmdEndRenderPass"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdEndRenderPass;
+  } else if (a_1 == "vkCmdDispatch"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdDispatch;
+  } else if (a_1 == "vkCreateGraphicsPipelines"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateGraphicsPipelines;
+  } else if (a_1 == "vkGetDeviceQueue"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceQueue;
+  } else if (a_1 == "vkQueueSubmit"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkQueueSubmit;
+  } else if (a_1 == "vkDestroyDevice"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDevice;
+  } else if (a_1 == "vkAcquireNextImageKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAcquireNextImageKHR;
+  } else if (a_1 == "vkQueuePresentKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkQueuePresentKHR;
+  } else if (a_1 == "vkWaitForFences"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkWaitForFences;
+#endif
 #endif
 #ifdef IS_32BIT_THUNK
   } else if (a_1 == "vkAllocateCommandBuffers"sv) {

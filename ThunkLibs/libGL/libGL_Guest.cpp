@@ -1134,6 +1134,11 @@ static int vexa_glx_attrib(int attribute, int* value) {
       *value = limit < 4096 ? 4096 : limit;
       break;
     }
+    case 0x20B2: {  // GLX_FRAMEBUFFER_SRGB_CAPABLE_EXT
+      const char* flag = getenv("VEXA_GL_SRGB_SURFACE");
+      *value = flag && strcmp(flag, "1") == 0 ? 1 : 0;
+      break;
+    }
     case 0x80A9: *value = 0; break;  // GLX_SAMPLES
     default: *value = 0; break;
   }
