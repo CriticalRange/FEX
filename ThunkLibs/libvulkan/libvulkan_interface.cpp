@@ -1612,7 +1612,11 @@ struct fex_gen_config<vkCreateDevice> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_param<vkCreateDevice, 3, VkDevice*> : fexgen::ptr_passthrough {};
 template<>
-struct fex_gen_config<vkDestroyDevice> {};
+struct fex_gen_config<vkDestroyDevice>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 #if defined(BUILD_ANDROID)
 // VEXA_FIXES: Spoof foreign-WSI instance extensions on Android.
 template<>
@@ -1629,7 +1633,11 @@ template<>
 struct fex_gen_config<vkEnumerateDeviceLayerProperties> {};
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkGetDeviceQueue> {};
+struct fex_gen_config<vkGetDeviceQueue>
+#if defined(BUILD_ANDROID)
+  : fexgen::custom_host_impl
+#endif
+{};
 #else
 template<>
 struct fex_gen_config<vkGetDeviceQueue> : fexgen::custom_host_impl {};
@@ -1638,7 +1646,11 @@ struct fex_gen_param<vkGetDeviceQueue, 3, VkQueue*> : fexgen::ptr_passthrough {}
 #endif
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkQueueSubmit> {};
+struct fex_gen_config<vkQueueSubmit>
+#if defined(BUILD_ANDROID)
+  : fexgen::custom_host_impl
+#endif
+{};
 #else
 // Needs array repacking for multiple submit infos
 template<>
@@ -1702,7 +1714,11 @@ template<>
 struct fex_gen_config<vkGetFenceStatus> {};
 #endif
 template<>
-struct fex_gen_config<vkWaitForFences> {};
+struct fex_gen_config<vkWaitForFences>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkCreateSemaphore> {};
 template<>
@@ -1770,7 +1786,11 @@ struct fex_gen_config<vkMergePipelineCaches> {};
 #endif
 // TODO: Should be custom_host_impl since there may be more than one VkGraphicsPipelineCreateInfo and more than one output pipeline
 template<>
-struct fex_gen_config<vkCreateGraphicsPipelines> {};
+struct fex_gen_config<vkCreateGraphicsPipelines>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCreateComputePipelines> {};
@@ -1821,14 +1841,26 @@ struct fex_gen_config<vkDestroyRenderPass> {};
 template<>
 struct fex_gen_config<vkGetRenderAreaGranularity> {};
 template<>
-struct fex_gen_config<vkCreateCommandPool> {};
+struct fex_gen_config<vkCreateCommandPool>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkDestroyCommandPool> {};
+struct fex_gen_config<vkDestroyCommandPool>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkResetCommandPool> {};
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkAllocateCommandBuffers> {};
+struct fex_gen_config<vkAllocateCommandBuffers>
+#if defined(BUILD_ANDROID)
+  : fexgen::custom_host_impl
+#endif
+{};
 #else
 template<>
 struct fex_gen_config<vkAllocateCommandBuffers> : fexgen::custom_host_impl {};
@@ -1838,7 +1870,11 @@ struct fex_gen_param<vkAllocateCommandBuffers, 2, VkCommandBuffer*> : fexgen::pt
 
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkFreeCommandBuffers> {};
+struct fex_gen_config<vkFreeCommandBuffers>
+#if defined(BUILD_ANDROID)
+  : fexgen::custom_host_impl
+#endif
+{};
 #else
 template<>
 struct fex_gen_config<vkFreeCommandBuffers> : fexgen::custom_host_impl {};
@@ -1846,13 +1882,21 @@ template<>
 struct fex_gen_param<vkFreeCommandBuffers, 3, const VkCommandBuffer*> : fexgen::ptr_passthrough {};
 #endif
 template<>
-struct fex_gen_config<vkBeginCommandBuffer> {};
+struct fex_gen_config<vkBeginCommandBuffer>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkEndCommandBuffer> {};
 template<>
 struct fex_gen_config<vkResetCommandBuffer> {};
 template<>
-struct fex_gen_config<vkCmdBindPipeline> {};
+struct fex_gen_config<vkCmdBindPipeline>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkCmdSetViewport> {};
 template<>
@@ -1887,7 +1931,11 @@ struct fex_gen_config<vkCmdDrawIndirect> {};
 template<>
 struct fex_gen_config<vkCmdDrawIndexedIndirect> {};
 template<>
-struct fex_gen_config<vkCmdDispatch> {};
+struct fex_gen_config<vkCmdDispatch>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkCmdDispatchIndirect> {};
 template<>
@@ -1944,16 +1992,28 @@ template<>
 struct fex_gen_param<vkCmdPushConstants, 5, const void*> : fexgen::assume_compatible_data_layout {};
 #endif
 template<>
-struct fex_gen_config<vkCmdBeginRenderPass> {};
+struct fex_gen_config<vkCmdBeginRenderPass>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdNextSubpass> {};
 #endif
 template<>
-struct fex_gen_config<vkCmdEndRenderPass> {};
+struct fex_gen_config<vkCmdEndRenderPass>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkCmdExecuteCommands> {};
+struct fex_gen_config<vkCmdExecuteCommands>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 #endif
 template<>
 struct fex_gen_config<vkEnumerateInstanceVersion> {};
@@ -2215,9 +2275,17 @@ struct fex_gen_config<vkDestroySwapchainKHR> {};
 template<>
 struct fex_gen_config<vkGetSwapchainImagesKHR> {};
 template<>
-struct fex_gen_config<vkAcquireNextImageKHR> {};
+struct fex_gen_config<vkAcquireNextImageKHR>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkQueuePresentKHR> {};
+struct fex_gen_config<vkQueuePresentKHR>
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  : fexgen::custom_host_impl
+#endif
+{};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkGetDeviceGroupPresentCapabilitiesKHR> {};
