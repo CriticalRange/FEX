@@ -52,21 +52,67 @@
 #undef SDL_memcpy
 
 // Generated from the SDL3 headers: SDL entry points that FNA's SDL3 platform layer reaches.
-// Audio capture, gamepads, touch and similar are inert stubs; see libSDL3_Compat.inc for real services.
+// Virtual gamepad + joystick backed by CompatPadButtons/CompatPadAxes in libSDL3_Compat.inc.
 
 namespace {
 SDL_EventFilter CompatEventFilter = nullptr;
 void* CompatEventFilterData = nullptr;
 bool CompatRelativeMouse = false;
+
+struct VexaJoyImpl {
+  Uint32 Magic;
+};
+struct VexaGamepadImpl {
+  VexaJoyImpl* Joy;
+};
+VexaJoyImpl VexaJoyInst {0x56455841u};
+VexaGamepadImpl VexaGamepadInst {&VexaJoyInst};
+constexpr const char* VexaPadName = "VEXA Virtual Gamepad";
+constexpr const char* VexaPadPath = "vexa://virtual-pad";
+constexpr Uint16 VexaPadVendor = 0x045e;  // Microsoft
+constexpr Uint16 VexaPadProduct = 0x028e; // Xbox 360 Controller
+constexpr const char* VexaPadMappingString =
+    "03564558415649525455415041443031,VEXA Virtual Gamepad,"
+    "a:b0,b:b1,x:b2,y:b3,back:b4,guide:b5,start:b6,"
+    "leftstick:b7,rightstick:b8,leftshoulder:b9,rightshoulder:b10,"
+    "dpup:b11,dpdown:b12,dpleft:b13,dpright:b14,"
+    "leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a4,righttrigger:a5,"
+    "platform:Android,";
+
+bool VexaIsJoy(SDL_Joystick* joy) {
+  return joy == reinterpret_cast<SDL_Joystick*>(&VexaJoyInst);
+}
+bool VexaIsGamepad(SDL_Gamepad* gp) {
+  return gp == reinterpret_cast<SDL_Gamepad*>(&VexaGamepadInst);
+}
+bool VexaIsPadId(SDL_JoystickID id) {
+  return id == kVexaPadInstanceId || id == 0;
+}
+SDL_GUID VexaPadGuid() {
+  SDL_GUID guid {};
+  guid.data[0] = 0x03;
+  std::memcpy(guid.data + 1, "VEXAVIRTUAPAD01", 15);
+  return guid;
+}
 } // namespace
 
 extern "C" bool SDL_BindAudioStream(SDL_AudioDeviceID devid, SDL_AudioStream *stream) { return false; }
 extern "C" void SDL_CloseGamepad(SDL_Gamepad *gamepad) {  }
+extern "C" void SDL_CloseJoystick(SDL_Joystick *joystick) {  }
 extern "C" SDL_AudioStream * SDL_CreateAudioStream(const SDL_AudioSpec *src_spec, const SDL_AudioSpec *dst_spec) { return nullptr; }
 extern "C" bool SDL_DisableScreenSaver() { return true; }
 extern "C" bool SDL_EnableScreenSaver() { return true; }
-extern "C" bool SDL_GamepadHasAxis(SDL_Gamepad *gamepad, SDL_GamepadAxis axis) { return false; }
-extern "C" bool SDL_GamepadHasButton(SDL_Gamepad *gamepad, SDL_GamepadButton button) { return false; }
+extern "C" bool SDL_GamepadConnected(SDL_Gamepad *gamepad) { return VexaIsGamepad(gamepad); }
+extern "C" bool SDL_GamepadEventsEnabled() { return true; }
+extern "C" void SDL_SetGamepadEventsEnabled(bool enabled) { (void)enabled; }
+extern "C" bool SDL_JoystickEventsEnabled() { return true; }
+extern "C" void SDL_SetJoystickEventsEnabled(bool enabled) { (void)enabled; }
+extern "C" bool SDL_GamepadHasAxis(SDL_Gamepad *gamepad, SDL_GamepadAxis axis) {
+  return VexaIsGamepad(gamepad) && axis >= 0 && axis < SDL_GAMEPAD_AXIS_COUNT;
+}
+extern "C" bool SDL_GamepadHasButton(SDL_Gamepad *gamepad, SDL_GamepadButton button) {
+  return VexaIsGamepad(gamepad) && button >= 0 && button <= SDL_GAMEPAD_BUTTON_DPAD_RIGHT;
+}
 extern "C" bool SDL_GamepadHasSensor(SDL_Gamepad *gamepad, SDL_SensorType type) { return false; }
 extern "C" bool SDL_GamepadSensorEnabled(SDL_Gamepad *gamepad, SDL_SensorType type) { return false; }
 extern "C" SDL_AudioDeviceID * SDL_GetAudioRecordingDevices(int *count) {
@@ -113,19 +159,203 @@ extern "C" SDL_DisplayMode ** SDL_GetFullscreenDisplayModes(SDL_DisplayID displa
   list[1] = nullptr;
   return list;
 }
-extern "C" Sint16 SDL_GetGamepadAxis(SDL_Gamepad *gamepad, SDL_GamepadAxis axis) { return 0; }
-extern "C" bool SDL_GetGamepadButton(SDL_Gamepad *gamepad, SDL_GamepadButton button) { return false; }
-extern "C" SDL_Joystick * SDL_GetGamepadJoystick(SDL_Gamepad *gamepad) { return nullptr; }
-extern "C" char * SDL_GetGamepadMapping(SDL_Gamepad *gamepad) { return nullptr; }
-extern "C" const char * SDL_GetGamepadName(SDL_Gamepad *gamepad) { return nullptr; }
+extern "C" bool SDL_HasGamepad() { return true; }
+extern "C" bool SDL_HasJoystick() { return true; }
+extern "C" SDL_JoystickID * SDL_GetGamepads(int *count) {
+  VexaAnnouncePadSDL3();
+  auto* list = static_cast<SDL_JoystickID*>(std::malloc(2 * sizeof(SDL_JoystickID)));
+  if (!list) {
+    if (count) *count = 0;
+    return nullptr;
+  }
+  list[0] = kVexaPadInstanceId;
+  list[1] = 0;
+  if (count) *count = 1;
+  return list;
+}
+extern "C" SDL_JoystickID * SDL_GetJoysticks(int *count) {
+  return SDL_GetGamepads(count);
+}
+extern "C" bool SDL_IsGamepad(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id);
+}
+extern "C" const char * SDL_GetGamepadNameForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadName : nullptr;
+}
+extern "C" const char * SDL_GetGamepadPathForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadPath : nullptr;
+}
+extern "C" int SDL_GetGamepadPlayerIndexForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? 0 : -1;
+}
+extern "C" SDL_GUID SDL_GetGamepadGUIDForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadGuid() : SDL_GUID {};
+}
+extern "C" Uint16 SDL_GetGamepadVendorForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadVendor : 0;
+}
+extern "C" Uint16 SDL_GetGamepadProductForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadProduct : 0;
+}
+extern "C" Uint16 SDL_GetGamepadProductVersionForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? 1 : 0;
+}
+extern "C" SDL_GamepadType SDL_GetGamepadTypeForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? SDL_GAMEPAD_TYPE_XBOX360 : SDL_GAMEPAD_TYPE_UNKNOWN;
+}
+extern "C" SDL_GamepadType SDL_GetRealGamepadTypeForID(SDL_JoystickID instance_id) {
+  return SDL_GetGamepadTypeForID(instance_id);
+}
+extern "C" char * SDL_GetGamepadMappingForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? strdup(VexaPadMappingString) : nullptr;
+}
+extern "C" Sint16 SDL_GetGamepadAxis(SDL_Gamepad *gamepad, SDL_GamepadAxis axis) {
+  VexaPollPointerEvents();
+  if (!VexaIsGamepad(gamepad) || axis < 0 || axis >= SDL_GAMEPAD_AXIS_COUNT) {
+    return 0;
+  }
+  return CompatPadAxes[axis];
+}
+extern "C" bool SDL_GetGamepadButton(SDL_Gamepad *gamepad, SDL_GamepadButton button) {
+  VexaPollPointerEvents();
+  if (!VexaIsGamepad(gamepad) || button < 0 || button >= SDL_GAMEPAD_BUTTON_COUNT) {
+    return false;
+  }
+  return CompatPadButtons[button] != 0;
+}
+extern "C" SDL_Joystick * SDL_GetGamepadJoystick(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? reinterpret_cast<SDL_Joystick*>(&VexaJoyInst) : nullptr;
+}
+extern "C" char * SDL_GetGamepadMapping(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? strdup(VexaPadMappingString) : nullptr;
+}
+extern "C" const char * SDL_GetGamepadName(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? VexaPadName : nullptr;
+}
+extern "C" const char * SDL_GetGamepadPath(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? VexaPadPath : nullptr;
+}
 extern "C" SDL_PropertiesID SDL_GetGamepadProperties(SDL_Gamepad *gamepad) { return 0; }
 extern "C" bool SDL_GetGamepadSensorData(SDL_Gamepad *gamepad, SDL_SensorType type, float *data, int num_values) { if (data) { *data = 0.0f; } return false; }
-extern "C" SDL_GamepadType SDL_GetGamepadType(SDL_Gamepad *gamepad) { return SDL_GAMEPAD_TYPE_UNKNOWN; }
+extern "C" SDL_GamepadType SDL_GetGamepadType(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? SDL_GAMEPAD_TYPE_XBOX360 : SDL_GAMEPAD_TYPE_UNKNOWN;
+}
+extern "C" SDL_GamepadType SDL_GetRealGamepadType(SDL_Gamepad *gamepad) {
+  return SDL_GetGamepadType(gamepad);
+}
+extern "C" int SDL_GetGamepadPlayerIndex(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? 0 : -1;
+}
+extern "C" bool SDL_SetGamepadPlayerIndex(SDL_Gamepad *gamepad, int player_index) {
+  (void)player_index;
+  return VexaIsGamepad(gamepad);
+}
+extern "C" Uint16 SDL_GetGamepadVendor(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? VexaPadVendor : 0;
+}
+extern "C" Uint16 SDL_GetGamepadProduct(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? VexaPadProduct : 0;
+}
+extern "C" Uint16 SDL_GetGamepadProductVersion(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? 1 : 0;
+}
+extern "C" SDL_JoystickID SDL_GetGamepadID(SDL_Gamepad *gamepad) {
+  return VexaIsGamepad(gamepad) ? kVexaPadInstanceId : 0;
+}
+extern "C" SDL_Gamepad * SDL_GetGamepadFromID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? reinterpret_cast<SDL_Gamepad*>(&VexaGamepadInst) : nullptr;
+}
+extern "C" SDL_Gamepad * SDL_GetGamepadFromPlayerIndex(int player_index) {
+  return player_index == 0 ? reinterpret_cast<SDL_Gamepad*>(&VexaGamepadInst) : nullptr;
+}
+extern "C" void SDL_UpdateGamepads() { VexaPollPointerEvents(); }
+extern "C" void SDL_UpdateJoysticks() { VexaPollPointerEvents(); }
 extern "C" SDL_MouseButtonFlags SDL_GetGlobalMouseState(float *x, float *y) { if (x) { *x = CompatMouseX.load(); } if (y) { *y = CompatMouseY.load(); } return CompatMouseButtons.load(); }
-extern "C" SDL_JoystickID SDL_GetJoystickID(SDL_Joystick *joystick) { return 0; }
-extern "C" Uint16 SDL_GetJoystickProduct(SDL_Joystick *joystick) { return 0; }
-extern "C" SDL_JoystickType SDL_GetJoystickType(SDL_Joystick *joystick) { return SDL_JOYSTICK_TYPE_UNKNOWN; }
-extern "C" Uint16 SDL_GetJoystickVendor(SDL_Joystick *joystick) { return 0; }
+extern "C" SDL_Joystick * SDL_OpenJoystick(SDL_JoystickID instance_id) {
+  if (!VexaIsPadId(instance_id)) {
+    return nullptr;
+  }
+  VexaAnnouncePadSDL3();
+  return reinterpret_cast<SDL_Joystick*>(&VexaJoyInst);
+}
+extern "C" SDL_Joystick * SDL_GetJoystickFromID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? reinterpret_cast<SDL_Joystick*>(&VexaJoyInst) : nullptr;
+}
+extern "C" SDL_Joystick * SDL_GetJoystickFromPlayerIndex(int player_index) {
+  return player_index == 0 ? reinterpret_cast<SDL_Joystick*>(&VexaJoyInst) : nullptr;
+}
+extern "C" const char * SDL_GetJoystickName(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? VexaPadName : nullptr;
+}
+extern "C" const char * SDL_GetJoystickNameForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadName : nullptr;
+}
+extern "C" const char * SDL_GetJoystickPath(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? VexaPadPath : nullptr;
+}
+extern "C" const char * SDL_GetJoystickPathForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadPath : nullptr;
+}
+extern "C" SDL_GUID SDL_GetJoystickGUID(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? VexaPadGuid() : SDL_GUID {};
+}
+extern "C" SDL_GUID SDL_GetJoystickGUIDForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadGuid() : SDL_GUID {};
+}
+extern "C" SDL_JoystickID SDL_GetJoystickID(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? kVexaPadInstanceId : 0;
+}
+extern "C" Uint16 SDL_GetJoystickProduct(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? VexaPadProduct : 0;
+}
+extern "C" Uint16 SDL_GetJoystickProductForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadProduct : 0;
+}
+extern "C" SDL_JoystickType SDL_GetJoystickType(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? SDL_JOYSTICK_TYPE_GAMEPAD : SDL_JOYSTICK_TYPE_UNKNOWN;
+}
+extern "C" SDL_JoystickType SDL_GetJoystickTypeForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? SDL_JOYSTICK_TYPE_GAMEPAD : SDL_JOYSTICK_TYPE_UNKNOWN;
+}
+extern "C" Uint16 SDL_GetJoystickVendor(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? VexaPadVendor : 0;
+}
+extern "C" Uint16 SDL_GetJoystickVendorForID(SDL_JoystickID instance_id) {
+  return VexaIsPadId(instance_id) ? VexaPadVendor : 0;
+}
+extern "C" bool SDL_JoystickConnected(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick);
+}
+extern "C" int SDL_GetNumJoystickAxes(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? SDL_GAMEPAD_AXIS_COUNT : 0;
+}
+extern "C" int SDL_GetNumJoystickButtons(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? SDL_GAMEPAD_BUTTON_COUNT : 0;
+}
+extern "C" int SDL_GetNumJoystickHats(SDL_Joystick *joystick) {
+  return VexaIsJoy(joystick) ? 1 : 0;
+}
+extern "C" Sint16 SDL_GetJoystickAxis(SDL_Joystick *joystick, int axis) {
+  VexaPollPointerEvents();
+  if (!VexaIsJoy(joystick) || axis < 0 || axis >= SDL_GAMEPAD_AXIS_COUNT) {
+    return 0;
+  }
+  return CompatPadAxes[axis];
+}
+extern "C" bool SDL_GetJoystickButton(SDL_Joystick *joystick, int button) {
+  VexaPollPointerEvents();
+  if (!VexaIsJoy(joystick) || button < 0 || button >= SDL_GAMEPAD_BUTTON_COUNT) {
+    return false;
+  }
+  return CompatPadButtons[button] != 0;
+}
+extern "C" Uint8 SDL_GetJoystickHat(SDL_Joystick *joystick, int hat) {
+  VexaPollPointerEvents();
+  if (!VexaIsJoy(joystick) || hat != 0) {
+    return SDL_HAT_CENTERED;
+  }
+  return VexaComputePadHat();
+}
 extern "C" SDL_MouseButtonFlags SDL_GetMouseState(float *x, float *y) { if (x) { *x = CompatMouseX.load(); } if (y) { *y = CompatMouseY.load(); } return CompatMouseButtons.load(); }
 extern "C" int SDL_GetNumGamepadTouchpads(SDL_Gamepad *gamepad) { return 0; }
 extern "C" char * SDL_GetPrefPath(const char *org, const char *app) {
@@ -183,7 +413,13 @@ extern "C" void * SDL_LoadFile(const char *file, size_t *datasize) {
   return data;
 }
 extern "C" SDL_AudioDeviceID SDL_OpenAudioDevice(SDL_AudioDeviceID devid, const SDL_AudioSpec *spec) { return 0; }
-extern "C" SDL_Gamepad * SDL_OpenGamepad(SDL_JoystickID instance_id) { return nullptr; }
+extern "C" SDL_Gamepad * SDL_OpenGamepad(SDL_JoystickID instance_id) {
+  if (!VexaIsPadId(instance_id)) {
+    return nullptr;
+  }
+  VexaAnnouncePadSDL3();
+  return reinterpret_cast<SDL_Gamepad*>(&VexaGamepadInst);
+}
 extern "C" bool SDL_PauseAudioDevice(SDL_AudioDeviceID devid) { return true; }
 extern "C" int SDL_PeepEvents(SDL_Event *events, int numevents, SDL_EventAction action, Uint32 minType, Uint32 maxType) { return 0; }
 extern "C" bool SDL_RumbleGamepad(SDL_Gamepad *gamepad, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble, Uint32 duration_ms) { return false; }

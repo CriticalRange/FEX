@@ -1028,6 +1028,29 @@ std::mutex PointerMutex;
 off_t PointerOffset = 0;
 std::chrono::steady_clock::time_point PointerLastPoll {};
 
+constexpr SDL_JoystickID kVexaPadInstanceId = 1;
+constexpr int32_t kVexaPadSynthFlag = 0x40000000;
+Uint8 CompatPadButtons[SDL_GAMEPAD_BUTTON_COUNT] = {};
+Sint16 CompatPadAxes[SDL_GAMEPAD_AXIS_COUNT] = {};
+bool VexaPadAnnounced = false;
+
+Uint8 VexaComputePadHat() {
+  Uint8 value = SDL_HAT_CENTERED;
+  if (CompatPadButtons[SDL_GAMEPAD_BUTTON_DPAD_UP]) {
+    value |= SDL_HAT_UP;
+  }
+  if (CompatPadButtons[SDL_GAMEPAD_BUTTON_DPAD_DOWN]) {
+    value |= SDL_HAT_DOWN;
+  }
+  if (CompatPadButtons[SDL_GAMEPAD_BUTTON_DPAD_LEFT]) {
+    value |= SDL_HAT_LEFT;
+  }
+  if (CompatPadButtons[SDL_GAMEPAD_BUTTON_DPAD_RIGHT]) {
+    value |= SDL_HAT_RIGHT;
+  }
+  return value;
+}
+
 SDL_Keycode CompatKeysymToKeycode(uint32_t sym) {
   switch (sym) {
   case 0xff0d: return SDLK_RETURN;
@@ -1055,6 +1078,24 @@ void CompatPushEvent(const SDL_Event& event) {
 }
 } // namespace
 
+void VexaAnnouncePadSDL3() {
+  if (VexaPadAnnounced) {
+    return;
+  }
+  VexaPadAnnounced = true;
+  const Uint64 ts = SDL_GetTicksNS();
+  SDL_Event event {};
+  event.type = SDL_EVENT_JOYSTICK_ADDED;
+  event.jdevice.timestamp = ts;
+  event.jdevice.which = kVexaPadInstanceId;
+  CompatPushEvent(event);
+  event = SDL_Event {};
+  event.type = SDL_EVENT_GAMEPAD_ADDED;
+  event.gdevice.timestamp = ts;
+  event.gdevice.which = kVexaPadInstanceId;
+  CompatPushEvent(event);
+}
+
 void VexaPollPointerEvents() {
   std::lock_guard<std::mutex> guard(PointerMutex);
   const auto now = std::chrono::steady_clock::now();
@@ -1073,6 +1114,7 @@ void VexaPollPointerEvents() {
   if (end > PointerOffset && lseek(fd, PointerOffset, SEEK_SET) >= 0) {
     unsigned char rec[16];
     int handled = 0;
+    const Uint64 timestamp = SDL_GetTicksNS();
     while (handled < 64 && read(fd, rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec))) {
       PointerOffset += sizeof(rec);
       ++handled;
@@ -1081,6 +1123,71 @@ void VexaPollPointerEvents() {
       std::memcpy(&x, rec + 4, 4);
       std::memcpy(&y, rec + 8, 4);
       std::memcpy(&state, rec + 12, 4);
+      if (type == 7) {
+        VexaAnnouncePadSDL3();
+        if (x >= 0 && x < SDL_GAMEPAD_BUTTON_COUNT) {
+          const Uint8 new_state = y != 0 ? 1 : 0;
+          if (CompatPadButtons[x] != new_state) {
+            const Uint8 old_hat = VexaComputePadHat();
+            CompatPadButtons[x] = new_state;
+            const Uint8 new_hat = VexaComputePadHat();
+
+            SDL_Event jev {};
+            jev.type = new_state ? SDL_EVENT_JOYSTICK_BUTTON_DOWN : SDL_EVENT_JOYSTICK_BUTTON_UP;
+            jev.jbutton.timestamp = timestamp;
+            jev.jbutton.which = kVexaPadInstanceId;
+            jev.jbutton.button = static_cast<Uint8>(x);
+            jev.jbutton.down = new_state != 0;
+            CompatPushEvent(jev);
+
+            if (new_hat != old_hat) {
+              SDL_Event hev {};
+              hev.type = SDL_EVENT_JOYSTICK_HAT_MOTION;
+              hev.jhat.timestamp = timestamp;
+              hev.jhat.which = kVexaPadInstanceId;
+              hev.jhat.hat = 0;
+              hev.jhat.value = new_hat;
+              CompatPushEvent(hev);
+            }
+
+            SDL_Event gev {};
+            gev.type = new_state ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+            gev.gbutton.timestamp = timestamp;
+            gev.gbutton.which = kVexaPadInstanceId;
+            gev.gbutton.button = static_cast<Uint8>(x);
+            gev.gbutton.down = new_state != 0;
+            CompatPushEvent(gev);
+          }
+        } else {
+          const int axis = x - 100;
+          if (axis >= 0 && axis < SDL_GAMEPAD_AXIS_COUNT) {
+            const Sint16 new_val = static_cast<Sint16>(y);
+            if (CompatPadAxes[axis] != new_val) {
+              CompatPadAxes[axis] = new_val;
+
+              SDL_Event jev {};
+              jev.type = SDL_EVENT_JOYSTICK_AXIS_MOTION;
+              jev.jaxis.timestamp = timestamp;
+              jev.jaxis.which = kVexaPadInstanceId;
+              jev.jaxis.axis = static_cast<Uint8>(axis);
+              jev.jaxis.value = new_val;
+              CompatPushEvent(jev);
+
+              SDL_Event gev {};
+              gev.type = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+              gev.gaxis.timestamp = timestamp;
+              gev.gaxis.which = kVexaPadInstanceId;
+              gev.gaxis.axis = static_cast<Uint8>(axis);
+              gev.gaxis.value = new_val;
+              CompatPushEvent(gev);
+            }
+          }
+        }
+        continue;
+      }
+      if ((state & kVexaPadSynthFlag) != 0) {
+        continue;
+      }
       SDL_Event event {};
       if (type == 6 || type == 4 || type == 5) {
         const float fx = static_cast<float>(x);
@@ -1094,6 +1201,7 @@ void VexaPollPointerEvents() {
         }
         if (type == 6 || oldX != fx || oldY != fy) {
           event.type = SDL_EVENT_MOUSE_MOTION;
+          event.motion.timestamp = timestamp;
           event.motion.windowID = 1;
           event.motion.state = CompatMouseButtons.load();
           event.motion.x = fx;
@@ -1105,6 +1213,7 @@ void VexaPollPointerEvents() {
         if (type != 6) {
           SDL_Event button {};
           button.type = type == 4 ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+          button.button.timestamp = timestamp;
           button.button.windowID = 1;
           button.button.button = SDL_BUTTON_LEFT;
           button.button.down = type == 4;
@@ -1117,6 +1226,7 @@ void VexaPollPointerEvents() {
         const SDL_Keycode key = CompatKeysymToKeycode(static_cast<uint32_t>(x));
         if (key != SDLK_UNKNOWN) {
           event.type = type == 2 ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+          event.key.timestamp = timestamp;
           event.key.windowID = 1;
           event.key.key = key;
           event.key.scancode = SDL_GetScancodeFromKey(key, nullptr);
