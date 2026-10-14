@@ -418,7 +418,14 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
     ExecveArgs.emplace_back(nullptr);
   }
 
-  Result = ::syscall(SYS_execveat, Args.dirfd, "/proc/self/exe", const_cast<char* const*>(ExecveArgs.data()), EnvpPtr, Args.flags);
+  // VEXA: in embedded mode /proc/self/exe is app_process, not a FEX loader, so
+  // re-executing it cannot recreate the emulated environment. Allow the host
+  // to name a trampoline binary that re-enters the runtime instead.
+  const char* ReexecTarget = "/proc/self/exe";
+  if (const char* EnvTarget = getenv("VEXA_REEXEC"); EnvTarget && *EnvTarget) {
+    ReexecTarget = EnvTarget;
+  }
+  Result = ::syscall(SYS_execveat, Args.dirfd, ReexecTarget, const_cast<char* const*>(ExecveArgs.data()), EnvpPtr, Args.flags);
   CloseSeccompFD();
   CloseFDExecFD();
 
