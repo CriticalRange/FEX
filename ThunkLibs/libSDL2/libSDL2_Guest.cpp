@@ -514,62 +514,49 @@ std::atomic<Uint32> CompatMouseButtons {0};
 // Polled by SDL_GetKeyboardState (FNA reads this every frame). Written under
 // PointerMutex, read lock-free; per-key torn reads are acceptable.
 Uint8 CompatKeyStates[SDL_NUM_SCANCODES] = {};
-// Virtual gamepad: the on-screen GuestPad emits X11-style records for every
-// control, and these arrays give it an SDL_Joystick/SDL_GameController face
-// (implemented in the FNA stubs include).
+// Virtual gamepad: GuestPad emits type-7 pad records for every control, and
+// these arrays + event generators give it an SDL_Joystick/SDL_GameController
+// face (implemented in libSDL2_FNAStubs.inc).
 Uint8 CompatPadButtons[SDL_CONTROLLER_BUTTON_MAX] = {};
 Sint16 CompatPadAxes[SDL_CONTROLLER_AXIS_MAX] = {};
+bool VexaPadAnnounced = false;
+constexpr int32_t kVexaPadSynthFlag = 0x40000000;
 
-int CompatPadButtonForKey(SDL_Keycode key) {
-  switch (key) {
-    case SDLK_ESCAPE: return SDL_CONTROLLER_BUTTON_B;
-    case SDLK_SPACE: return SDL_CONTROLLER_BUTTON_X;
-    case SDLK_e: return SDL_CONTROLLER_BUTTON_Y;
-    case SDLK_RETURN: return SDL_CONTROLLER_BUTTON_START;
-    case SDLK_TAB: return SDL_CONTROLLER_BUTTON_BACK;
-    case SDLK_LSHIFT: return SDL_CONTROLLER_BUTTON_LEFTSHOULDER;
-    case SDLK_c: return SDL_CONTROLLER_BUTTON_LEFTSTICK;
-    case SDLK_r: return SDL_CONTROLLER_BUTTON_RIGHTSTICK;
-    case SDLK_UP: return SDL_CONTROLLER_BUTTON_DPAD_UP;
-    case SDLK_DOWN: return SDL_CONTROLLER_BUTTON_DPAD_DOWN;
-    case SDLK_LEFT: return SDL_CONTROLLER_BUTTON_DPAD_LEFT;
-    case SDLK_RIGHT: return SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
-    default: return -1;
+Uint8 VexaComputePadHat() {
+  Uint8 value = SDL_HAT_CENTERED;
+  if (CompatPadButtons[SDL_CONTROLLER_BUTTON_DPAD_UP]) {
+    value |= SDL_HAT_UP;
   }
+  if (CompatPadButtons[SDL_CONTROLLER_BUTTON_DPAD_DOWN]) {
+    value |= SDL_HAT_DOWN;
+  }
+  if (CompatPadButtons[SDL_CONTROLLER_BUTTON_DPAD_LEFT]) {
+    value |= SDL_HAT_LEFT;
+  }
+  if (CompatPadButtons[SDL_CONTROLLER_BUTTON_DPAD_RIGHT]) {
+    value |= SDL_HAT_RIGHT;
+  }
+  return value;
 }
 
-void CompatPadSetAxis(SDL_GameControllerAxis axis, Sint16 value) {
-  if (axis >= 0 && axis < SDL_CONTROLLER_AXIS_MAX) {
-    CompatPadAxes[axis] = value;
+void VexaAnnouncePad() {
+  if (VexaPadAnnounced) {
+    return;
   }
+  VexaPadAnnounced = true;
+  const Uint32 ts = GetTicksMS();
+  SDL_Event event {};
+  event.type = SDL_JOYDEVICEADDED;
+  event.jdevice.which = 0;
+  event.jdevice.timestamp = ts;
+  QueueSyntheticEvent(event);
+  event = SDL_Event {};
+  event.type = SDL_CONTROLLERDEVICEADDED;
+  event.cdevice.which = 0;
+  event.cdevice.timestamp = ts;
+  QueueSyntheticEvent(event);
 }
 
-void CompatPadKey(SDL_Keycode key, bool down) {
-  const int button = CompatPadButtonForKey(key);
-  if (button >= 0) {
-    CompatPadButtons[button] = down ? 1 : 0;
-  }
-  switch (key) {
-    case SDLK_w: CompatPadSetAxis(SDL_CONTROLLER_AXIS_LEFTY, down ? -32768 : 0); break;
-    case SDLK_s: CompatPadSetAxis(SDL_CONTROLLER_AXIS_LEFTY, down ? 32767 : 0); break;
-    case SDLK_a: CompatPadSetAxis(SDL_CONTROLLER_AXIS_LEFTX, down ? -32768 : 0); break;
-    case SDLK_d: CompatPadSetAxis(SDL_CONTROLLER_AXIS_LEFTX, down ? 32767 : 0); break;
-    case SDLK_LCTRL: CompatPadSetAxis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, down ? 32767 : 0); break;
-    default: break;
-  }
-}
-
-// Button records encode the pad source in state bits 24+: 1 = left click
-// (face A / RT on the overlay), 3 = right click (RB). Raw taps carry 0.
-void CompatPadButtonRecord(int32_t type, int32_t state) {
-  const int source = state >> 24;
-  const bool down = type == 4;
-  if (source == 1) {
-    CompatPadButtons[SDL_CONTROLLER_BUTTON_A] = down ? 1 : 0;
-  } else if (source == 3) {
-    CompatPadButtons[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER] = down ? 1 : 0;
-  }
-}
 std::mutex PointerMutex;
 off_t PointerOffset = 0;
 std::chrono::steady_clock::time_point PointerLastPoll {};
@@ -646,18 +633,71 @@ void VexaSDL2PollPointerEvents() {
       if (type == 7) {
         // VEXA pad record: x = SDL_GameControllerButton (0-14) or
         // 100 + SDL_GameControllerAxis; y = button state or signed axis value.
+        VexaAnnouncePad();
         if (x >= 0 && x < SDL_CONTROLLER_BUTTON_MAX) {
-          CompatPadButtons[x] = y != 0 ? 1 : 0;
+          const Uint8 new_state = y != 0 ? 1 : 0;
+          if (CompatPadButtons[x] != new_state) {
+            const Uint8 old_hat = VexaComputePadHat();
+            CompatPadButtons[x] = new_state;
+            const Uint8 new_hat = VexaComputePadHat();
+
+            SDL_Event jev {};
+            jev.type = new_state ? SDL_JOYBUTTONDOWN : SDL_JOYBUTTONUP;
+            jev.jbutton.timestamp = timestamp;
+            jev.jbutton.which = 0;
+            jev.jbutton.button = static_cast<Uint8>(x);
+            jev.jbutton.state = new_state ? SDL_PRESSED : SDL_RELEASED;
+            QueueSyntheticEvent(jev);
+
+            if (new_hat != old_hat) {
+              SDL_Event hev {};
+              hev.type = SDL_JOYHATMOTION;
+              hev.jhat.timestamp = timestamp;
+              hev.jhat.which = 0;
+              hev.jhat.hat = 0;
+              hev.jhat.value = new_hat;
+              QueueSyntheticEvent(hev);
+            }
+
+            SDL_Event cev {};
+            cev.type = new_state ? SDL_CONTROLLERBUTTONDOWN : SDL_CONTROLLERBUTTONUP;
+            cev.cbutton.timestamp = timestamp;
+            cev.cbutton.which = 0;
+            cev.cbutton.button = static_cast<Uint8>(x);
+            cev.cbutton.state = new_state ? SDL_PRESSED : SDL_RELEASED;
+            QueueSyntheticEvent(cev);
+          }
         } else {
           const int axis = x - 100;
           if (axis >= 0 && axis < SDL_CONTROLLER_AXIS_MAX) {
-            CompatPadAxes[axis] = static_cast<Sint16>(y);
+            const Sint16 new_val = static_cast<Sint16>(y);
+            if (CompatPadAxes[axis] != new_val) {
+              CompatPadAxes[axis] = new_val;
+
+              SDL_Event jev {};
+              jev.type = SDL_JOYAXISMOTION;
+              jev.jaxis.timestamp = timestamp;
+              jev.jaxis.which = 0;
+              jev.jaxis.axis = static_cast<Uint8>(axis);
+              jev.jaxis.value = new_val;
+              QueueSyntheticEvent(jev);
+
+              SDL_Event cev {};
+              cev.type = SDL_CONTROLLERAXISMOTION;
+              cev.caxis.timestamp = timestamp;
+              cev.caxis.which = 0;
+              cev.caxis.axis = static_cast<Uint8>(axis);
+              cev.caxis.value = new_val;
+              QueueSyntheticEvent(cev);
+            }
           }
         }
         continue;
       }
-      if (type == 4 || type == 5) {
-        CompatPadButtonRecord(type, state);
+      // Pad-synthesized keyboard/mouse fallback records are only for raw X11
+      // guests; SDL2 guests already consume native type-7 controller records.
+      if ((state & kVexaPadSynthFlag) != 0) {
+        continue;
       }
       SDL_Event event {};
       if (type == 6 || type == 4 || type == 5) {
@@ -711,7 +751,6 @@ void VexaSDL2PollPointerEvents() {
           if (event.key.keysym.scancode < SDL_NUM_SCANCODES) {
             CompatKeyStates[event.key.keysym.scancode] = down ? 1 : 0;
           }
-          CompatPadKey(key, down);
           event.key.keysym.sym = key;
           event.key.keysym.mod = CurrentModState.load(std::memory_order_acquire);
           QueueSyntheticEvent(event);
@@ -2327,6 +2366,9 @@ extern "C" int SDL_InitSubSystem(Uint32 flags) {
     }
     InitializedSubsystemMask |= normalized;
   }
+  if ((normalized & (SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER)) != 0) {
+    VexaAnnouncePad();
+  }
   fprintf(stderr, "[SDL2 thunk] SDL_InitSubSystem => 0 added=0x%x mask=0x%x\n",
           static_cast<unsigned>(added), static_cast<unsigned>(InitializedSubsystemMask));
   return 0;
@@ -2349,6 +2391,7 @@ extern "C" void SDL_Quit() {
     std::scoped_lock lock {SyntheticEventQueueMutex};
     SyntheticEventQueue.clear();
   }
+  VexaPadAnnounced = false;
   fexfn_pack_FEX_SDL2_Quit();
 }
 

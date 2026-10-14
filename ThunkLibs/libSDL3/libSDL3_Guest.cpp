@@ -1699,10 +1699,15 @@ const GLProcEntry GLProcTable[] = {
 #undef SDL3_GL_PROC_ENTRY
 } // namespace
 
+void VexaAnnouncePadSDL3();
+
 extern "C" bool SDL_Init(SDL_InitFlags flags) {
   fprintf(stderr, "[SDL3 thunk] SDL_Init(flags=0x%x)\n", static_cast<unsigned>(flags));
   const SDL_InitFlags normalized = NormalizeInitFlags(flags);
   const SDL_InitFlags previous = InitializedSubsystems.fetch_or(normalized, std::memory_order_acq_rel);
+  if ((normalized & (SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) != 0) {
+    VexaAnnouncePadSDL3();
+  }
   if (previous == 0) {
     const bool success = fexfn_pack_FEX_SDL_Init(normalized) != 0;
     fprintf(stderr,
