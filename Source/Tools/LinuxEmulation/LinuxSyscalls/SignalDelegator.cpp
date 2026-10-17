@@ -94,7 +94,7 @@ static bool HostAltStackUsable(const ucontext_t* Context) {
 
 static void ReraiseDefault(int Signal) {
   ::signal(Signal, SIG_DFL);
-  FHU::Syscalls::tgkill(::getpid(), FHU::Syscalls::gettid(), Signal);
+  FHU::Syscalls::tgkill(FHU::Syscalls::getpid(), FHU::Syscalls::gettid(), Signal);
 }
 
 // VEXA: FEX shares the process with ART. ART threads use SIGSEGV for implicit
@@ -897,7 +897,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       // If the signal wasn't sent by the kernel then we need to reraise it.
       // This is necessary since returning from this signal handler now might just continue executing.
       // eg: If sent from tgkill then the signal gets dropped and returns.
-      FHU::Syscalls::tgkill(::getpid(), FHU::Syscalls::gettid(), Signal);
+      FHU::Syscalls::tgkill(FHU::Syscalls::getpid(), FHU::Syscalls::gettid(), Signal);
     }
   } else {
     Handler.OldAction.handler(Signal);

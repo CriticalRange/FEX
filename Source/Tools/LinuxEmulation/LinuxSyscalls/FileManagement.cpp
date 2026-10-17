@@ -12,6 +12,9 @@ $end_info$
 
 #include "FEXCore/Config/Config.h"
 #include "LinuxSyscalls/FileManagement.h"
+#if defined(__ANDROID__)
+#include "LinuxSyscalls/AndroidRootFSOpen.h"
+#endif
 #include "LinuxSyscalls/EmulatedFiles/EmulatedFiles.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
@@ -46,6 +49,10 @@ $end_info$
 
 #include <tiny-json.h>
 
+#if defined(__ANDROID__)
+#include <android/fdsan.h>
+#endif
+
 // VEXA_FIXES: Android compatibility helper for close_range().
 // VEXA_FIXES: On Android we must preserve FEX-owned FDs while still honoring guest intent
 // VEXA_FIXES: to close broad FD ranges. This closes non-tracked FDs and skips tracked ones.
@@ -55,19 +62,27 @@ static uint64_t CloseRangeSkipTracked(FEX::HLE::FileManager* FM, unsigned int fi
     return -1;
   }
 
+  // Python also uses INT_MAX, not only UINT_MAX, for an unbounded sweep.
+  // Bound every range: walking billions of nonexistent descriptors stalls
+  // subprocess creation before exec. Use the hard limit so a lowered soft
+  // limit does not omit descriptors opened before that limit was lowered.
   unsigned int end = last;
-  if (last == std::numeric_limits<unsigned int>::max()) {
-    struct rlimit rl {};
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0) {
-      end = static_cast<unsigned int>(rl.rlim_cur - 1);
-    } else {
-      // Best-effort fallback if RLIMIT lookup fails.
-      end = 65535;
-    }
+  struct rlimit rl {};
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max != RLIM_INFINITY && rl.rlim_max > 0) {
+    end = std::min<uint64_t>(end, rl.rlim_max - 1);
+  } else if (last == std::numeric_limits<unsigned int>::max()) {
+    // Best-effort fallback if RLIMIT lookup fails.
+    end = 65535;
   }
 
   for (unsigned int fd = first; fd <= end; ++fd) {
     if (!FM->CheckIfFDInTrackedSet(static_cast<int>(fd))) {
+#if defined(__ANDROID__)
+      // Embedded guests inherit ART/native descriptors. Their close_fds sweep
+      // must not invalidate host-owned FILE/Java/unique_fd objects or abort in
+      // bionic fdsan. Guest-opened descriptors have no bionic ownership tag.
+      if (android_fdsan_get_owner_tag(static_cast<int>(fd)) != 0) continue;
+#endif
       ::close(static_cast<int>(fd));
     }
     if (fd == std::numeric_limits<unsigned int>::max()) {
@@ -100,6 +115,9 @@ static int OpenAt2Compat(int dirfd, const char* path, const open_how* how, size_
   }
 
   const mode_t mode = static_cast<mode_t>(how->mode & 07777);
+  if (how->resolve & RESOLVE_IN_ROOT) {
+    return AndroidOpenInRoot(dirfd, path, static_cast<int>(how->flags), mode);
+  }
   return static_cast<int>(::syscall(SYSCALL_DEF(openat), dirfd, path, static_cast<int>(how->flags), mode));
 #else
   return static_cast<int>(::syscall(SYSCALL_DEF(openat2), dirfd, path, how, usize));
@@ -405,7 +423,7 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
     LogMan::Msg::EFmt("Couldn't open `/proc`. Is ProcFS mounted? FEX won't be able to track FD conflicts");
   }
 
-  UpdatePID(::getpid());
+  UpdatePID(FHU::Syscalls::getpid());
 }
 
 FileManager::~FileManager() {
@@ -678,6 +696,20 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
   return EmulatedFDPathResult {RootFSFD, &SubPath[1]};
 }
 
+static const char* SkipDuplicateLeadingSlashes(const char* Pathname) {
+  if (!Pathname || Pathname[0] != '/') {
+    return Pathname;
+  }
+  while (Pathname[1] == '/') {
+    ++Pathname;
+  }
+  return Pathname;
+}
+
+static int GetActualPID() {
+  return static_cast<int>(::syscall(SYSCALL_DEF(getpid)));
+}
+
 ///< Returns true if the pathname is self and symlink flags are set NOFOLLOW.
 bool FileManager::IsSelfNoFollow(const char* Pathname, int flags) const {
   const bool Follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
@@ -690,8 +722,10 @@ bool FileManager::IsSelfNoFollow(const char* Pathname, int flags) const {
     return false;
   }
 
+  Pathname = SkipDuplicateLeadingSlashes(Pathname);
+
   char PidSelfPath[50];
-  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", CurrentPID);
+  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", GetActualPID());
 
   return strcmp(Pathname, "/proc/self/exe") == 0 || strcmp(Pathname, "/proc/thread-self/exe") == 0 || strcmp(Pathname, PidSelfPath) == 0;
 }
@@ -701,10 +735,12 @@ std::optional<std::string_view> FileManager::GetSelf(const char* Pathname) const
     return std::nullopt;
   }
 
-  char PidSelfPath[50];
-  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", CurrentPID);
+  const char* Normalized = SkipDuplicateLeadingSlashes(Pathname);
 
-  if (strcmp(Pathname, "/proc/self/exe") == 0 || strcmp(Pathname, "/proc/thread-self/exe") == 0 || strcmp(Pathname, PidSelfPath) == 0) {
+  char PidSelfPath[50];
+  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", GetActualPID());
+
+  if (strcmp(Normalized, "/proc/self/exe") == 0 || strcmp(Normalized, "/proc/thread-self/exe") == 0 || strcmp(Normalized, PidSelfPath) == 0) {
     return Filename();
   }
 
@@ -798,6 +834,9 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
 // runtime state alive. Non-Android behavior is unchanged: tracked FDs can still be
 // closed and are removed from the tracking set before close.
 uint64_t FileManager::Close(int fd) {
+#if defined(__ANDROID__)
+  if (android_fdsan_get_owner_tag(fd) != 0) return 0;
+#endif
   if (CheckIfFDInTrackedSet(fd)) {
     #if defined(__ANDROID__)
     #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
@@ -823,6 +862,13 @@ uint64_t FileManager::Close(int fd) {
 uint64_t FileManager::CloseRange(unsigned int first, unsigned int last, unsigned int flags) {
 #ifndef CLOSE_RANGE_CLOEXEC
 #define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
+
+#if defined(__ANDROID__)
+  // The kernel close_range syscall cannot consult bionic's ownership table.
+  // For ordinary guest sweeps, preserve host-owned descriptors even if this
+  // particular range contains no explicitly tracked FEX descriptor.
+  if (flags == 0) return CloseRangeSkipTracked(this, first, last);
 #endif
 
   // VEXA_FIXES: Convert UINT_MAX close_range upper bound into "unbounded" sentinel for set checks.
@@ -934,35 +980,7 @@ uint64_t FileManager::FAccessat2(int dirfd, const char* pathname, int mode, int 
 }
 
 uint64_t FileManager::Readlink(const char* pathname, char* buf, size_t bufsiz) {
-  // calculate the non-self link to exe
-  // Some executables do getpid, stat("/proc/$pid/exe")
-  char PidSelfPath[50];
-  snprintf(PidSelfPath, 50, "/proc/%i/exe", CurrentPID);
-
-  if (strcmp(pathname, "/proc/self/exe") == 0 || strcmp(pathname, "/proc/thread-self/exe") == 0 || strcmp(pathname, PidSelfPath) == 0) {
-    const auto& App = Filename();
-    strncpy(buf, App.c_str(), bufsiz);
-    return std::min(bufsiz, App.size());
-  }
-
-  FDPathTmpData TmpFilename;
-  auto Path = GetEmulatedFDPath(AT_FDCWD, pathname, false, TmpFilename);
-  uint64_t Result = -1;
-  if (Path.FD != -1) {
-    Result = ::readlinkat(Path.FD, Path.Path, buf, bufsiz);
-
-    if (Result == -1 && errno == EINVAL) {
-      // This means that the file wasn't a symlink
-      // This is expected behaviour
-      return -1;
-    }
-  }
-  if (Result == -1) {
-    Result = ::readlink(pathname, buf, bufsiz);
-  }
-
-  // We might have read a /proc/self/fd/* link. If so, strip the RootFS prefix from it.
-  return StripRootFSPrefix(buf, Result, true);
+  return Readlinkat(AT_FDCWD, pathname, buf, bufsiz);
 }
 
 uint64_t FileManager::Chmod(const char* pathname, mode_t mode) {
@@ -1013,8 +1031,13 @@ uint64_t FileManager::Readlinkat(int dirfd, const char* pathname, char* buf, siz
     }
   }
 
+  // Collapse duplicate slashes (e.g. "//proc/self/exe" from glibc realpath).
+  while (Path.size() > 1 && Path[0] == '/' && Path[1] == '/') {
+    Path.erase(0, 1);
+  }
+
   char PidSelfPath[50];
-  snprintf(PidSelfPath, 50, "/proc/%i/exe", CurrentPID);
+  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", GetActualPID());
 
   if (Path == "/proc/self/exe" || Path == "/proc/thread-self/exe" || Path == PidSelfPath) {
     const auto& App = Filename();

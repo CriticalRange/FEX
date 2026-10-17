@@ -1835,7 +1835,11 @@ struct fex_gen_config<vkCreateFramebuffer> {};
 template<>
 struct fex_gen_config<vkDestroyFramebuffer> {};
 template<>
-struct fex_gen_config<vkCreateRenderPass> {};
+struct fex_gen_config<vkCreateRenderPass>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkDestroyRenderPass> {};
 template<>
@@ -1974,7 +1978,11 @@ template<>
 struct fex_gen_config<vkCmdWaitEvents> {};
 #endif
 template<>
-struct fex_gen_config<vkCmdPipelineBarrier> {};
+struct fex_gen_config<vkCmdPipelineBarrier>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdBeginQuery> {};
@@ -2244,9 +2252,17 @@ struct fex_gen_config<vkCopyImageToImage> {};
 template<>
 struct fex_gen_config<vkTransitionImageLayout> {};
 template<>
-struct fex_gen_config<vkDestroySurfaceKHR> {};
+struct fex_gen_config<vkDestroySurfaceKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSurfaceSupportKHR> {};
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceSupportKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 #if defined(BUILD_ANDROID)
 // VEXA_FIXES: vkgears asserts VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR. Android
 // surfaces advertise INHERIT instead. The swapchain host impl substitutes a
@@ -2258,9 +2274,17 @@ template<>
 struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilitiesKHR> {};
 #endif
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormatsKHR> {}; // TODO: Need to figure out how *not* to repack the last parameter on input...
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormatsKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{}; // TODO: Need to figure out how *not* to repack the last parameter on input...
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSurfacePresentModesKHR> {};
+struct fex_gen_config<vkGetPhysicalDeviceSurfacePresentModesKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 #if defined(BUILD_ANDROID)
 // VEXA_FIXES: vkgears creates the swapchain at its 300x300 window size and does
 // not check the result. Android requires imageExtent == currentExtent.
@@ -2271,9 +2295,17 @@ template<>
 struct fex_gen_config<vkCreateSwapchainKHR> {};
 #endif
 template<>
-struct fex_gen_config<vkDestroySwapchainKHR> {};
+struct fex_gen_config<vkDestroySwapchainKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkGetSwapchainImagesKHR> {};
+struct fex_gen_config<vkGetSwapchainImagesKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkAcquireNextImageKHR>
 #if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
@@ -2294,7 +2326,11 @@ struct fex_gen_config<vkGetDeviceGroupSurfacePresentModesKHR> {};
 template<>
 struct fex_gen_config<vkGetPhysicalDevicePresentRectanglesKHR> {};
 template<>
-struct fex_gen_config<vkAcquireNextImage2KHR> {};
+struct fex_gen_config<vkAcquireNextImage2KHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceDisplayPropertiesKHR> {};
 template<>
@@ -2425,9 +2461,17 @@ struct fex_gen_config<vkAcquireProfilingLockKHR> {};
 template<>
 struct fex_gen_config<vkReleaseProfilingLockKHR> {};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilities2KHR> {};
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilities2KHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormats2KHR> {};
+struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormats2KHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkGetPhysicalDeviceDisplayProperties2KHR> {};
 template<>

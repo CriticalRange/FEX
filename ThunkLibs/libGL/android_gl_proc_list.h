@@ -457,7 +457,43 @@
   OP(glUniform3i) \
   OP(glUniform4i) \
   OP(glPixelStorei) \
-  OP(glDisableClientState)
+  OP(glDisableClientState) \
+  OP(glBlendColor) \
+  OP(glGetBufferParameteriv) \
+  OP(glIsQuery) \
+  OP(glGetAttachedShaders) \
+  OP(glGetUniformfv) \
+  OP(glStencilMaskSeparate) \
+  OP(glEnablei) \
+  OP(glDisablei) \
+  OP(glClearBufferiv) \
+  OP(glGetInteger64v) \
+  OP(glSamplerParameteriv) \
+  OP(glSamplerParameterfv) \
+  OP(glSamplerParameterIiv) \
+  OP(glSamplerParameterIuiv) \
+  OP(glTexBufferRange) \
+  OP(glVertexAttribIFormat) \
+  OP(glVertexBindingDivisor) \
+  OP(glUseProgramStages) \
+  OP(glActiveShaderProgram) \
+  OP(glBindProgramPipeline) \
+  OP(glDeleteProgramPipelines) \
+  OP(glGenProgramPipelines) \
+  OP(glGetProgramPipelineiv) \
+  OP(glValidateProgramPipeline) \
+  OP(glGetProgramPipelineInfoLog) \
+  OP(glGetDebugMessageLog) \
+  OP(glObjectPtrLabel) \
+  OP(glGetObjectPtrLabel) \
+  OP(glProgramUniform1i) \
+  OP(glProgramUniform1f) \
+  OP(glProgramUniform2i) \
+  OP(glProgramUniform2f) \
+  OP(glProgramUniform3i) \
+  OP(glProgramUniform3f) \
+  OP(glProgramUniform4i) \
+  OP(glProgramUniform4f)
 
 #ifdef BUILD_ANDROID
 // VEXA_FIXES: Declare EXT/APPLE alias entrypoints used by Android fallback lookups and

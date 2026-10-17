@@ -406,7 +406,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     timespec tp {};
     clock_gettime(CLOCK_MONOTONIC, &tp);
     LogMan::Msg::IFmt("audit: type={} audit({}.{:03}:{}): uid={} gid={} pid={} comm={} sig={} arch={:x} syscall={} ip=0x{:x} code=0x{:x}",
-                      AUDIT_SECCOMP, tp.tv_sec, tp.tv_nsec / 1'000'000, AuditSerialIncrement(), ::getuid(), ::getgid(), ::getpid(),
+                      AUDIT_SECCOMP, tp.tv_sec, tp.tv_nsec / 1'000'000, AuditSerialIncrement(), ::getuid(), ::getgid(), FHU::Syscalls::getpid(),
                       Filename(), Signal, Arch, Args->Argument[0], RIP, SeccompResult);
   }
 
@@ -427,7 +427,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     uint64_t Mask = 1 << (SIGSYS - 1);
     SignalDelegation->GuestSigProcMask(Thread, SIG_UNBLOCK, &Mask, nullptr);
     SignalDelegation->UninstallHostHandler(SIGSYS);
-    FHU::Syscalls::tgkill(::getpid(), ::gettid(), SIGSYS);
+    FHU::Syscalls::tgkill(FHU::Syscalls::getpid(), ::gettid(), SIGSYS);
     break;
   }
   case SECCOMP_RET_TRAP: {
@@ -441,7 +441,7 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     Info.si_syscall = Args->Argument[0];
     Info.si_arch = Arch;
 
-    SignalDelegation->QueueSignal(::getpid(), ::gettid(), SIGSYS, &Info, true);
+    SignalDelegation->QueueSignal(FHU::Syscalls::getpid(), ::gettid(), SIGSYS, &Info, true);
     break;
   }
   case SECCOMP_RET_ERRNO: {

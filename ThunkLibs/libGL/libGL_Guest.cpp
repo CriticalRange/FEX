@@ -537,6 +537,27 @@ uintptr_t ResolveAndroidDirectGuestProc(std::string_view procname) {
   return 0;
 }
 
+// Forward decls for compat exports defined at file end.
+void glDepthBounds(GLclampd, GLclampd);
+void glSelectBuffer(GLsizei, GLuint*);
+void glColorPointer(GLint, GLenum, GLsizei, const void*);
+void glEnableClientState(GLenum);
+void glFrameTerminator(void);
+void glPushGroupMarker(GLsizei, const GLchar*);
+void glPopGroupMarker(void);
+void glInsertEventMarker(GLsizei, const GLchar*);
+void glLabelObject(GLenum, GLuint, GLsizei, const GLchar*);
+void glRenderbufferStorageMultisampleCoverage(GLenum, GLsizei, GLsizei, GLenum, GLsizei, GLsizei);
+static void VexaCompat_glTexImage2DMultisample(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
+static void VexaCompat_glGetTextureParameteriv(GLuint, GLenum, GLint*);
+static void VexaCompat_glGetTextureLevelParameteriv(GLuint, GLint, GLenum, GLint*);
+static void VexaCompat_glDrawElementsInstancedBaseInstance(GLenum, GLsizei, GLenum, const void*, GLsizei, GLuint);
+static void VexaCompat_glDrawElementsInstancedBaseVertexBaseInstance(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint, GLuint);
+int glXGetGPUIDsAMD(unsigned int, unsigned int*);
+int glXGetGPUInfoAMD(unsigned int, int, GLenum, unsigned int, void*);
+unsigned int glXGetContextGPUIDAMD(void*);
+int glXSwapIntervalSGI(int);
+
 uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
 #ifdef BUILD_ANDROID
   if (procname == "glXChooseVisual") return reinterpret_cast<uintptr_t>(glXChooseVisual);
@@ -607,6 +628,31 @@ uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
   if (procname == "glCopyTexImage2D") return reinterpret_cast<uintptr_t>(glCopyTexImage2D);
   if (procname == "glCopyTexSubImage1D") return reinterpret_cast<uintptr_t>(glCopyTexSubImage1D);
   if (procname == "glTexSubImage1D") return reinterpret_cast<uintptr_t>(glTexSubImage1D);
+  if (procname == "glCompressedTexImage1D") return reinterpret_cast<uintptr_t>(glCompressedTexImage1D);
+  if (procname == "glCompressedTexSubImage1D") return reinterpret_cast<uintptr_t>(glCompressedTexSubImage1D);
+  if (procname == "glGetCompressedTexImage") return reinterpret_cast<uintptr_t>(glGetCompressedTexImage);
+  if (procname == "glGetBufferSubData") return reinterpret_cast<uintptr_t>(glGetBufferSubData);
+  if (procname == "glGetQueryObjectiv") return reinterpret_cast<uintptr_t>(glGetQueryObjectiv);
+  if (procname == "glBindFragDataLocation") return reinterpret_cast<uintptr_t>(glBindFragDataLocation);
+  if (procname == "glBindFragDataLocationIndexed") return reinterpret_cast<uintptr_t>(glBindFragDataLocationIndexed);
+  if (procname == "glGetActiveUniformName") return reinterpret_cast<uintptr_t>(glGetActiveUniformName);
+  if (procname == "glMultiDrawElementsBaseVertex") return reinterpret_cast<uintptr_t>(glMultiDrawElementsBaseVertex);
+  if (procname == "glMultiDrawArraysIndirect") return reinterpret_cast<uintptr_t>(glMultiDrawArraysIndirect);
+  if (procname == "glMultiDrawElementsIndirect") return reinterpret_cast<uintptr_t>(glMultiDrawElementsIndirect);
+  if (procname == "glBindBuffersBase") return reinterpret_cast<uintptr_t>(glBindBuffersBase);
+  if (procname == "glBindBuffersRange") return reinterpret_cast<uintptr_t>(glBindBuffersRange);
+  if (procname == "glBindTextures") return reinterpret_cast<uintptr_t>(glBindTextures);
+  if (procname == "glBindSamplers") return reinterpret_cast<uintptr_t>(glBindSamplers);
+  if (procname == "glBindImageTextures") return reinterpret_cast<uintptr_t>(glBindImageTextures);
+  if (procname == "glBindVertexBuffers") return reinterpret_cast<uintptr_t>(glBindVertexBuffers);
+  if (procname == "glInvalidateBufferData") return reinterpret_cast<uintptr_t>(glInvalidateBufferData);
+  if (procname == "glInvalidateBufferSubData") return reinterpret_cast<uintptr_t>(glInvalidateBufferSubData);
+  // NOTE: Do not advertise glDepthBounds (and the desktop-only names defined near the end of this file:
+  // glClipControl, glVertexAttribLFormat, glXGetGPU*AMD, glXSwapIntervalSGI, ...) through this table.
+  // Bisected on Megabonk (Unity, Vulkan mode): glDepthBounds resolving here, or glMapBuffer exported
+  // from libGL, makes Unity take its desktop-GL path and crash (strlen(NULL) in SDL_GetDisplayName).
+  // The functions stay exported for guests that dlsym() libGL directly (ETS2); glMapBuffer lives in
+  // libvexa_glmap.so (LD_PRELOAD for ETS2 only).
   if (procname == "glIsTexture") return reinterpret_cast<uintptr_t>(glIsTexture);
   if (procname == "glBegin") return reinterpret_cast<uintptr_t>(glBegin);
   if (procname == "glEnd") return reinterpret_cast<uintptr_t>(glEnd);
@@ -1361,6 +1407,203 @@ VEXA_GL_GUEST_EXPORT void glShadeModel(GLenum /*mode*/) {}
 VEXA_GL_GUEST_EXPORT void glLightfv(GLenum /*light*/, GLenum /*pname*/, const GLfloat* /*params*/) {}
 VEXA_GL_GUEST_EXPORT void glMaterialfv(GLenum /*face*/, GLenum pname, const GLfloat* params) {
   vexa_ff::material(pname, params);
+}
+
+// glMapBuffer is intentionally NOT defined here (see libvexa_glmap.c): exporting it from libGL makes
+// Unity (Megabonk, Vulkan mode) take its desktop-GL path and crash.
+// ---- Desktop GL entrypoints ETS2 resolves via dlsym(libGL.so.1) ----
+// Host GLES lacks most of these; emulate with thunked siblings or no-op.
+
+VEXA_GL_GUEST_EXPORT void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat,
+                                                  GLsizei width, GLint border, GLsizei imageSize, const void* data) {
+  ::glCompressedTexImage2D(GL_TEXTURE_2D, level, internalformat, width, 1, border, imageSize, data);
+}
+
+VEXA_GL_GUEST_EXPORT void glCompressedTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width,
+                                                     GLenum format, GLsizei imageSize, const void* data) {
+  ::glCompressedTexSubImage2D(GL_TEXTURE_2D, level, xoffset, 0, width, 1, format, imageSize, data);
+}
+
+VEXA_GL_GUEST_EXPORT void glGetCompressedTexImage(GLenum /*target*/, GLint /*level*/, void* /*img*/) {}
+
+VEXA_GL_GUEST_EXPORT void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data) {
+  if (!data || size <= 0) return;
+  void* p = ::glMapBufferRange(target, offset, size, 0x0001 /*GL_MAP_READ_BIT*/);
+  if (!p) return;
+  memcpy(data, p, static_cast<size_t>(size));
+  ::glUnmapBuffer(target);
+}
+
+VEXA_GL_GUEST_EXPORT void glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params) {
+  GLuint v = 0;
+  ::glGetQueryObjectuiv(id, pname, &v);
+  if (params) *params = static_cast<GLint>(v);
+}
+
+VEXA_GL_GUEST_EXPORT void glBindFragDataLocation(GLuint /*program*/, GLuint /*color*/, const GLchar* /*name*/) {}
+VEXA_GL_GUEST_EXPORT void glBindFragDataLocationIndexed(GLuint /*program*/, GLuint /*color*/, GLuint /*index*/, const GLchar* /*name*/) {}
+
+VEXA_GL_GUEST_EXPORT void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+  VexaCompat_glFramebufferTexture1D(target, attachment, textarget, texture, level);
+}
+
+VEXA_GL_GUEST_EXPORT void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) {
+  VexaCompat_glFramebufferTexture3D(target, attachment, textarget, texture, level, zoffset);
+}
+
+VEXA_GL_GUEST_EXPORT void glGetActiveUniformName(GLuint program, GLuint uniformIndex, GLsizei bufSize, GLsizei* length, GLchar* uniformName) {
+  GLint size = 0;
+  GLenum type = 0;
+  ::glGetActiveUniform(program, uniformIndex, bufSize, length, &size, &type, uniformName);
+}
+
+VEXA_GL_GUEST_EXPORT void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type,
+                                                         const void* const* indices, GLsizei drawcount, const GLint* basevertex) {
+  for (GLsizei i = 0; i < drawcount; ++i) {
+    ::glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
+  }
+}
+
+VEXA_GL_GUEST_EXPORT void glMultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
+  if (drawcount <= 0) return;
+  if (stride == 0) stride = 16;
+  const auto off = reinterpret_cast<uintptr_t>(indirect);
+  const GLsizeiptr map_size = off + static_cast<GLsizeiptr>(stride) * drawcount;
+  const uint8_t* p = static_cast<const uint8_t*>(
+      ::glMapBufferRange(0x8F3F /*GL_DRAW_INDIRECT_BUFFER*/, 0, map_size, 0x0001));
+  if (!p) return;
+  for (GLsizei i = 0; i < drawcount; ++i) {
+    const uint32_t* e = reinterpret_cast<const uint32_t*>(p + off + static_cast<size_t>(stride) * i);
+    ::glDrawArraysInstanced(mode, static_cast<GLint>(e[2]), static_cast<GLsizei>(e[0]), static_cast<GLsizei>(e[1]));
+  }
+  ::glUnmapBuffer(0x8F3F);
+}
+
+VEXA_GL_GUEST_EXPORT void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride) {
+  if (drawcount <= 0) return;
+  if (stride == 0) stride = 20;
+  const auto off = reinterpret_cast<uintptr_t>(indirect);
+  const GLsizeiptr map_size = off + static_cast<GLsizeiptr>(stride) * drawcount;
+  const uint8_t* p = static_cast<const uint8_t*>(
+      ::glMapBufferRange(0x8F3F /*GL_DRAW_INDIRECT_BUFFER*/, 0, map_size, 0x0001));
+  if (!p) return;
+  const GLsizeiptr elem_size = (type == 0x1403 /*UNSIGNED_SHORT*/) ? 2 : 4;
+  for (GLsizei i = 0; i < drawcount; ++i) {
+    const uint32_t* e = reinterpret_cast<const uint32_t*>(p + off + static_cast<size_t>(stride) * i);
+    ::glDrawElementsInstancedBaseVertex(mode, static_cast<GLsizei>(e[0]), type,
+                                        reinterpret_cast<const void*>(static_cast<uintptr_t>(e[2] * elem_size)),
+                                        static_cast<GLsizei>(e[1]), static_cast<GLint>(e[3]));
+  }
+  ::glUnmapBuffer(0x8F3F);
+}
+
+VEXA_GL_GUEST_EXPORT void glBindBuffersBase(GLenum target, GLuint first, GLsizei count, const GLuint* buffers) {
+  for (GLsizei i = 0; i < count; ++i) ::glBindBufferBase(target, first + i, buffers[i]);
+}
+
+VEXA_GL_GUEST_EXPORT void glBindBuffersRange(GLenum target, GLuint first, GLsizei count, const GLuint* buffers,
+                                             const GLintptr* offsets, const GLsizeiptr* sizes) {
+  for (GLsizei i = 0; i < count; ++i) ::glBindBufferRange(target, first + i, buffers[i], offsets[i], sizes[i]);
+}
+
+VEXA_GL_GUEST_EXPORT void glBindTextures(GLuint first, GLsizei count, const GLuint* textures) {
+  for (GLsizei i = 0; i < count; ++i) {
+    if (!textures[i]) continue;
+    ::glActiveTexture(0x84C0 /*GL_TEXTURE0*/ + first + i);
+    ::glBindTexture(GL_TEXTURE_2D, textures[i]);
+  }
+}
+
+VEXA_GL_GUEST_EXPORT void glBindSamplers(GLuint first, GLsizei count, const GLuint* samplers) {
+  for (GLsizei i = 0; i < count; ++i) ::glBindSampler(first + i, samplers[i]);
+}
+
+VEXA_GL_GUEST_EXPORT void glBindImageTextures(GLuint first, GLsizei count, const GLuint* textures) {
+  for (GLsizei i = 0; i < count; ++i) {
+    ::glBindImageTexture(first + i, textures[i], 0, GL_TRUE, 0, 0x88B9 /*GL_WRITE_ONLY*/, 0x8058 /*GL_RGBA8*/);
+  }
+}
+
+VEXA_GL_GUEST_EXPORT void glBindVertexBuffers(GLuint first, GLsizei count, const GLuint* buffers,
+                                              const GLintptr* offsets, const GLsizei* strides) {
+  for (GLsizei i = 0; i < count; ++i) {
+    ::glBindVertexBuffer(first + i, buffers[i], offsets ? offsets[i] : 0, strides ? strides[i] : 0);
+  }
+}
+
+VEXA_GL_GUEST_EXPORT void glInvalidateBufferData(GLuint /*buffer*/) {}
+VEXA_GL_GUEST_EXPORT void glInvalidateBufferSubData(GLuint /*buffer*/, GLintptr /*offset*/, GLsizeiptr /*length*/) {}
+VEXA_GL_GUEST_EXPORT void glDepthBounds(GLclampd /*zmin*/, GLclampd /*zmax*/) {}
+VEXA_GL_GUEST_EXPORT void glClipControl(GLenum /*origin*/, GLenum /*depth*/) {}
+VEXA_GL_GUEST_EXPORT void glVertexAttribLFormat(GLuint /*index*/, GLint /*size*/, GLenum /*type*/, GLuint /*relativeoffset*/) {}
+VEXA_GL_GUEST_EXPORT void glSelectBuffer(GLsizei /*size*/, GLuint* /*buffer*/) {}
+VEXA_GL_GUEST_EXPORT void glColorPointer(GLint /*size*/, GLenum /*type*/, GLsizei /*stride*/, const void* /*pointer*/) {}
+VEXA_GL_GUEST_EXPORT void glEnableClientState(GLenum /*array*/) {}
+VEXA_GL_GUEST_EXPORT void glFrameTerminator(void) {}
+VEXA_GL_GUEST_EXPORT void glPushGroupMarker(GLsizei /*length*/, const GLchar* /*marker*/) {}
+VEXA_GL_GUEST_EXPORT void glPopGroupMarker(void) {}
+VEXA_GL_GUEST_EXPORT void glInsertEventMarker(GLsizei /*length*/, const GLchar* /*marker*/) {}
+
+VEXA_GL_GUEST_EXPORT GLuint glCreateShaderProgramv(GLenum type, GLsizei count, const GLchar* const* strings) {
+  if (count <= 0 || !strings) return 0;
+  GLuint shader = ::glCreateShader(type);
+  if (!shader) return 0;
+  ::glShaderSource(shader, count, strings, nullptr);
+  ::glCompileShader(shader);
+  GLuint program = ::glCreateProgram();
+  if (!program) { ::glDeleteShader(shader); return 0; }
+  ::glAttachShader(program, shader);
+  ::glLinkProgram(program);
+  ::glDetachShader(program, shader);
+  ::glDeleteShader(shader);
+  return program;
+}
+
+VEXA_GL_GUEST_EXPORT void glLabelObject(GLenum identifier, GLuint name, GLsizei length, const GLchar* label) {
+  ::glObjectLabel(identifier, name, length, label);
+}
+
+VEXA_GL_GUEST_EXPORT int glXGetGPUIDsAMD(unsigned int /*maxCount*/, unsigned int* /*ids*/) { return 0; }
+VEXA_GL_GUEST_EXPORT int glXGetGPUInfoAMD(unsigned int /*id*/, int /*property*/, GLenum /*dataType*/, unsigned int /*size*/, void* /*data*/) { return 0; }
+VEXA_GL_GUEST_EXPORT unsigned int glXGetContextGPUIDAMD(void* /*ctx*/) { return 0; }
+
+VEXA_GL_GUEST_EXPORT int glXSwapIntervalSGI(int interval) {
+  return fexfn_pack_VEXA_SetSwapInterval(interval);
+}
+
+VEXA_GL_GUEST_EXPORT void glPolygonOffsetClamp(GLfloat factor, GLfloat units, GLfloat clamp) {
+  (void)clamp;
+  ::glPolygonOffset(factor, units);
+}
+VEXA_GL_GUEST_EXPORT void glRenderbufferStorageMultisampleCoverage(GLenum target, GLsizei /*coverageSamples*/,
+                                                                    GLsizei colorSamples, GLenum internalformat,
+                                                                    GLsizei width, GLsizei height) {
+  ::glRenderbufferStorageMultisample(target, colorSamples, internalformat, width, height);
+}
+
+
+static void VexaCompat_glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat,
+                                                  GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
+  ::glTexStorage2DMultisample(target, samples, internalformat, width, height, fixedsamplelocations);
+}
+
+static void VexaCompat_glGetTextureParameteriv(GLuint /*texture*/, GLenum /*pname*/, GLint* params) {
+  if (params) *params = 0;
+}
+
+static void VexaCompat_glGetTextureLevelParameteriv(GLuint /*texture*/, GLint /*level*/, GLenum /*pname*/, GLint* params) {
+  if (params) *params = 0;
+}
+
+static void VexaCompat_glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type,
+                                                               const void* indices, GLsizei instancecount, GLuint /*baseinstance*/) {
+  ::glDrawElementsInstanced(mode, count, type, indices, instancecount);
+}
+
+static void VexaCompat_glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type,
+                                                                         const void* indices, GLsizei instancecount,
+                                                                         GLint basevertex, GLuint /*baseinstance*/) {
+  ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
 }
 
 #undef VEXA_GL_GUEST_EXPORT

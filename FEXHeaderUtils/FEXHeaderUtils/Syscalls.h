@@ -61,6 +61,15 @@ inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
 #endif
 }
 
+inline int32_t getpid() {
+#if defined(__ANDROID__)
+  // Bionic caches PID in pthread TLS and does not update it across raw clone() syscalls.
+  return ::syscall(SYS_getpid);
+#else
+  return ::getpid();
+#endif
+}
+
 inline int32_t gettid() {
 #if defined(HAS_SYSCALL_GETTID) && HAS_SYSCALL_GETTID
   return ::gettid();

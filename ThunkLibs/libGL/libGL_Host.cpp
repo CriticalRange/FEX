@@ -1233,6 +1233,7 @@ struct VexaGlxState {
   ANativeWindow* window = nullptr;
   uint64_t window_serial = 0;
   bool ready = false;
+  bool shadow = false;
 };
 
 // Headless runs must not touch a SurfaceTexture-backed ANativeWindow at all:
@@ -1328,6 +1329,9 @@ extern uint64_t g_vexa_diag_bindfbo;
 extern uint64_t g_vexa_diag_dispatches;
 
 static VexaGlxState g_vexa_glx;
+// Surface serial for which the VEXA_GLX_SWAP_INTERVAL env override was last
+// applied. ~0 forces an apply on the first swap of any surface.
+static uint64_t g_vexa_env_interval_serial = ~0ull;
 
 // Called with g_vexa_context_mutex held. Keep the old surface on creation
 // failure so a later bind/swap can retry. Do not bind the bootstrap context:
@@ -1336,8 +1340,19 @@ static bool VexaSrgbSurface() {
   const char* flag = getenv("VEXA_GL_SRGB_SURFACE");
   return flag && strcmp(flag, "1") == 0;
 }
+// When the launch env selects the Vulkan renderer, guest GL probing (Unity
+// loads libGL before picking Vulkan) must not connect EGL to the runtime
+// window — vkCreateAndroidSurfaceKHR needs the only api connect. GL runs on a
+// shadow pbuffer so the probe still sees a working GLES context.
+static bool VexaGlShadowForVulkan() {
+  static const bool shadow = [] {
+    const char* backend = getenv("VEXA_GRAPHICS_BACKEND");
+    return backend && strcmp(backend, "vulkan") == 0;
+  }();
+  return shadow;
+}
 static bool VexaRefreshGlxSurface() {
-  if (VexaHeadlessMode()) return g_vexa_glx.surface != EGL_NO_SURFACE;
+  if (VexaHeadlessMode() || g_vexa_glx.shadow) return g_vexa_glx.surface != EGL_NO_SURFACE;
   const uint64_t serial = VexaRuntimeSurfaceSerial();
   if (!serial || serial == g_vexa_glx.window_serial) return true;
   ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
@@ -1378,8 +1393,9 @@ static bool VexaEnsureGlx() {
     return false;
   }
   const bool headless = VexaHeadlessMode();
-  ANativeWindow* window = headless ? nullptr : VexaAcquireRuntimeWindow(2000);
-  if (!window && !headless) {
+  const bool shadow = !headless && VexaGlShadowForVulkan();
+  ANativeWindow* window = (headless || shadow) ? nullptr : VexaAcquireRuntimeWindow(2000);
+  if (!window && !headless && !shadow) {
     return false;
   }
   EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -1415,7 +1431,7 @@ static bool VexaEnsureGlx() {
   }
   EGLSurface surface = EGL_NO_SURFACE;
   int headless_w = 0, headless_h = 0;
-  if (headless) {
+  if (headless || shadow) {
     headless_w = VexaHeadlessEnvInt("VEXA_HEADLESS_W", 1280);
     headless_h = VexaHeadlessEnvInt("VEXA_HEADLESS_H", 720);
     const EGLint pbattrs[] = {EGL_WIDTH, headless_w, EGL_HEIGHT, headless_h,
@@ -1427,7 +1443,7 @@ static bool VexaEnsureGlx() {
   }
   if (surface == EGL_NO_SURFACE) {
     fprintf(stderr, "[VEXA][GLX] eglCreate%sSurface failed 0x%x\n",
-            headless ? "Pbuffer" : "Window", eglGetError());
+            (headless || shadow) ? "Pbuffer" : "Window", eglGetError());
     if (window) ANativeWindow_release(window);
     return false;
   }
@@ -1464,16 +1480,19 @@ static bool VexaEnsureGlx() {
     if (window) ANativeWindow_release(window);
     return false;
   }
+  // EGL defaults to swap interval 1; the env override is applied lazily in the
+  // swap path (VEXA_GLX_SWAP_INTERVAL) where the surface is current.
   g_vexa_glx.display = display;
   g_vexa_glx.surface = surface;
   g_vexa_glx.context = context;
   g_vexa_glx.config = config;
   g_vexa_glx.buffer_format = format;
   g_vexa_glx.window = window;
-  g_vexa_glx.window_serial = VexaRuntimeSurfaceSerial();
+  g_vexa_glx.window_serial = shadow ? 0 : VexaRuntimeSurfaceSerial();
   g_vexa_glx.ready = true;
-  fprintf(stderr, "[VEXA][GLX] surface ready %p gles %s serial %llu headless=%d\n", surface, ctx_name,
-          (unsigned long long)g_vexa_glx.window_serial, headless ? 1 : 0);
+  g_vexa_glx.shadow = shadow;
+  fprintf(stderr, "[VEXA][GLX] surface ready %p gles %s serial %llu headless=%d shadow=%d\n", surface, ctx_name,
+          (unsigned long long)g_vexa_glx.window_serial, headless ? 1 : 0, shadow ? 1 : 0);
   if (headless) {
     VexaPublishGuestSize(headless_w, headless_h);
   }
@@ -2000,6 +2019,22 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
     ++frame_no;
     ++g_vexa_swap_no;
   }
+  // Swap interval is per-surface in EGL; re-apply the env override whenever the
+  // window surface was rebuilt (serial change) so the override survives surface
+  // recreation.
+  {
+    static const int env_interval = [] {
+      const char* iv = getenv("VEXA_GLX_SWAP_INTERVAL");
+      return iv ? atoi(iv) : -1;
+    }();
+    if (env_interval >= 0 && g_vexa_glx.window_serial != g_vexa_env_interval_serial) {
+      const int interval = env_interval;
+      const EGLBoolean ok = eglSwapInterval(g_vexa_glx.display, interval);
+      fprintf(stderr, "[VEXA][GLX] env swap interval %d -> %s (serial=%llu)\n", interval,
+              ok == EGL_TRUE ? "ok" : "failed", (unsigned long long)g_vexa_glx.window_serial);
+      g_vexa_env_interval_serial = g_vexa_glx.window_serial;
+    }
+  }
   if (eglSwapBuffers(g_vexa_glx.display, g_vexa_glx.surface) != EGL_TRUE) {
     fprintf(stderr, "[VEXA][GLX] eglSwapBuffers failed 0x%x\n", eglGetError());
   }
@@ -2519,7 +2554,10 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
     fprintf(stderr, "[VEXA][TRACE] draw %s mode=%x n=%d dfbo=%d prog=%u pending_err=0x%x\n", name, mode, count, dfbo,
             g_vexa_diag_curprog, glGetError());
   }
-  if ((g_vexa_diag_draws & 1023) == 0) {
+  // glGetError can force the mobile driver to synchronize pending work. Keep
+  // this periodic error probe in explicit tracing sessions only; normal
+  // rendering already reports failures through the opt-in debug callback.
+  if (GLHostTraceEnabled() && (g_vexa_diag_draws & 1023) == 0) {
     GLenum err = glGetError();
     fprintf(stderr,
             "[VEXA][GL] draws=%llu last=%s mode=%x n=%d fbo=%u prog=%u clears=%llu err=%x\n",
@@ -5830,6 +5868,37 @@ void fexfn_impl_libGL_glXGetSelectedEventSGIX(Display* Display, GLXDrawable Draw
   unsigned long HostMask;
   fexldr_ptr_libGL_glXGetSelectedEventSGIX(Display, Drawable, &HostMask);
   *Mask.get_pointer() = HostMask;
+}
+#endif
+
+#if defined(BUILD_ANDROID)
+// The runtime window's BufferQueue producer accepts a single api connect();
+// our EGL window surface already holds it. A guest that moves to Vulkan
+// (Unity probes GLX first) needs the api slot back, otherwise the producer's
+// second connect() returns BAD_VALUE and vkCreateAndroidSurfaceKHR fails
+// with EINVAL. The Vulkan thunk resolves this through dlsym before creating
+// its VkSurfaceKHR.
+extern "C" __attribute__((visibility("default")))
+void Vexa_ReleaseGlxWindowApi(ANativeWindow* window) {
+  if (!window) return;
+  std::lock_guard lock(g_vexa_context_mutex);
+  if (!g_vexa_glx.ready || g_vexa_glx.window != window) return;
+  eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (g_vexa_glx.surface != EGL_NO_SURFACE) {
+    eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
+    g_vexa_glx.surface = EGL_NO_SURFACE;
+  }
+  // eglDestroySurface defers destruction while another thread holds the
+  // surface current; call Surface::disconnect(api) directly as a fallback so
+  // the producer frees now. NATIVE_WINDOW_API_EGL == 1, DisconnectModeNormal == 0.
+  using SurfaceDisconnect = int (*)(void*, int, int);
+  static auto* surface_disconnect = reinterpret_cast<SurfaceDisconnect>(
+      dlsym(RTLD_DEFAULT, "_ZN7android7Surface10disconnectEiNS_22IGraphicBufferProducer14DisconnectModeE"));
+  if (surface_disconnect) {
+    surface_disconnect(window, 1, 0);
+  }
+  g_vexa_glx.ready = false;
+  fprintf(stderr, "[VEXA][GLX] released window api for Vulkan takeover\n");
 }
 #endif
 

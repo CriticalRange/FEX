@@ -292,12 +292,22 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
     bool Map32Bit = !Is64Bit || (flags & FEX::HLE::X86_64_MAP_32BIT);
     if (Map32Bit) {
       Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, prot, flags, fd, offset);
+#if defined(__ANDROID__)
+      if (Result == static_cast<uint64_t>(-EACCES) && (prot & PROT_EXEC) && !(flags & MAP_ANONYMOUS) && fd >= 0) {
+        Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, (prot & ~PROT_EXEC) | PROT_READ, flags, fd, offset);
+      }
+#endif
       if (FEX::HLE::HasSyscallError(Result)) {
         return reinterpret_cast<void*>(Result);
       }
       LOGMAN_THROW_A_FMT(Is64Bit || (Result >> 32) == 0 || (Result >> 32) == 0xFFFFFFFF, "values must fit to 32 bits");
     } else {
       Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
+#if defined(__ANDROID__)
+      if (Result == ~0ULL && errno == EACCES && (prot & PROT_EXEC) && !(flags & MAP_ANONYMOUS) && fd >= 0) {
+        Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, (prot & ~PROT_EXEC) | PROT_READ, flags, fd, offset));
+      }
+#endif
       if (Result == ~0ULL) {
         return reinterpret_cast<void*>(-errno);
       }
@@ -459,6 +469,11 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
       }
     }
     Result = ::mprotect(addr, len, prot);
+#if defined(__ANDROID__)
+    if (Result == -1 && errno == EACCES && (prot & PROT_EXEC)) {
+      Result = ::mprotect(addr, len, (prot & ~PROT_EXEC) | PROT_READ);
+    }
+#endif
     if (Result == -1) {
       return -errno;
     }
@@ -471,6 +486,9 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
 }
 
 uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, int shmid, const void* shmaddr, int shmflg) {
+#if defined(__ANDROID__)
+  return -ENOSYS;
+#else
   uint64_t Result {};
   uint64_t Length {};
 
@@ -501,9 +519,13 @@ uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadS
 
   InvalidateCodeRangeIfNecessary(Thread, Result, Length);
   return Result;
+#endif
 }
 
 uint64_t SyscallHandler::GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, const void* shmaddr) {
+#if defined(__ANDROID__)
+  return -ENOSYS;
+#else
   uint64_t Result {};
   uint64_t Length {};
   {
@@ -525,6 +547,7 @@ uint64_t SyscallHandler::GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadS
 
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uintptr_t>(shmaddr), Length);
   return Result;
+#endif
 }
 
 // MMan Tracking
