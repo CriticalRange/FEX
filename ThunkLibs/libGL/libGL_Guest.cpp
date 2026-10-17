@@ -551,8 +551,36 @@ void glRenderbufferStorageMultisampleCoverage(GLenum, GLsizei, GLsizei, GLenum, 
 static void VexaCompat_glTexImage2DMultisample(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
 static void VexaCompat_glGetTextureParameteriv(GLuint, GLenum, GLint*);
 static void VexaCompat_glGetTextureLevelParameteriv(GLuint, GLint, GLenum, GLint*);
-static void VexaCompat_glDrawElementsInstancedBaseInstance(GLenum, GLsizei, GLenum, const void*, GLsizei, GLuint);
-static void VexaCompat_glDrawElementsInstancedBaseVertexBaseInstance(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint, GLuint);
+// These are odr-used from this anonymous namespace. Definitions that live
+// later, in the extern "C" export block, are different functions, so the
+// linker leaves these references undefined. ETS2 dlopens libGL with RTLD_NOW
+// and treats a failed dlopen as a null glXQueryVersion.
+static void VexaWarnBaseInstance(const char* fn, GLuint baseinstance) {
+  static int warned = 0;
+  if (baseinstance != 0 && warned++ < 8) {
+    fprintf(stderr, "[libGL thunk] %s baseinstance=%u ignored (no GL_EXT_base_instance on this driver)\n", fn, baseinstance);
+  }
+}
+static void VexaCompat_glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type,
+                                                               const void* indices, GLsizei instancecount, GLuint baseinstance) {
+  VexaWarnBaseInstance("glDrawElementsInstancedBaseInstance", baseinstance);
+  ::glDrawElementsInstanced(mode, count, type, indices, instancecount);
+}
+static void VexaCompat_glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type,
+                                                                         const void* indices, GLsizei instancecount,
+                                                                         GLint basevertex, GLuint baseinstance) {
+  VexaWarnBaseInstance("glDrawElementsInstancedBaseVertexBaseInstance", baseinstance);
+  ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
+}
+static void VexaCompat_glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
+                                                             GLsizei instancecount, GLuint baseinstance) {
+  VexaWarnBaseInstance("glDrawArraysInstancedBaseInstance", baseinstance);
+  ::glDrawArraysInstanced(mode, first, count, instancecount);
+}
+void glPolygonOffsetClamp(GLfloat factor, GLfloat units, GLfloat clamp) {
+  (void)clamp;
+  ::glPolygonOffset(factor, units);
+}
 int glXGetGPUIDsAMD(unsigned int, unsigned int*);
 int glXGetGPUInfoAMD(unsigned int, int, GLenum, unsigned int, void*);
 unsigned int glXGetContextGPUIDAMD(void*);
@@ -658,6 +686,21 @@ uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
   if (procname == "glEnd") return reinterpret_cast<uintptr_t>(glEnd);
   if (procname == "glVertex3f") return reinterpret_cast<uintptr_t>(glVertex3f);
   if (procname == "glNormal3f") return reinterpret_cast<uintptr_t>(glNormal3f);
+  // Mali (GLES 3.2) has no base_instance. ETS2 draws most of its geometry through
+  // these desktop entry points; without a guest entry they resolve to the no-op
+  // MissingGLProcStub and the draw silently disappears.
+  if (procname == "glDrawElementsInstancedBaseInstance" || procname == "glDrawElementsInstancedBaseInstanceEXT") {
+    return reinterpret_cast<uintptr_t>(VexaCompat_glDrawElementsInstancedBaseInstance);
+  }
+  if (procname == "glDrawElementsInstancedBaseVertexBaseInstance" || procname == "glDrawElementsInstancedBaseVertexBaseInstanceEXT") {
+    return reinterpret_cast<uintptr_t>(VexaCompat_glDrawElementsInstancedBaseVertexBaseInstance);
+  }
+  if (procname == "glDrawArraysInstancedBaseInstance" || procname == "glDrawArraysInstancedBaseInstanceEXT") {
+    return reinterpret_cast<uintptr_t>(VexaCompat_glDrawArraysInstancedBaseInstance);
+  }
+  if (procname == "glPolygonOffsetClampEXT" || procname == "glPolygonOffsetClamp") {
+    return reinterpret_cast<uintptr_t>(glPolygonOffsetClamp);
+  }
   if (procname == "glMatrixMode") return reinterpret_cast<uintptr_t>(glMatrixMode);
   if (procname == "glLoadIdentity") return reinterpret_cast<uintptr_t>(glLoadIdentity);
   if (procname == "glTranslatef") return reinterpret_cast<uintptr_t>(glTranslatef);
@@ -727,6 +770,15 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
 
   // VEXA_FIXES: Resolve in this order: shader bridge/self handlers, Android direct
   // guest bindings, host lookup, then address-to-invoker link stitching.
+#ifdef BUILD_ANDROID
+  if (procname_s == "glMapBuffer") {
+    // ETS2 asks glXGetProcAddress for the desktop name. The host already
+    // implements it as glMapBufferOES. Do not export glMapBuffer from libGL:
+    // Unity's dlsym(libGL) would then take the desktop path and crash.
+    fprintf(stderr, "[libGL thunk] glXGetProcAddress glMapBuffer -> glMapBufferOES\n");
+    return reinterpret_cast<voidFunc*>(glMapBufferOES);
+  }
+#endif
   if (procname_s == "glShaderSource" || procname_s == "glShaderSourceARB") {
     // VEXA_FIXES: Route shader source through explicit guest bridge helper.
     // Return a guest-callable entrypoint for shader source and avoid exposing
@@ -735,6 +787,17 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
     TraceGLProcLink(procname_s, reinterpret_cast<const void*>(shader_source_addr), shader_source_addr);
     return reinterpret_cast<voidFunc*>(glShaderSource);
   }
+#ifdef BUILD_ANDROID
+  if (procname_s == "glCreateShaderProgramv") {
+    // ETS2 resolves this through glXGetProcAddress. The host would otherwise
+    // return Mali's native entry, which receives desktop GLSL untranslated and
+    // fails with an empty info log. Our guest implementation builds the program
+    // from glCreateShader/glShaderSource, so the ESSL translation applies.
+    const auto create_program_addr = reinterpret_cast<uintptr_t>(glCreateShaderProgramv);
+    TraceGLProcLink(procname_s, reinterpret_cast<const void*>(create_program_addr), create_program_addr);
+    return reinterpret_cast<voidFunc*>(glCreateShaderProgramv);
+  }
+#endif
 
 #ifdef BUILD_ANDROID
   if (const uintptr_t hidden = VexaHiddenCoreNoop(procname_s)) {
@@ -1550,10 +1613,33 @@ VEXA_GL_GUEST_EXPORT GLuint glCreateShaderProgramv(GLenum type, GLsizei count, c
   if (!shader) return 0;
   ::glShaderSource(shader, count, strings, nullptr);
   ::glCompileShader(shader);
+  // The game only reports "driver provided no explanation"; surface the real
+  // Mali compile/link log (and the source head) so failures are diagnosable.
+  GLint compiled = GL_FALSE;
+  ::glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (compiled != GL_TRUE) {
+    char log[2048] = {};
+    GLsizei written = 0;
+    ::glGetShaderInfoLog(shader, sizeof(log) - 1, &written, log);
+    fprintf(stderr, "[libGL thunk] SHADER-COMPILE-FAILED type=0x%x log='%.1500s' src0='%.400s'\n",
+            type, log, strings[0] ? strings[0] : "(null)");
+  }
   GLuint program = ::glCreateProgram();
   if (!program) { ::glDeleteShader(shader); return 0; }
+  // Program pipelines (glUseProgramStages) only accept separable programs.
+  ::glProgramParameteri(program, GL_PROGRAM_SEPARABLE, GL_TRUE);
   ::glAttachShader(program, shader);
   ::glLinkProgram(program);
+  if (compiled == GL_TRUE) {
+    GLint linked = GL_FALSE;
+    ::glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+      char log[2048] = {};
+      GLsizei written = 0;
+      ::glGetProgramInfoLog(program, sizeof(log) - 1, &written, log);
+      fprintf(stderr, "[libGL thunk] SHADER-LINK-FAILED type=0x%x log='%.1500s'\n", type, log);
+    }
+  }
   ::glDetachShader(program, shader);
   ::glDeleteShader(shader);
   return program;
@@ -1593,17 +1679,6 @@ static void VexaCompat_glGetTextureParameteriv(GLuint /*texture*/, GLenum /*pnam
 
 static void VexaCompat_glGetTextureLevelParameteriv(GLuint /*texture*/, GLint /*level*/, GLenum /*pname*/, GLint* params) {
   if (params) *params = 0;
-}
-
-static void VexaCompat_glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type,
-                                                               const void* indices, GLsizei instancecount, GLuint /*baseinstance*/) {
-  ::glDrawElementsInstanced(mode, count, type, indices, instancecount);
-}
-
-static void VexaCompat_glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type,
-                                                                         const void* indices, GLsizei instancecount,
-                                                                         GLint basevertex, GLuint /*baseinstance*/) {
-  ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
 }
 
 #undef VEXA_GL_GUEST_EXPORT
