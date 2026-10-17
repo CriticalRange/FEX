@@ -34,6 +34,7 @@ $end_info$
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <GLES3/gl31.h>
 #include <GLES3/gl3ext.h>
 #include "common/AndroidWindow.h"
 #if __has_include(<android/log.h>)
@@ -1602,6 +1603,18 @@ constexpr GLenum kVexaGLDebugOutput = 0x92E0;
 constexpr GLenum kVexaGLDebugOutputSync = 0x8242;
 using VexaGLDebugProc = void(GL_APIENTRYP)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar*, const void*);
 
+// Synchronous KHR_debug reports the driver validation branch, which need not
+// identify the actual input enum. Keep the arguments on the calling thread.
+static thread_local GLenum VexaUploadFormat = 0, VexaUploadType = 0;
+static thread_local GLsizei VexaUploadWidth = 0, VexaUploadHeight = 0;
+struct VexaUploadTrace {
+  VexaUploadTrace(GLenum format, GLenum type, GLsizei width, GLsizei height) {
+    VexaUploadFormat = format; VexaUploadType = type;
+    VexaUploadWidth = width; VexaUploadHeight = height;
+  }
+  ~VexaUploadTrace() { VexaUploadFormat = VexaUploadType = 0; VexaUploadWidth = VexaUploadHeight = 0; }
+};
+
 static void GL_APIENTRY VexaGLDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length,
                                             const GLchar* message, const void*) {
   static int logged = 0;
@@ -1615,6 +1628,8 @@ static void GL_APIENTRY VexaGLDebugCallback(GLenum source, GLenum type, GLuint i
   }
   last_msg = msg;
   ++logged;
+  fprintf(stderr, "[VEXA][GLDBG-ARGS] upload fmt=%x type=%x size=%dx%d\n",
+          VexaUploadFormat, VexaUploadType, VexaUploadWidth, VexaUploadHeight);
   fprintf(stderr, "[VEXA][GLDBG] src=%x type=%x id=%u sev=%x tid=%ld: %.*s\n", source, type, id, severity,
           (long)syscall(SYS_gettid), length > 0 ? (int)length : 512, msg.c_str());
 }
@@ -2538,6 +2553,7 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
   if (g_vexa_trace_frame && access("/data/data/com.critical.vexaemulator/files/unity_shader_dump.flag", F_OK) == 0) {
     GLint program = 0;
     ::glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    if (program != 0)
     for (const char* uniform : {"_Color", "_AlphaParam", "_MainTex", "_MainTex_ST", "hlslcc_mtx4x4unity_MatrixVP[0]", "hlslcc_mtx4x4unity_ObjectToWorld[0]"}) {
       const GLint location = ::glGetUniformLocation(program, uniform);
       if (location < 0) continue;
@@ -2652,6 +2668,158 @@ static void VexaPostDrawDiag() {
           err, dfbo, st, atype, aname, prog, link, vao, ab, eab, attribs_on, feedback_unit);
 }
 
+static GLuint g_vexa_stage_program = 0;
+
+static GLuint VexaStageProgram() {
+  if (g_vexa_stage_program) return g_vexa_stage_program;
+  GLint pipe = 0;
+  ::glGetIntegerv(0x825A /* GL_PROGRAM_PIPELINE_BINDING */, &pipe);
+  while (::glGetError() != GL_NO_ERROR) {
+  }
+  if (!pipe) return 0;
+  const GLenum stages[] = {GL_FRAGMENT_SHADER, GL_VERTEX_SHADER, 0x8DD9, 0x91B9};
+  for (GLenum stage : stages) {
+    GLint program = 0;
+    ::glGetProgramPipelineiv(pipe, stage, &program);
+    while (::glGetError() != GL_NO_ERROR) {
+    }
+    if (program) {
+      g_vexa_stage_program = static_cast<GLuint>(program);
+      return g_vexa_stage_program;
+    }
+  }
+  return 0;
+}
+
+// ETS2 keeps a program pipeline bound and glUseProgram(0). glUniform* then
+// applies to program 0, and glGetUniformLocation(0) is rejected, so sampler
+// and material values stay at zero and the shaded frame is black.
+static GLuint VexaUniformTarget(GLuint program) {
+  auto linked = [](GLuint candidate) {
+    if (!candidate) return false;
+    GLint status = GL_FALSE;
+    ::glGetProgramiv(candidate, GL_LINK_STATUS, &status);
+    while (::glGetError() != GL_NO_ERROR) {
+    }
+    return status == GL_TRUE;
+  };
+  if (linked(program)) return program;
+  if (linked(g_vexa_diag_curprog)) return g_vexa_diag_curprog;
+  return VexaStageProgram();
+}
+
+static GLint VexaGL_glGetUniformLocation(GLuint program, const GLchar* name) {
+  const GLuint target = VexaUniformTarget(program);
+  static int logs = 0;
+  if (logs++ < 8) {
+    fprintf(stderr, "[VEXA][UNI] GetUniformLocation(%u) -> %u name=%s\n", program, target, name ? name : "");
+  }
+  if (!target) return -1;
+  return ::glGetUniformLocation(target, name);
+}
+
+static void VexaGL_glUseProgramStages(GLuint pipeline, GLbitfield stages, GLuint program) {
+  // GL_FRAGMENT_SHADER_BIT is 0x2. GL_ALL_SHADER_BITS is all ones.
+  if ((stages & 0x2u) != 0 || stages == 0xFFFFFFFFu) g_vexa_stage_program = program;
+  else if (!g_vexa_stage_program) g_vexa_stage_program = program;
+  ::glUseProgramStages(pipeline, stages, program);
+}
+
+static void VexaGL_glBindProgramPipeline(GLuint pipeline) {
+  if (!pipeline) g_vexa_stage_program = 0;
+  ::glBindProgramPipeline(pipeline);
+}
+
+static void VexaGL_glActiveShaderProgram(GLuint pipeline, GLuint program) {
+  g_vexa_stage_program = program;
+  ::glActiveShaderProgram(pipeline, program);
+}
+
+static void VexaGL_glProgramUniform1i(GLuint program, GLint location, GLint v0) {
+  const GLuint target = VexaUniformTarget(program);
+  if (target) ::glProgramUniform1i(target, location, v0);
+}
+
+#define VEXA_U1(suffix, type)                                                                                          \
+  static void VexaGL_glUniform##suffix(GLint location, type v0) {                                                     \
+    if (g_vexa_diag_curprog) {                                                                                         \
+      ::glUniform##suffix(location, v0);                                                                              \
+      return;                                                                                                         \
+    }                                                                                                                  \
+    const GLuint target = VexaUniformTarget(0);                                                                       \
+    if (target) ::glProgramUniform##suffix(target, location, v0);                                                     \
+  }
+#define VEXA_UN(suffix, type)                                                                                          \
+  static void VexaGL_glUniform##suffix(GLint location, GLsizei count, const type* value) {                            \
+    if (g_vexa_diag_curprog) {                                                                                         \
+      ::glUniform##suffix(location, count, value);                                                                    \
+      return;                                                                                                         \
+    }                                                                                                                  \
+    const GLuint target = VexaUniformTarget(0);                                                                       \
+    if (target) ::glProgramUniform##suffix(target, location, count, value);                                           \
+  }
+#define VEXA_UMAT(n)                                                                                                   \
+  static void VexaGL_glUniformMatrix##n##fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { \
+    if (g_vexa_diag_curprog) {                                                                                         \
+      ::glUniformMatrix##n##fv(location, count, transpose, value);                                                    \
+      return;                                                                                                         \
+    }                                                                                                                  \
+    const GLuint target = VexaUniformTarget(0);                                                                       \
+    if (target) ::glProgramUniformMatrix##n##fv(target, location, count, transpose, value);                           \
+  }
+VEXA_U1(1i, GLint)
+VEXA_U1(1f, GLfloat)
+#define VEXA_U2(suffix, type)                                                                                          \
+  static void VexaGL_glUniform##suffix(GLint location, type v0, type v1) {                                            \
+    if (g_vexa_diag_curprog) {                                                                                         \
+      ::glUniform##suffix(location, v0, v1);                                                                          \
+      return;                                                                                                         \
+    }                                                                                                                  \
+    const GLuint target = VexaUniformTarget(0);                                                                       \
+    if (target) ::glProgramUniform##suffix(target, location, v0, v1);                                                 \
+  }
+#define VEXA_U3(suffix, type)                                                                                          \
+  static void VexaGL_glUniform##suffix(GLint location, type v0, type v1, type v2) {                                   \
+    if (g_vexa_diag_curprog) {                                                                                         \
+      ::glUniform##suffix(location, v0, v1, v2);                                                                      \
+      return;                                                                                                         \
+    }                                                                                                                  \
+    const GLuint target = VexaUniformTarget(0);                                                                       \
+    if (target) ::glProgramUniform##suffix(target, location, v0, v1, v2);                                             \
+  }
+#define VEXA_U4(suffix, type)                                                                                          \
+  static void VexaGL_glUniform##suffix(GLint location, type v0, type v1, type v2, type v3) {                          \
+    if (g_vexa_diag_curprog) {                                                                                         \
+      ::glUniform##suffix(location, v0, v1, v2, v3);                                                                  \
+      return;                                                                                                         \
+    }                                                                                                                  \
+    const GLuint target = VexaUniformTarget(0);                                                                       \
+    if (target) ::glProgramUniform##suffix(target, location, v0, v1, v2, v3);                                         \
+  }
+VEXA_U2(2i, GLint)
+VEXA_U2(2f, GLfloat)
+VEXA_U3(3i, GLint)
+VEXA_U3(3f, GLfloat)
+VEXA_U4(4i, GLint)
+VEXA_U4(4f, GLfloat)
+VEXA_UN(1iv, GLint)
+VEXA_UN(1fv, GLfloat)
+VEXA_UN(2iv, GLint)
+VEXA_UN(2fv, GLfloat)
+VEXA_UN(3iv, GLint)
+VEXA_UN(3fv, GLfloat)
+VEXA_UN(4iv, GLint)
+VEXA_UN(4fv, GLfloat)
+VEXA_UMAT(2)
+VEXA_UMAT(3)
+VEXA_UMAT(4)
+#undef VEXA_U1
+#undef VEXA_U2
+#undef VEXA_U3
+#undef VEXA_U4
+#undef VEXA_UN
+#undef VEXA_UMAT
+
 static void fexfn_impl_libGL_glUseProgram(GLuint program) {
   g_vexa_diag_curprog = program;
   ++g_vexa_diag_useprog;
@@ -2727,14 +2895,20 @@ static void VexaGLEnumCompat(const char* what, GLenum value) {
   }
 }
 
+static bool VexaIgnoreDesktopCap(GLenum cap) {
+  return cap == 0x864F;  // GL_DEPTH_CLAMP is not in GLES
+}
+
 static void fexfn_impl_libGL_glEnable(GLenum cap) {
   if (g_vexa_trace_frame) fprintf(stderr, "[VEXA][TRACE] enable cap=%x\n", cap);
+  if (VexaIgnoreDesktopCap(cap)) return;
   ::glEnable(cap);
   VexaGLEnumCompat("glEnable", cap);
 }
 
 static void fexfn_impl_libGL_glDisable(GLenum cap) {
   if (g_vexa_trace_frame) fprintf(stderr, "[VEXA][TRACE] disable cap=%x\n", cap);
+  if (VexaIgnoreDesktopCap(cap)) return;
   ::glDisable(cap);
   VexaGLEnumCompat("glDisable", cap);
 }
@@ -2748,6 +2922,22 @@ static void fexfn_impl_libGL_glTexParameterf(GLenum target, GLenum pname, GLfloa
 static void fexfn_impl_libGL_glTexParameteri(GLenum target, GLenum pname, GLint param) {
   ::glTexParameteri(target, pname, param);
   VexaGLEnumCompat("glTexParameteri", pname);
+}
+
+static void VexaGL_glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {
+  // GLES has no sampler LOD bias. The desktop default of zero changes no
+  // sampling behaviour, so omit only that exact request. Nonzero bias still
+  // needs shader emulation and must not be silently discarded.
+  if (pname == 0x8501 && param == 0.0f) {
+    static std::atomic<int> ignored {0};
+    if (ignored.fetch_add(1) < 4)
+      fprintf(stderr, "[VEXA][SAMPLER] zero LOD bias omitted sampler=%u\n", sampler);
+    return;
+  }
+  static std::atomic<int> logs {0};
+  if (logs.fetch_add(1) < 64)
+    fprintf(stderr, "[VEXA][SAMPLER] sampler=%u pname=%x value=%g\n", sampler, pname, param);
+  ::glSamplerParameterf(sampler, pname, param);
 }
 
 static void fexfn_impl_libGL_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
@@ -3681,6 +3871,44 @@ static auto fexfn_impl_libGL_VEXA_FFDelete(unsigned buffer) -> void {
 
 #include "thunkgen_host_libGL.inl"
 
+static void VexaRebindUploadThunks() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  // Direct guest imports call fexldr_ptr, which init points at the raw GLES
+  // entry. glXGetProcAddress returns the wrappers, but ETS2 also calls the
+  // imported symbols. Point those at the wrappers before the first upload.
+  fexldr_ptr_libGL_glTexImage2D = VexaGL_glTexImage2D;
+  fexldr_ptr_libGL_glTexImage3D = VexaGL_glTexImage3D;
+  fexldr_ptr_libGL_glTexSubImage2D = VexaGL_glTexSubImage2D;
+  fexldr_ptr_libGL_glTexSubImage3D = VexaGL_glTexSubImage3D;
+  fexldr_ptr_libGL_glPixelStorei = VexaGL_glPixelStorei;
+  fexldr_ptr_libGL_glGetUniformLocation = VexaGL_glGetUniformLocation;
+  fexldr_ptr_libGL_glUniform1i = VexaGL_glUniform1i;
+  fexldr_ptr_libGL_glUniform1f = VexaGL_glUniform1f;
+  fexldr_ptr_libGL_glUniform1iv = VexaGL_glUniform1iv;
+  fexldr_ptr_libGL_glUniform1fv = VexaGL_glUniform1fv;
+  fexldr_ptr_libGL_glUniform2i = VexaGL_glUniform2i;
+  fexldr_ptr_libGL_glUniform2f = VexaGL_glUniform2f;
+  fexldr_ptr_libGL_glUniform2iv = VexaGL_glUniform2iv;
+  fexldr_ptr_libGL_glUniform2fv = VexaGL_glUniform2fv;
+  fexldr_ptr_libGL_glUniform3i = VexaGL_glUniform3i;
+  fexldr_ptr_libGL_glUniform3f = VexaGL_glUniform3f;
+  fexldr_ptr_libGL_glUniform3iv = VexaGL_glUniform3iv;
+  fexldr_ptr_libGL_glUniform3fv = VexaGL_glUniform3fv;
+  fexldr_ptr_libGL_glUniform4i = VexaGL_glUniform4i;
+  fexldr_ptr_libGL_glUniform4f = VexaGL_glUniform4f;
+  fexldr_ptr_libGL_glUniform4iv = VexaGL_glUniform4iv;
+  fexldr_ptr_libGL_glUniform4fv = VexaGL_glUniform4fv;
+  fexldr_ptr_libGL_glUniformMatrix2fv = VexaGL_glUniformMatrix2fv;
+  fexldr_ptr_libGL_glUniformMatrix3fv = VexaGL_glUniformMatrix3fv;
+  fexldr_ptr_libGL_glUniformMatrix4fv = VexaGL_glUniformMatrix4fv;
+  fexldr_ptr_libGL_glProgramUniform1i = VexaGL_glProgramUniform1i;
+  fexldr_ptr_libGL_glUseProgramStages = VexaGL_glUseProgramStages;
+  fexldr_ptr_libGL_glBindProgramPipeline = VexaGL_glBindProgramPipeline;
+  fexldr_ptr_libGL_glActiveShaderProgram = VexaGL_glActiveShaderProgram;
+}
+
 #if defined(BUILD_ANDROID) && defined(VEXA_ENABLE_RUNTIME_SHADER_TRANSLATOR)
 bool ConsumeShaderDriverErrorBudget() {
   int32_t remaining = ShaderDriverErrorLogBudget.load(std::memory_order_acquire);
@@ -3959,6 +4187,36 @@ static void VexaStripDesktopArbExtensions(std::string* source) {
   }
   *source = std::move(out);
 }
+
+// Desktop separable-program vertex shaders redeclare the built-in output block:
+//   out gl_PerVertex { vec4 gl_Position; };
+// ESSL rejects that (Mali L0001 "Invalid qualifier 'out' for interface block")
+// and already provides gl_Position, so drop the whole declaration.
+static void VexaStripPerVertexRedeclaration(std::string* source) {
+  constexpr std::string_view kBlock {"gl_PerVertex"};
+  size_t pos = 0;
+  while ((pos = source->find(kBlock, pos)) != std::string::npos) {
+    // Walk back over whitespace to the `out` keyword.
+    size_t kw_end = pos;
+    auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    while (kw_end > 0 && is_space((*source)[kw_end - 1])) {
+      --kw_end;
+    }
+    if (kw_end < 3 || source->compare(kw_end - 3, 3, "out") != 0) {
+      pos += kBlock.size();
+      continue;
+    }
+    const size_t kw_begin = kw_end - 3;
+    const size_t open = source->find('{', pos);
+    const size_t close = open == std::string::npos ? std::string::npos : source->find('}', open);
+    const size_t semi = close == std::string::npos ? std::string::npos : source->find(';', close);
+    if (semi == std::string::npos) {
+      break;
+    }
+    source->erase(kw_begin, semi + 1 - kw_begin);
+    pos = kw_begin;
+  }
+}
 #endif
 
 // VEXA_FIXES: Central shader-source bridge used by both glShaderSource and glShaderSourceARB.
@@ -4168,7 +4426,14 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
       } else if (desktop && desktop_version >= 130 && desktop_version <= 330) {
         // Heaps/HashLink uses GLSL 150 with in/out interfaces. Like GLSL 330,
         // its vertex/fragment shaders need an ESSL 300 version on Android.
-        rewritten_version = "#version 300 es";
+        // Shaders that use texel buffers (samplerBuffer is reserved in ESSL 300)
+        // or ARB_separate_shader_objects (layout(location) on fragment inputs is
+        // illegal in ESSL 300) need ESSL 320, where both are core. ETS2 does both.
+        const bool needs_es_320 =
+            source.find("samplerBuffer") != std::string::npos ||
+            source.find("imageBuffer") != std::string::npos ||
+            source.find("GL_ARB_separate_shader_objects") != std::string::npos;
+        rewritten_version = needs_es_320 ? "#version 320 es" : "#version 300 es";
       } else if (desktop && desktop_version >= 110 && desktop_version <= 120) {
         rewritten_version = "#version 100";
       }
@@ -4235,9 +4500,12 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
             }
           }
         }
-        if (desktop_version >= 400 || compute) {
-          VexaStripDesktopArbExtensions(&source);
-        }
+        // Desktop `#extension GL_ARB_* : require` is a hard error on ESSL (Mali
+        // P0003). Those features are core in 300/320 es, so strip the directive
+        // for every desktop shader we rewrite to ES (ETS2 uses #version 330 with
+        // GL_ARB_separate_shader_objects).
+        VexaStripDesktopArbExtensions(&source);
+        VexaStripPerVertexRedeclaration(&source);
         {
           const bool to_es_100 = std::string_view{rewritten_version} == "#version 100";
           const bool to_es_320 = std::string_view{rewritten_version} == "#version 320 es";
@@ -4314,6 +4582,12 @@ static const char* const kVexaDesktopSpoofExts[] = {
   "GL_ARB_draw_indirect",
   "GL_ARB_compute_shader",
   "GL_ARB_shader_image_load_store",
+  // ETS2 (and most desktop engines) refuse to load DXT/BC textures unless the
+  // driver advertises S3TC. Mali supports the compressed formats natively
+  // through GL_EXT_texture_compression_s3tc, but the GL ES extension string is
+  // not mapped to the desktop name, so advertise it explicitly.
+  // Keep this entry last: it is the one the runtime log shows being queried.
+  "GL_EXT_texture_compression_s3tc",
 };
 static constexpr unsigned kVexaDesktopSpoofExtCount =
   sizeof(kVexaDesktopSpoofExts) / sizeof(kVexaDesktopSpoofExts[0]);
@@ -4773,9 +5047,38 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
         {"glDisable", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDisable)},
         {"glTexParameterf", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glTexParameterf)},
         {"glTexParameteri", reinterpret_cast<VoidFn>(fexfn_impl_libGL_glTexParameteri)},
+        {"glSamplerParameterf", reinterpret_cast<VoidFn>(VexaGL_glSamplerParameterf)},
         // Software BCn fallback (Mali has no S3TC/RGTC/BPTC).
         {"glTexStorage2D", reinterpret_cast<VoidFn>(VexaGL_glTexStorage2D)},
+        {"glTexImage2D", reinterpret_cast<VoidFn>(VexaGL_glTexImage2D)},
+        {"glTexImage3D", reinterpret_cast<VoidFn>(VexaGL_glTexImage3D)},
         {"glTexSubImage2D", reinterpret_cast<VoidFn>(VexaGL_glTexSubImage2D)},
+        {"glTexSubImage3D", reinterpret_cast<VoidFn>(VexaGL_glTexSubImage3D)},
+        {"glPixelStorei", reinterpret_cast<VoidFn>(VexaGL_glPixelStorei)},
+        {"glGetUniformLocation", reinterpret_cast<VoidFn>(VexaGL_glGetUniformLocation)},
+        {"glUseProgramStages", reinterpret_cast<VoidFn>(VexaGL_glUseProgramStages)},
+        {"glBindProgramPipeline", reinterpret_cast<VoidFn>(VexaGL_glBindProgramPipeline)},
+        {"glActiveShaderProgram", reinterpret_cast<VoidFn>(VexaGL_glActiveShaderProgram)},
+        {"glProgramUniform1i", reinterpret_cast<VoidFn>(VexaGL_glProgramUniform1i)},
+        {"glUniform1i", reinterpret_cast<VoidFn>(VexaGL_glUniform1i)},
+        {"glUniform1f", reinterpret_cast<VoidFn>(VexaGL_glUniform1f)},
+        {"glUniform1iv", reinterpret_cast<VoidFn>(VexaGL_glUniform1iv)},
+        {"glUniform1fv", reinterpret_cast<VoidFn>(VexaGL_glUniform1fv)},
+        {"glUniform2i", reinterpret_cast<VoidFn>(VexaGL_glUniform2i)},
+        {"glUniform2f", reinterpret_cast<VoidFn>(VexaGL_glUniform2f)},
+        {"glUniform2iv", reinterpret_cast<VoidFn>(VexaGL_glUniform2iv)},
+        {"glUniform2fv", reinterpret_cast<VoidFn>(VexaGL_glUniform2fv)},
+        {"glUniform3i", reinterpret_cast<VoidFn>(VexaGL_glUniform3i)},
+        {"glUniform3f", reinterpret_cast<VoidFn>(VexaGL_glUniform3f)},
+        {"glUniform3iv", reinterpret_cast<VoidFn>(VexaGL_glUniform3iv)},
+        {"glUniform3fv", reinterpret_cast<VoidFn>(VexaGL_glUniform3fv)},
+        {"glUniform4i", reinterpret_cast<VoidFn>(VexaGL_glUniform4i)},
+        {"glUniform4f", reinterpret_cast<VoidFn>(VexaGL_glUniform4f)},
+        {"glUniform4iv", reinterpret_cast<VoidFn>(VexaGL_glUniform4iv)},
+        {"glUniform4fv", reinterpret_cast<VoidFn>(VexaGL_glUniform4fv)},
+        {"glUniformMatrix2fv", reinterpret_cast<VoidFn>(VexaGL_glUniformMatrix2fv)},
+        {"glUniformMatrix3fv", reinterpret_cast<VoidFn>(VexaGL_glUniformMatrix3fv)},
+        {"glUniformMatrix4fv", reinterpret_cast<VoidFn>(VexaGL_glUniformMatrix4fv)},
         {"glDeleteTextures", reinterpret_cast<VoidFn>(VexaGL_glDeleteTextures)},
         {"glTexStorage3D", reinterpret_cast<VoidFn>(VexaGL_glTexStorage3D)},
         {"glCompressedTexImage2D", reinterpret_cast<VoidFn>(VexaGL_glCompressedTexImage2D)},
@@ -5930,7 +6233,36 @@ extern "C" ExportEntry* fexthunks_exports_libGL() {
   VEXA_BIND_HOST_WRAPPER(glFlush)
   VEXA_BIND_HOST_WRAPPER(glWaitSync)
   VEXA_BIND_HOST_WRAPPER(glDeleteTextures)
+  VEXA_BIND_HOST_WRAPPER(glTexImage2D)
+  VEXA_BIND_HOST_WRAPPER(glTexImage3D)
   VEXA_BIND_HOST_WRAPPER(glTexSubImage2D)
+  VEXA_BIND_HOST_WRAPPER(glSamplerParameterf)
+  VEXA_BIND_HOST_WRAPPER(glTexSubImage3D)
+  VEXA_BIND_HOST_WRAPPER(glPixelStorei)
+  VEXA_BIND_HOST_WRAPPER(glGetUniformLocation)
+  VEXA_BIND_HOST_WRAPPER(glUseProgramStages)
+  VEXA_BIND_HOST_WRAPPER(glBindProgramPipeline)
+  VEXA_BIND_HOST_WRAPPER(glActiveShaderProgram)
+  VEXA_BIND_HOST_WRAPPER(glProgramUniform1i)
+  VEXA_BIND_HOST_WRAPPER(glUniform1i)
+  VEXA_BIND_HOST_WRAPPER(glUniform1f)
+  VEXA_BIND_HOST_WRAPPER(glUniform1iv)
+  VEXA_BIND_HOST_WRAPPER(glUniform1fv)
+  VEXA_BIND_HOST_WRAPPER(glUniform2i)
+  VEXA_BIND_HOST_WRAPPER(glUniform2f)
+  VEXA_BIND_HOST_WRAPPER(glUniform2iv)
+  VEXA_BIND_HOST_WRAPPER(glUniform2fv)
+  VEXA_BIND_HOST_WRAPPER(glUniform3i)
+  VEXA_BIND_HOST_WRAPPER(glUniform3f)
+  VEXA_BIND_HOST_WRAPPER(glUniform3iv)
+  VEXA_BIND_HOST_WRAPPER(glUniform3fv)
+  VEXA_BIND_HOST_WRAPPER(glUniform4i)
+  VEXA_BIND_HOST_WRAPPER(glUniform4f)
+  VEXA_BIND_HOST_WRAPPER(glUniform4iv)
+  VEXA_BIND_HOST_WRAPPER(glUniform4fv)
+  VEXA_BIND_HOST_WRAPPER(glUniformMatrix2fv)
+  VEXA_BIND_HOST_WRAPPER(glUniformMatrix3fv)
+  VEXA_BIND_HOST_WRAPPER(glUniformMatrix4fv)
   VEXA_BIND_HOST_WRAPPER(glTexStorage2D)
   VEXA_BIND_HOST_WRAPPER(glTexStorage3D)
   VEXA_BIND_HOST_WRAPPER(glCompressedTexImage2D)
