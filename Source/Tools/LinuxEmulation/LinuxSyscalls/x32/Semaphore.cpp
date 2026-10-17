@@ -87,6 +87,10 @@ union semun {
 };
 
 uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first, uint32_t second, uint32_t third, uint32_t ptr, uint32_t fifth) {
+#if defined(__ANDROID__)
+  // VEXA_FIXES: Android seccomp traps every SysV IPC op multiplexed through SYS_ipc with SIGSYS.
+  return -ENOSYS;
+#else
   uint64_t Result {};
 
   const int Version = call >> 16;
@@ -381,11 +385,15 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
   default: return -ENOSYS;
   }
   SYSCALL_ERRNO();
+#endif
 }
 void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL_X32(ipc, _ipc);
 
   REGISTER_SYSCALL_IMPL_X32(semctl, [](FEXCore::Core::CpuStateFrame* Frame, int semid, int semnum, int cmd, semun_32* semun) -> uint64_t {
+#if defined(__ANDROID__)
+    return -ENOSYS;
+#else
     uint64_t Result {};
     bool IPC64 = cmd & 0x100;
 
@@ -456,6 +464,7 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
     default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
     }
     SYSCALL_ERRNO();
+#endif
   });
 }
 } // namespace FEX::HLE::x32

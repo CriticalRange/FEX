@@ -111,6 +111,8 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   std::optional<GdbInfoStruct> GdbInfo;
 
   int StatusCode {};
+  // VEXA: distinguish a guest exit syscall from launcher error-path cleanup.
+  bool VexaGuestExit {};
 
   struct CallRetStackInfo {
     uint64_t AllocationBase;

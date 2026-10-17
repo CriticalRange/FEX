@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "LinuxSyscalls/Syscalls.h"
+#include "LinuxSyscalls/X11Socket.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 
@@ -14,6 +15,7 @@ $end_info$
 
 #include <stdint.h>
 #include <sys/epoll.h>
+#include "LinuxSyscalls/VexaTmpPath.h"
 
 namespace FEX::HLE {
 #ifdef ARCHITECTURE_arm64
@@ -264,11 +266,21 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(sched_yield, SyscallPassthrough0<SYSCALL_DEF(sched_yield)>);
   REGISTER_SYSCALL_IMPL(msync, SyscallPassthrough3<SYSCALL_DEF(msync)>);
   REGISTER_SYSCALL_IMPL(mincore, SyscallPassthrough3<SYSCALL_DEF(mincore)>);
+#if defined(__ANDROID__)
+  // VEXA_FIXES: Android seccomp traps SysV IPC syscalls (shmget/shmctl/semget/msg*) with SIGSYS.
+  // Return ENOSYS so X11 clients (e.g. winex11.drv MIT-SHM probe) and guests fall back cleanly.
+  REGISTER_SYSCALL_IMPL(shmget, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+  REGISTER_SYSCALL_IMPL(shmctl, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+#else
   REGISTER_SYSCALL_IMPL(shmget, SyscallPassthrough3<SYSCALL_DEF(shmget)>);
   REGISTER_SYSCALL_IMPL(shmctl, SyscallPassthrough3<SYSCALL_DEF(shmctl)>);
+#endif
   REGISTER_SYSCALL_IMPL(getpid, SyscallPassthrough0<SYSCALL_DEF(getpid)>);
   REGISTER_SYSCALL_IMPL(socket, SyscallPassthrough3<SYSCALL_DEF(socket)>);
-  REGISTER_SYSCALL_IMPL(connect, SyscallPassthrough3<SYSCALL_DEF(connect)>);
+  REGISTER_SYSCALL_IMPL(connect, [](FEXCore::Core::CpuStateFrame*, int FD, const sockaddr* Address, socklen_t Length) -> uint64_t {
+    uint64_t Result = ConnectVexaX11(FD, Address, Length);
+    SYSCALL_ERRNO();
+  });
   REGISTER_SYSCALL_IMPL(sendto, SyscallPassthrough6<SYSCALL_DEF(sendto)>);
   REGISTER_SYSCALL_IMPL(recvfrom, SyscallPassthrough6<SYSCALL_DEF(recvfrom)>);
   REGISTER_SYSCALL_IMPL(shutdown, SyscallPassthrough2<SYSCALL_DEF(shutdown)>);
@@ -278,18 +290,30 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(getpeername, SyscallPassthrough3<SYSCALL_DEF(getpeername)>);
   REGISTER_SYSCALL_IMPL(socketpair, SyscallPassthrough4<SYSCALL_DEF(socketpair)>);
   REGISTER_SYSCALL_IMPL(kill, SyscallPassthrough2<SYSCALL_DEF(kill)>);
+#if defined(__ANDROID__)
+  REGISTER_SYSCALL_IMPL(semget, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+  REGISTER_SYSCALL_IMPL(msgget, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+  REGISTER_SYSCALL_IMPL(msgsnd, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+  REGISTER_SYSCALL_IMPL(msgrcv, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+  REGISTER_SYSCALL_IMPL(msgctl, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+#else
   REGISTER_SYSCALL_IMPL(semget, SyscallPassthrough3<SYSCALL_DEF(semget)>);
   REGISTER_SYSCALL_IMPL(msgget, SyscallPassthrough2<SYSCALL_DEF(msgget)>);
   REGISTER_SYSCALL_IMPL(msgsnd, SyscallPassthrough4<SYSCALL_DEF(msgsnd)>);
   REGISTER_SYSCALL_IMPL(msgrcv, SyscallPassthrough5<SYSCALL_DEF(msgrcv)>);
   REGISTER_SYSCALL_IMPL(msgctl, SyscallPassthrough3<SYSCALL_DEF(msgctl)>);
+#endif
   REGISTER_SYSCALL_IMPL(flock, SyscallPassthrough2<SYSCALL_DEF(flock)>);
   REGISTER_SYSCALL_IMPL(fsync, SyscallPassthrough1<SYSCALL_DEF(fsync)>);
   REGISTER_SYSCALL_IMPL(fdatasync, SyscallPassthrough1<SYSCALL_DEF(fdatasync)>);
   REGISTER_SYSCALL_IMPL(truncate, SyscallPassthrough2<SYSCALL_DEF(truncate)>);
   REGISTER_SYSCALL_IMPL(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
   REGISTER_SYSCALL_IMPL(getcwd, SyscallPassthrough2<SYSCALL_DEF(getcwd)>);
-  REGISTER_SYSCALL_IMPL(chdir, SyscallPassthrough1<SYSCALL_DEF(chdir)>);
+  REGISTER_SYSCALL_IMPL(chdir, [](FEXCore::Core::CpuStateFrame*, const char* pathname) -> uint64_t {
+    const auto path = VexaPrivateTmpPath(pathname);
+    uint64_t Result = ::syscall(SYSCALL_DEF(chdir), path.empty() ? pathname : path.c_str());
+    SYSCALL_ERRNO();
+  });
   REGISTER_SYSCALL_IMPL(fchdir, SyscallPassthrough1<SYSCALL_DEF(fchdir)>);
   REGISTER_SYSCALL_IMPL(fchmod, SyscallPassthrough2<SYSCALL_DEF(fchmod)>);
   REGISTER_SYSCALL_IMPL(fchown, SyscallPassthrough3<SYSCALL_DEF(fchown)>);
@@ -398,7 +422,11 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
 #else
   REGISTER_SYSCALL_IMPL(migrate_pages, SyscallPassthrough4<SYSCALL_DEF(migrate_pages)>);
 #endif
-  REGISTER_SYSCALL_IMPL(mkdirat, SyscallPassthrough3<SYSCALL_DEF(mkdirat)>);
+  REGISTER_SYSCALL_IMPL(mkdirat, [](FEXCore::Core::CpuStateFrame*, int dirfd, const char* pathname, mode_t mode) -> uint64_t {
+    const auto path = VexaPrivateTmpPath(pathname);
+    uint64_t Result = ::syscall(SYSCALL_DEF(mkdirat), dirfd, path.empty() ? pathname : path.c_str(), mode);
+    SYSCALL_ERRNO();
+  });
   REGISTER_SYSCALL_IMPL(mknodat, SyscallPassthrough4<SYSCALL_DEF(mknodat)>);
   REGISTER_SYSCALL_IMPL(fchownat, SyscallPassthrough5<SYSCALL_DEF(fchownat)>);
   REGISTER_SYSCALL_IMPL(unlinkat, SyscallPassthrough3<SYSCALL_DEF(unlinkat)>);
@@ -467,7 +495,19 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(memfd_secret, SyscallPassthrough1<SYSCALL_DEF(memfd_secret)>);
   REGISTER_SYSCALL_IMPL(process_mrelease, SyscallPassthrough2<SYSCALL_DEF(process_mrelease)>);
   if (Handler->IsHostKernelVersionAtLeast(5, 16, 0)) {
+#if defined(__ANDROID__)
+    REGISTER_SYSCALL_IMPL(futex_waitv, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t waiters, uint64_t count,
+                                       uint64_t flags, uint64_t timeout, uint64_t clockid) -> uint64_t {
+      // Android app seccomp can SIGSYS this syscall even on a new kernel.
+      // Wine probes it before checking WINEFSYNC; ENOSYS selects its supported
+      // synchronization fallback without entering the forbidden host syscall.
+      const char* session = getenv("VEXA_COMPAT_SESSION");
+      if (session && *session) return -ENOSYS;
+      return SyscallPassthrough5<SYSCALL_DEF(futex_waitv)>(Frame, waiters, count, flags, timeout, clockid);
+    });
+#else
     REGISTER_SYSCALL_IMPL(futex_waitv, SyscallPassthrough5<SYSCALL_DEF(futex_waitv)>);
+#endif
   } else {
     REGISTER_SYSCALL_IMPL(futex_waitv, UnimplementedSyscallSafe);
   }
@@ -517,13 +557,24 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(getitimer, SyscallPassthrough2<SYSCALL_DEF(getitimer)>);
     REGISTER_SYSCALL_IMPL_X64(setitimer, SyscallPassthrough3<SYSCALL_DEF(setitimer)>);
     REGISTER_SYSCALL_IMPL_X64(sendfile, SyscallPassthrough4<SYSCALL_DEF(sendfile)>);
+#if defined(__ANDROID__)
+    // VEXA_FIXES: Android seccomp blocks arm64 SYS_accept (202); Bionic's accept() wraps SYS_accept4 (242) with flags=0.
+    REGISTER_SYSCALL_IMPL_X64(accept, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t fd, uint64_t addr, uint64_t addrlen) -> uint64_t {
+      return SyscallPassthrough4<SYSCALL_DEF(accept4)>(Frame, fd, addr, addrlen, 0);
+    });
+#else
     REGISTER_SYSCALL_IMPL_X64(accept, SyscallPassthrough3<SYSCALL_DEF(accept)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(sendmsg, SyscallPassthrough3<SYSCALL_DEF(sendmsg)>);
     REGISTER_SYSCALL_IMPL_X64(recvmsg, SyscallPassthrough3<SYSCALL_DEF(recvmsg)>);
     REGISTER_SYSCALL_IMPL_X64(setsockopt, SyscallPassthrough5<SYSCALL_DEF(setsockopt)>);
     REGISTER_SYSCALL_IMPL_X64(getsockopt, SyscallPassthrough5<SYSCALL_DEF(getsockopt)>);
     REGISTER_SYSCALL_IMPL_X64(wait4, SyscallPassthrough4<SYSCALL_DEF(wait4)>);
+#if defined(__ANDROID__)
+    REGISTER_SYSCALL_IMPL_X64(semop, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+#else
     REGISTER_SYSCALL_IMPL_X64(semop, SyscallPassthrough3<SYSCALL_DEF(semop)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(gettimeofday, SyscallPassthrough2<SYSCALL_DEF(gettimeofday)>);
     REGISTER_SYSCALL_IMPL_X64(getrlimit, SyscallPassthrough2<SYSCALL_DEF(getrlimit)>);
     REGISTER_SYSCALL_IMPL_X64(getrusage, SyscallPassthrough2<SYSCALL_DEF(getrusage)>);
@@ -540,7 +591,11 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(readahead, SyscallPassthrough3<SYSCALL_DEF(readahead)>);
     REGISTER_SYSCALL_IMPL_X64(futex, SyscallPassthrough6<SYSCALL_DEF(futex)>);
     REGISTER_SYSCALL_IMPL_X64(io_getevents, SyscallPassthrough5<SYSCALL_DEF(io_getevents)>);
+#if defined(__ANDROID__)
+    REGISTER_SYSCALL_IMPL_X64(semtimedop, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+#else
     REGISTER_SYSCALL_IMPL_X64(semtimedop, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(timer_create, SyscallPassthrough3<SYSCALL_DEF(timer_create)>);
     REGISTER_SYSCALL_IMPL_X64(timer_settime, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
     REGISTER_SYSCALL_IMPL_X64(timer_gettime, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
@@ -666,7 +721,11 @@ namespace x32 {
     REGISTER_SYSCALL_IMPL_X32(io_pgetevents_time64, SyscallPassthrough6<SYSCALL_DEF(io_pgetevents)>);
     REGISTER_SYSCALL_IMPL_X32(mq_timedsend_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
     REGISTER_SYSCALL_IMPL_X32(mq_timedreceive_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedreceive)>);
+#if defined(__ANDROID__)
+    REGISTER_SYSCALL_IMPL_X32(semtimedop_time64, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+#else
     REGISTER_SYSCALL_IMPL_X32(semtimedop_time64, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
+#endif
     REGISTER_SYSCALL_IMPL_X32(futex_time64, SyscallPassthrough6<SYSCALL_DEF(futex)>);
     REGISTER_SYSCALL_IMPL_X32(sched_rr_get_interval_time64, SyscallPassthrough2<SYSCALL_DEF(sched_rr_get_interval)>);
   }

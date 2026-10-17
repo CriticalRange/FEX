@@ -22,6 +22,10 @@
   #include <sys/syscall.h>
 #endif
 
+// Optional VEXA host hook, absent in ordinary FEX builds.
+extern "C" bool Vexa_IsStandaloneLoader() __attribute__((weak));
+extern "C" void Vexa_ReportGuestExit(int status) __attribute__((weak));
+
 namespace FEX::HLE {
 
 ThreadManager::StatAlloc::StatAlloc() {
@@ -40,13 +44,13 @@ void ThreadManager::StatAlloc::Initialize() {
         StatsFD = -1;
       }
 
-      auto Name = fextl::fmt::format("fex-{}-stats", ::getpid());
+      auto Name = fextl::fmt::format("fex-{}-stats", FHU::Syscalls::getpid());
       int fd = static_cast<int>(::syscall(SYS_memfd_create, Name.c_str(), MFD_CLOEXEC));
       if (fd == -1) {
         return;
       }
   #else
-      int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_CREAT | O_TRUNC | O_RDWR, USER_PERMS);
+      int fd = shm_open(fextl::fmt::format("fex-{}-stats", FHU::Syscalls::getpid()).c_str(), O_CREAT | O_TRUNC | O_RDWR, USER_PERMS);
       if (fd == -1) {
         return;
       };
@@ -112,7 +116,7 @@ uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
         return CurrentSize;
       }
   #else
-      int fd = shm_open(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str(), O_RDWR, USER_PERMS);
+      int fd = shm_open(fextl::fmt::format("fex-{}-stats", FHU::Syscalls::getpid()).c_str(), O_RDWR, USER_PERMS);
       if (fd == -1) {
         return CurrentSize;
       };
@@ -160,7 +164,7 @@ void ThreadManager::StatAlloc::CleanupForExit() {
     StatsFD = -1;
   }
   #else
-  shm_unlink(fextl::fmt::format("fex-{}-stats", ::getpid()).c_str());
+  shm_unlink(fextl::fmt::format("fex-{}-stats", FHU::Syscalls::getpid()).c_str());
   #endif
 }
 
@@ -210,7 +214,7 @@ FEX::HLE::ThreadStateObject* ThreadManager::CreateThread(uint64_t InitialRIP, ui
   auto ThreadStateObject = new FEX::HLE::ThreadStateObject;
 
   ThreadStateObject->ThreadInfo.parent_tid = ParentTID;
-  ThreadStateObject->ThreadInfo.PID = ::getpid();
+  ThreadStateObject->ThreadInfo.PID = FHU::Syscalls::getpid();
 
   ThreadStateObject->ThreadInfo.TID = FHU::Syscalls::gettid();
 
@@ -289,6 +293,18 @@ void ThreadManager::DestroyThread(FEX::HLE::ThreadStateObject* Thread, bool Need
     LOGMAN_THROW_A_FMT(It != Threads.end(), "Thread wasn't in Threads");
     Threads.erase(It);
     if (Threads.empty()) {
+#if defined(__ANDROID__)
+      // Guest exit (rather than exit_group) may leave native helper threads.
+      // Decide under ThreadCreationMutex so concurrent guest thread exits cannot
+      // both miss the final thread. Embedded Android workers retain old behavior.
+      if (Thread->VexaGuestExit && Vexa_ReportGuestExit) {
+        Vexa_ReportGuestExit(Thread->StatusCode);
+      }
+      if (Thread->VexaGuestExit && Vexa_IsStandaloneLoader && Vexa_IsStandaloneLoader()) {
+        ::syscall(SYS_exit_group, Thread->StatusCode);
+        std::terminate();
+      }
+#endif
       Thread->Thread->CTX->FlushAndCloseCodeMap();
     }
   }
@@ -317,7 +333,7 @@ void ThreadManager::HandleThreadDeletion(FEX::HLE::ThreadStateObject* Thread, bo
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
     // Sanity check. This can only be called from the owning thread.
     {
-      const auto pid = ::getpid();
+      const auto pid = FHU::Syscalls::getpid();
       const auto tid = FHU::Syscalls::gettid();
       LOGMAN_THROW_A_FMT(Thread->ThreadInfo.PID == pid && Thread->ThreadInfo.TID == tid, "Can't delete TLS data from a different thread!");
     }
@@ -353,7 +369,7 @@ void ThreadManager::Pause() {
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   // Sanity check. This can't be called from an emulation thread.
   {
-    const auto pid = ::getpid();
+    const auto pid = FHU::Syscalls::getpid();
     const auto tid = FHU::Syscalls::gettid();
     std::lock_guard lk(ThreadCreationMutex);
     for (auto& Thread : Threads) {
@@ -453,7 +469,7 @@ void ThreadManager::SleepThread(FEXCore::Context::Context* CTX, FEXCore::Core::C
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   // Sanity check. This can only be called from the owning thread.
   {
-    const auto pid = ::getpid();
+    const auto pid = FHU::Syscalls::getpid();
     const auto tid = FHU::Syscalls::gettid();
     LOGMAN_THROW_A_FMT(ThreadObject->ThreadInfo.PID == pid && ThreadObject->ThreadInfo.TID == tid, "Can't delete TLS data from a different "
                                                                                                    "thread!");

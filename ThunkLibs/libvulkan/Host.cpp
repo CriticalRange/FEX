@@ -23,6 +23,7 @@ $end_info$
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <mutex>
 #include <span>
 #include <string_view>
@@ -73,6 +74,152 @@ static void DoSetupWithInstance(VkInstance instance) {
 }
 
 #define FEXFN_IMPL(fn) fexfn_impl_libvulkan_##fn
+#if defined(BUILD_ANDROID)
+// VEXA real X11 WSI: the bridge owns synthetic surfaces, never the Android ICD.
+static bool VexaRealX11() {const char *e=getenv("VEXA_REAL_X11");return e&&strcmp(e,"1")==0;}
+static void *VexaX11Proc(const char *name) {if(!VexaRealX11())return nullptr;using Lookup=void *(*)(const char *);static void *lib=dlopen("libvexa.so",RTLD_NOW|RTLD_LOCAL);static auto lookup=lib?reinterpret_cast<Lookup>(dlsym(lib,"Vexa_X11VulkanGetProcAddr")):nullptr;return lookup?lookup(name):nullptr;}
+
+// The runtime ANativeWindow dies with the SurfaceView on every backgrounding.
+// The bridge bumps Vexa_GetRuntimeSurfaceSerial on Set(null)/Set(new), so a
+// swapchain whose creation serial no longer matches is presenting into a dead
+// producer. Report VK_ERROR_SURFACE_LOST_KHR so the guest rebuilds its WSI
+// objects against the replacement window instead of rendering to nowhere.
+static uint64_t VexaRuntimeSurfaceSerial() {
+  using Getter = uint64_t (*)();
+  static Getter get = [] {
+    void* vexa = dlopen("libvexa.so", RTLD_NOW | RTLD_NOLOAD);
+    return vexa ? reinterpret_cast<Getter>(dlsym(vexa, "Vexa_GetRuntimeSurfaceSerial")) : nullptr;
+  }();
+  return get ? get() : 0;
+}
+static std::mutex g_vk_wsi_mutex;
+static std::unordered_map<VkSurfaceKHR, uint64_t> g_vk_surface_serial;
+static std::unordered_map<VkSwapchainKHR, uint64_t> g_vk_swapchain_serial;
+static std::unordered_map<VkSwapchainKHR, VkExtent2D> g_vk_swapchain_extent;
+static bool VexaVkSurfaceLost(VkSwapchainKHR swapchain) {
+  const uint64_t serial = VexaRuntimeSurfaceSerial();
+  if (!serial) {
+    return false;
+  }
+  std::lock_guard lk(g_vk_wsi_mutex);
+  const auto it = g_vk_swapchain_serial.find(swapchain);
+  return it != g_vk_swapchain_serial.end() && it->second != serial;
+}
+// Some Android WSI drivers return SUBOPTIMAL on every present even while the
+// producer and its dimensions are unchanged. Unity interprets that as a resize
+// and rebuilds the entire surface/swapchain every frame. Keep real resize and
+// surface replacement notifications intact.
+static bool VexaVkStableSwapchain(VkSwapchainKHR swapchain) {
+  const uint64_t serial = VexaRuntimeSurfaceSerial();
+  VkExtent2D extent {};
+  {
+    std::lock_guard lk(g_vk_wsi_mutex);
+    const auto it = g_vk_swapchain_serial.find(swapchain);
+    const auto size = g_vk_swapchain_extent.find(swapchain);
+    if (!serial || it == g_vk_swapchain_serial.end() || it->second != serial || size == g_vk_swapchain_extent.end()) return false;
+    extent = size->second;
+  }
+  using Getter = ANativeWindow* (*)();
+  static Getter retained = [] {
+    void* vexa = dlopen("libvexa.so", RTLD_NOW | RTLD_NOLOAD);
+    return vexa ? reinterpret_cast<Getter>(dlsym(vexa, "Vexa_GetRuntimeNativeWindowRetained")) : nullptr;
+  }();
+  ANativeWindow* window = retained ? retained() : nullptr;
+  if (!window) return false;
+  const bool stable = ANativeWindow_getWidth(window) == static_cast<int>(extent.width) &&
+                      ANativeWindow_getHeight(window) == static_cast<int>(extent.height);
+  ANativeWindow_release(window);
+  return stable;
+}
+#endif
+
+
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+#include <dirent.h>
+#include <dlfcn.h>
+#include <unistd.h>
+// ADPF (Android Dynamic Performance Framework) hint session for the guest's frame
+// pipeline threads. Fed with the present-to-present interval so the platform power
+// HAL can raise CPU/GPU clocks when frames overrun the display period.
+// Disable with VEXA_ADPF=0.
+static void VexaAdpfOnPresent() {
+  using GetManager = void* (*)();
+  using CreateSession = void* (*)(void*, const int32_t*, size_t, int64_t);
+  using ReportDuration = int (*)(void*, int64_t);
+  static std::mutex mutex;
+  static void* session {};
+  static ReportDuration report {};
+  static bool disabled {};
+  static uint64_t frames {};
+  static int64_t lastNs {};
+  static int64_t targetNs {6944444};
+  std::lock_guard lk(mutex);
+  if (disabled) return;
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  const int64_t interval = lastNs ? now - lastNs : 0;
+  lastNs = now;
+  ++frames;
+  if (!session) {
+    // Wait until Unity has spawned its render threads.
+    if (frames < 180 || frames % 60 != 0) return;
+    const char* env = std::getenv("VEXA_ADPF");
+    if (env && std::strcmp(env, "0") == 0) {
+      disabled = true;
+      return;
+    }
+    void* lib = dlopen("libandroid.so", RTLD_NOW);
+    auto getManager = lib ? reinterpret_cast<GetManager>(dlsym(lib, "APerformanceHint_getManager")) : nullptr;
+    auto create = lib ? reinterpret_cast<CreateSession>(dlsym(lib, "APerformanceHint_createSession")) : nullptr;
+    report = lib ? reinterpret_cast<ReportDuration>(dlsym(lib, "APerformanceHint_reportActualWorkDuration")) : nullptr;
+    if (!getManager || !create || !report) {
+      disabled = true;
+      return;
+    }
+    std::vector<int32_t> tids;
+    int32_t busiestMain {};
+    unsigned long busiestTicks {};
+    if (DIR* dir = opendir("/proc/self/task")) {
+      while (dirent* entry = readdir(dir)) {
+        const int tid = atoi(entry->d_name);
+        if (tid <= 0) continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+        char buf[512] = {};
+        if (FILE* f = fopen(path, "r")) {
+          if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+          fclose(f);
+        }
+        const char* open = std::strchr(buf, '(');
+        const char* close = std::strrchr(buf, ')');
+        if (!open || !close || close <= open) continue;
+        const std::string comm(open + 1, close);
+        unsigned long utime {};
+        unsigned long stime {};
+        // Fields after the comm: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
+        sscanf(close + 2, "%*c %*d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %lu %lu", &utime, &stime);
+        if (comm == "UnityGfxDeviceW" || comm == "Vulkan Submissi" || comm.rfind("Job.worker", 0) == 0) {
+          tids.push_back(tid);
+        } else if (comm == "Thread-6" && utime + stime > busiestTicks) {
+          busiestTicks = utime + stime;
+          busiestMain = tid;
+        }
+      }
+      closedir(dir);
+    }
+    if (busiestMain) tids.push_back(busiestMain);
+    void* manager = getManager();
+    if (!manager || tids.empty()) {
+      if (frames > 1800) disabled = true;
+      return;
+    }
+    session = create(manager, tids.data(), tids.size(), targetNs);
+    fprintf(stderr, "[VEXA][VK] ADPF hint session %s threads=%zu main=%d\n", session ? "created" : "FAILED", tids.size(), busiestMain);
+    if (!session) disabled = true;
+    return;
+  }
+  if (interval > 0 && interval < 1000000000) report(session, interval);
+}
+#endif
 
 #if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
 // Opt-in host wall times distinguish buffer-queue/fence waits from guest work.
@@ -98,11 +245,18 @@ struct VexaVkWallTime {
   }
 };
 static bool VexaVkProfileEnabled() {
-  static const bool enabled = [] { const char* value = std::getenv("VEXA_VK_PROFILE"); return value && std::strcmp(value, "1") == 0; }();
+  static const bool enabled = [] {
+    const char* value = std::getenv("VEXA_VK_PROFILE");
+    const bool active = value && std::strcmp(value, "1") == 0;
+    if (active) fprintf(stderr, "[VEXA][VK-PERF] profile enabled\n");
+    return active;
+  }();
   return enabled;
 }
 static VkResult FEXFN_IMPL(vkAcquireNextImageKHR)(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
                                                 VkSemaphore semaphore, VkFence fence, uint32_t* image) {
+  if(auto f=reinterpret_cast<PFN_vkAcquireNextImageKHR>(VexaX11Proc("vkAcquireNextImageKHR")))return f(device,swapchain,timeout,semaphore,fence,image);
+  if (VexaVkSurfaceLost(swapchain)) return VK_ERROR_SURFACE_LOST_KHR;
   if (!VexaVkProfileEnabled()) return LDR_PTR(vkAcquireNextImageKHR)(device, swapchain, timeout, semaphore, fence, image);
   const auto start = std::chrono::steady_clock::now();
   const auto cpuStart = VexaVkWallTime::ThreadCpuNs();
@@ -112,7 +266,38 @@ static VkResult FEXFN_IMPL(vkAcquireNextImageKHR)(VkDevice device, VkSwapchainKH
   return result;
 }
 static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* info) {
-  if (!VexaVkProfileEnabled()) return LDR_PTR(vkQueuePresentKHR)(queue, info);
+  if(auto f=reinterpret_cast<PFN_vkQueuePresentKHR>(VexaX11Proc("vkQueuePresentKHR")))return f(queue,info);
+  if (info) {
+    bool lost = false;
+    for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+      const bool dead = VexaVkSurfaceLost(info->pSwapchains[i]);
+      lost |= dead;
+      if (info->pResults) {
+        info->pResults[i] = dead ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
+      }
+    }
+    if (lost) {
+      fprintf(stderr, "[VEXA][VK] present dropped: runtime window replaced\n");
+      return VK_ERROR_SURFACE_LOST_KHR;
+    }
+  }
+  auto present = [&] {
+    const VkResult result = LDR_PTR(vkQueuePresentKHR)(queue, info);
+    if (result != VK_SUBOPTIMAL_KHR || !info) return result;
+    for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+      if (!VexaVkStableSwapchain(info->pSwapchains[i])) return result;
+    }
+    if (info->pResults) {
+      for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+        if (info->pResults[i] == VK_SUBOPTIMAL_KHR) info->pResults[i] = VK_SUCCESS;
+      }
+    }
+    return VK_SUCCESS;
+  };
+  VexaAdpfOnPresent();
+  if (!VexaVkProfileEnabled()) {
+    return present();
+  }
   const auto start = std::chrono::steady_clock::now();
   const auto cpuStart = VexaVkWallTime::ThreadCpuNs();
   static thread_local uint64_t calls {};
@@ -124,7 +309,7 @@ static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfo
     }
     fprintf(stderr, "\n");
   }
-  const auto result = LDR_PTR(vkQueuePresentKHR)(queue, info);
+  const auto result = present();
   static thread_local VexaVkWallTime stats;
   stats.Add("present", start, result, cpuStart);
   return result;
@@ -192,6 +377,17 @@ static VkResult VexaCreateRuntimeVulkanSurface(VkInstance instance, ANativeWindo
     fprintf(stderr, "[VEXA][VK] no runtime window for VkSurfaceKHR\n");
     return VK_ERROR_INITIALIZATION_FAILED;
   }
+  // The window's BufferQueue producer accepts a single api connect(); the
+  // GLX thunk's EGL surface may already hold it (guests such as Unity probe
+  // GLX before choosing Vulkan). Hand the api slot to Vulkan first, else the
+  // producer rejects the connect inside vkCreateAndroidSurfaceKHR (EINVAL).
+  {
+    using ReleaseGlx = void (*)(ANativeWindow*);
+    void* gl = dlopen("libGL-host.so", RTLD_NOW | RTLD_NOLOAD);
+    if (auto* release = gl ? reinterpret_cast<ReleaseGlx>(dlsym(gl, "Vexa_ReleaseGlxWindowApi")) : nullptr) {
+      release(window);
+    }
+  }
   // Guest programs such as vkgears never see this ANativeWindow. Publish the
   // size into the guest rootfs so the libxcb shim can deliver ConfigureNotify.
   {
@@ -204,6 +400,10 @@ static VkResult VexaCreateRuntimeVulkanSurface(VkInstance instance, ANativeWindo
   }
   VkAndroidSurfaceCreateInfoKHR info = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, nullptr, 0, window};
   VkResult ret = create_android_surface(instance, &info, nullptr, out);
+  if (ret == VK_SUCCESS && *out) {
+    std::lock_guard lk(g_vk_wsi_mutex);
+    g_vk_surface_serial[*out] = VexaRuntimeSurfaceSerial();
+  }
   if (acquired) {
     ANativeWindow_release(window);
   }
@@ -217,12 +417,14 @@ static VkResult fexfn_impl_libvulkan_vkCreateAndroidSurfaceKHR(VkInstance a_0, c
   ANativeWindow* requested = a_1 ? a_1->window : nullptr;
   return VexaCreateRuntimeVulkanSurface(a_0, requested, a_3);
 }
-static VkResult fexfn_impl_libvulkan_vkCreateXlibSurfaceKHR(VkInstance a_0, const VkXlibSurfaceCreateInfoKHR*, const VkAllocationCallbacks*,
+static VkResult fexfn_impl_libvulkan_vkCreateXlibSurfaceKHR(VkInstance a_0, const VkXlibSurfaceCreateInfoKHR* info, const VkAllocationCallbacks*,
                                                             VkSurfaceKHR* a_3) {
+  if(VexaRealX11()){using Create=VkResult(*)(VkInstance,uint32_t,VkSurfaceKHR*);auto f=reinterpret_cast<Create>(VexaX11Proc("VexaCreateX11Surface"));if(!info||info->pNext||info->flags||!f)return VK_ERROR_INITIALIZATION_FAILED;return f(a_0,uint32_t(info->window),a_3);}
   return VexaCreateRuntimeVulkanSurface(a_0, nullptr, a_3);
 }
-static VkResult fexfn_impl_libvulkan_vkCreateXcbSurfaceKHR(VkInstance a_0, const VkXcbSurfaceCreateInfoKHR*, const VkAllocationCallbacks*,
+static VkResult fexfn_impl_libvulkan_vkCreateXcbSurfaceKHR(VkInstance a_0, const VkXcbSurfaceCreateInfoKHR* info, const VkAllocationCallbacks*,
                                                            VkSurfaceKHR* a_3) {
+  if(VexaRealX11()){using Create=VkResult(*)(VkInstance,uint32_t,VkSurfaceKHR*);auto f=reinterpret_cast<Create>(VexaX11Proc("VexaCreateX11Surface"));if(!info||info->pNext||info->flags||!f)return VK_ERROR_INITIALIZATION_FAILED;return f(a_0,uint32_t(info->window),a_3);}
   return VexaCreateRuntimeVulkanSurface(a_0, nullptr, a_3);
 }
 static VkResult fexfn_impl_libvulkan_vkCreateWaylandSurfaceKHR(VkInstance a_0, const VkWaylandSurfaceCreateInfoKHR*, const VkAllocationCallbacks*,
@@ -399,6 +601,7 @@ static void VexaDestroyPassProfiles(VkDevice device);
 #endif
 
 static VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice a_0, VkSurfaceKHR a_1, VkSurfaceCapabilitiesKHR* a_2) {
+  if(auto f=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(VexaX11Proc("vkGetPhysicalDeviceSurfaceCapabilitiesKHR")))return f(a_0,a_1,a_2);
   if (!LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)) {
     return VK_ERROR_EXTENSION_NOT_PRESENT;
   }
@@ -424,6 +627,7 @@ static VkCompositeAlphaFlagBitsKHR VexaSupportedCompositeAlpha(VkCompositeAlphaF
 
 static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const VkSwapchainCreateInfoKHR* a_1, const VkAllocationCallbacks*,
                                                           VkSwapchainKHR* a_3) {
+  if(auto f=reinterpret_cast<PFN_vkCreateSwapchainKHR>(VexaX11Proc("vkCreateSwapchainKHR")))return f(a_0,a_1,nullptr,a_3);
   if (!a_1) {
     return VK_ERROR_INITIALIZATION_FAILED;
   }
@@ -476,6 +680,15 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
     return VK_ERROR_EXTENSION_NOT_PRESENT;
   }
   const VkResult result = LDR_PTR(vkCreateSwapchainKHR)(a_0, &copy, nullptr, a_3);
+  if (result == VK_SUCCESS && a_3 && *a_3) {
+    std::lock_guard lk(g_vk_wsi_mutex);
+    if (const auto it = g_vk_surface_serial.find(copy.surface); it != g_vk_surface_serial.end()) {
+      g_vk_swapchain_serial[*a_3] = it->second;
+    } else {
+      g_vk_swapchain_serial[*a_3] = VexaRuntimeSurfaceSerial();
+    }
+    g_vk_swapchain_extent[*a_3] = copy.imageExtent;
+  }
 #ifndef IS_32BIT_THUNK
   if (VexaVkProfileEnabled()) {
     fprintf(stderr, "[VEXA][VK-PERF] swapchain result=%d extent=%ux%u images=%u mode=%d format=%d usage=0x%x\n",
@@ -489,6 +702,33 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
   }
   return result;
 }
+#endif
+
+#if defined(BUILD_ANDROID)
+#define VEXA_WSI_RETURN(name,params,args) static VkResult FEXFN_IMPL(name) params {auto bridge=reinterpret_cast<PFN_##name>(VexaX11Proc(#name));return bridge?bridge args:LDR_PTR(name) args;}
+#define VEXA_WSI_VOID(name,params,args) static void FEXFN_IMPL(name) params {auto bridge=reinterpret_cast<PFN_##name>(VexaX11Proc(#name));if(bridge)bridge args;else LDR_PTR(name) args;}
+VEXA_WSI_RETURN(vkAcquireNextImage2KHR,(VkDevice a,const VkAcquireNextImageInfoKHR *b,uint32_t *c),(a,b,c))
+VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceCapabilities2KHR,(VkPhysicalDevice a,const VkPhysicalDeviceSurfaceInfo2KHR *b,VkSurfaceCapabilities2KHR *c),(a,b,c))
+VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceFormats2KHR,(VkPhysicalDevice a,const VkPhysicalDeviceSurfaceInfo2KHR *b,uint32_t *c,VkSurfaceFormat2KHR *d),(a,b,c,d))
+static void FEXFN_IMPL(vkDestroySurfaceKHR)(VkInstance a, VkSurfaceKHR b, const VkAllocationCallbacks* c) {
+  auto bridge = reinterpret_cast<PFN_vkDestroySurfaceKHR>(VexaX11Proc("vkDestroySurfaceKHR"));
+  if (bridge) bridge(a, b, c); else LDR_PTR(vkDestroySurfaceKHR)(a, b, c);
+  std::lock_guard lk(g_vk_wsi_mutex);
+  g_vk_surface_serial.erase(b);
+}
+static void FEXFN_IMPL(vkDestroySwapchainKHR)(VkDevice a, VkSwapchainKHR b, const VkAllocationCallbacks* c) {
+  auto bridge = reinterpret_cast<PFN_vkDestroySwapchainKHR>(VexaX11Proc("vkDestroySwapchainKHR"));
+  if (bridge) bridge(a, b, c); else LDR_PTR(vkDestroySwapchainKHR)(a, b, c);
+  std::lock_guard lk(g_vk_wsi_mutex);
+  g_vk_swapchain_serial.erase(b);
+  g_vk_swapchain_extent.erase(b);
+}
+VEXA_WSI_RETURN(vkGetSwapchainImagesKHR,(VkDevice a,VkSwapchainKHR b,uint32_t *c,VkImage *d),(a,b,c,d))
+VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceSupportKHR,(VkPhysicalDevice a,uint32_t b,VkSurfaceKHR c,VkBool32 *d),(a,b,c,d))
+VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceFormatsKHR,(VkPhysicalDevice a,VkSurfaceKHR b,uint32_t *c,VkSurfaceFormatKHR *d),(a,b,c,d))
+VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfacePresentModesKHR,(VkPhysicalDevice a,VkSurfaceKHR b,uint32_t *c,VkPresentModeKHR *d),(a,b,c,d))
+VEXA_WSI_RETURN(vkCreateRenderPass,(VkDevice a,const VkRenderPassCreateInfo *b,const VkAllocationCallbacks *c,VkRenderPass *d),(a,b,c,d))
+VEXA_WSI_VOID(vkCmdPipelineBarrier,(VkCommandBuffer a,VkPipelineStageFlags b,VkPipelineStageFlags c,VkDependencyFlags d,uint32_t e,const VkMemoryBarrier *f,uint32_t g,const VkBufferMemoryBarrier *h,uint32_t i,const VkImageMemoryBarrier *j),(a,b,c,d,e,f,g,h,i,j))
 #endif
 
 // Functions with callbacks are overridden to ignore the guest-side callbacks
@@ -559,6 +799,7 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   if (!have_android_surface) {
     filtered_exts.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
   }
+  if(VexaRealX11()){for(const char *name:{"VK_KHR_external_memory_capabilities","VK_KHR_get_physical_device_properties2"})if(std::none_of(filtered_exts.begin(),filtered_exts.end(),[&](const char *e){return strcmp(e,name)==0;}))filtered_exts.push_back(name);}
   patched.enabledExtensionCount = static_cast<uint32_t>(filtered_exts.size());
   patched.ppEnabledExtensionNames = filtered_exts.data();
   patched.flags &= ~static_cast<VkInstanceCreateFlags>(VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR);
@@ -577,7 +818,15 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
   g_vexa_physical_device = a_0;
 #endif
   VkDevice out;
-  auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);
+  const VkDeviceCreateInfo *effective=a_1;
+#if defined(BUILD_ANDROID)
+  VkDeviceCreateInfo patched=*a_1;std::vector<const char*> extensions;if(a_1->enabledExtensionCount)extensions.assign(a_1->ppEnabledExtensionNames,a_1->ppEnabledExtensionNames+a_1->enabledExtensionCount);
+  if(VexaRealX11()){for(const char *name:{"VK_ANDROID_external_memory_android_hardware_buffer","VK_EXT_queue_family_foreign","VK_KHR_external_memory","VK_KHR_dedicated_allocation","VK_KHR_get_memory_requirements2"}){if(std::none_of(extensions.begin(),extensions.end(),[&](const char *e){return strcmp(e,name)==0;}))extensions.push_back(name);}patched.enabledExtensionCount=extensions.size();patched.ppEnabledExtensionNames=extensions.data();effective=&patched;}
+#endif
+  auto ret = LDR_PTR(vkCreateDevice)(a_0, effective, nullptr, &out);
+#if defined(BUILD_ANDROID)
+  if(ret==VK_SUCCESS){using Register=void(*)(VkPhysicalDevice,VkDevice,const VkDeviceCreateInfo*);if(auto f=reinterpret_cast<Register>(VexaX11Proc("VexaRegisterX11Device")))f(a_0,out,effective);}
+#endif
   *a_3.get_pointer() = to_guest(to_host_layout(out));
 
   // Reload device-specific function pointers used in custom implementations.
@@ -768,6 +1017,11 @@ VkResult fexfn_impl_libvulkan_vkGetPipelineCacheData(VkDevice device, VkPipeline
 
 static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
   using namespace std::string_view_literals;
+#if defined(BUILD_ANDROID)
+#define WSI_LOOKUP(n) if(a_1==#n##sv)return (PFN_vkVoidFunction)FEXFN_IMPL(n)
+  WSI_LOOKUP(vkAcquireNextImage2KHR);WSI_LOOKUP(vkGetPhysicalDeviceSurfaceCapabilities2KHR);WSI_LOOKUP(vkGetPhysicalDeviceSurfaceFormats2KHR);WSI_LOOKUP(vkDestroySurfaceKHR);WSI_LOOKUP(vkDestroySwapchainKHR);WSI_LOOKUP(vkGetSwapchainImagesKHR);WSI_LOOKUP(vkGetPhysicalDeviceSurfaceSupportKHR);WSI_LOOKUP(vkGetPhysicalDeviceSurfaceFormatsKHR);WSI_LOOKUP(vkGetPhysicalDeviceSurfacePresentModesKHR);WSI_LOOKUP(vkCreateRenderPass);WSI_LOOKUP(vkCmdPipelineBarrier);
+#undef WSI_LOOKUP
+#endif
 
   if (a_1 == "vkCreateShaderModule"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateShaderModule;

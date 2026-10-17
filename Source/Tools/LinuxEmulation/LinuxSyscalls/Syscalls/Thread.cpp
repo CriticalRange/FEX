@@ -45,6 +45,11 @@ $end_info$
 
 ARG_TO_STR(idtype_t, "%u")
 
+// The embedded Android worker must survive guest exit; a standalone VEXA
+// trampoline is a real guest process and must report its actual exit status.
+extern "C" bool Vexa_IsStandaloneLoader() __attribute__((weak));
+extern "C" void Vexa_ReportGuestExit(int status) __attribute__((weak));
+
 namespace FEX::HLE {
 
 struct ExecutionThreadHandler {
@@ -62,7 +67,7 @@ static void* ThreadHandler(void* Data) {
   auto CTX = Handler->CTX;
   auto Thread = Handler->Thread;
 
-  Thread->ThreadInfo.PID = ::getpid();
+  Thread->ThreadInfo.PID = FHU::Syscalls::getpid();
   Thread->ThreadInfo.TID = FHU::Syscalls::gettid();
   if (Thread->Thread->ThreadStats) {
     Thread->Thread->ThreadStats->TID.store(Thread->ThreadInfo.TID, std::memory_order_relaxed);
@@ -233,7 +238,7 @@ uint64_t HandleNewClone(FEX::HLE::ThreadStateObject* Thread, FEXCore::Context::C
 
   // Depending on clone settings, our TID and PID could have changed
   Thread->ThreadInfo.TID = FHU::Syscalls::gettid();
-  Thread->ThreadInfo.PID = ::getpid();
+  Thread->ThreadInfo.PID = ::syscall(SYSCALL_DEF(getpid));
   FEX::HLE::_SyscallHandler->FM.UpdatePID(Thread->ThreadInfo.PID);
 
   if (CreatedNewThreadObject) {
@@ -315,7 +320,7 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
     // Child
     // update the internal TID
     ThreadObject->ThreadInfo.TID = FHU::Syscalls::gettid();
-    ThreadObject->ThreadInfo.PID = ::getpid();
+    ThreadObject->ThreadInfo.PID = ::syscall(SYSCALL_DEF(getpid));
     FEX::HLE::_SyscallHandler->FM.UpdatePID(ThreadObject->ThreadInfo.PID);
     ThreadObject->ThreadInfo.clear_child_tid = nullptr;
 
@@ -461,6 +466,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     }
 
     ThreadObject->StatusCode = status;
+    ThreadObject->VexaGuestExit = true;
 
     FEX::HLE::_SyscallHandler->UninstallTLSState(ThreadObject);
 
@@ -566,6 +572,15 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(exit_group, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
+#if defined(__ANDROID__)
+    if (Vexa_ReportGuestExit) {
+      Vexa_ReportGuestExit(status);
+    }
+    if (Vexa_IsStandaloneLoader && Vexa_IsStandaloneLoader()) {
+      ::syscall(SYS_exit_group, status);
+      std::terminate();
+    }
+#endif
     Frame->Thread->CTX->FlushAndCloseCodeMap();
 
     // Save telemetry if we're exiting.

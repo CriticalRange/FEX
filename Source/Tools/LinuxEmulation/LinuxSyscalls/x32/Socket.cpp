@@ -6,6 +6,7 @@ $end_info$
 */
 
 #include "LinuxSyscalls/Syscalls.h"
+#include "LinuxSyscalls/X11Socket.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/x32/Types.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
@@ -661,7 +662,11 @@ void RegisterSocket(FEX::HLE::SyscallHandler* Handler) {
       break;
     }
     case OP_CONNECT: {
-      Result = ::connect(Arguments[0], reinterpret_cast<const struct sockaddr*>(Arguments[1]), Arguments[2]);
+      uint32_t ConnectArgs[3];
+      if (FaultSafeUserMemAccess::CopyFromUser(ConnectArgs, Arguments, sizeof(ConnectArgs))) {
+        return -EFAULT;
+      }
+      Result = ConnectVexaX11(ConnectArgs[0], reinterpret_cast<const struct sockaddr*>(ConnectArgs[1]), ConnectArgs[2]);
       break;
     }
     case OP_LISTEN: {

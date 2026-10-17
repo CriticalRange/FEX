@@ -62,6 +62,9 @@ $end_info$
 #include <sys/utsname.h>
 #include <unistd.h>
 
+// Optional VEXA host hook: validates PE content; absent in ordinary FEX builds.
+extern "C" int Vexa_IsPortableExecutable(const char* path) __attribute__((weak));
+
 namespace FEX::HLE {
 class SignalDelegator;
 SyscallHandler* _SyscallHandler {};
@@ -234,7 +237,7 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
       return -ENOENT;
     }
 
-    int pid = getpid();
+    int pid = static_cast<int>(::syscall(SYSCALL_DEF(getpid)));
 
     char PidSelfPath[50];
     snprintf(PidSelfPath, 50, "/proc/%i/exe", pid);
@@ -255,6 +258,22 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   const bool IsShebang = !ShebangInterpreter.empty();
   if (IsShebang) {
     InterpreterType = ELFLoader::ELFContainer::GetELFType(ShebangInterpreter);
+  }
+
+  bool IsVexaPE = false;
+  if (!IsShebang && Type == ELFLoader::ELFContainer::ELFType::TYPE_NONE && Vexa_IsPortableExecutable) {
+    if (IsFDExec) {
+      // The VEXA Proton launch contract needs a stable pathname, not an exec FD.
+      char FDPath[64];
+      snprintf(FDPath, sizeof(FDPath), "/proc/self/fd/%d", Args.dirfd);
+      if (Vexa_IsPortableExecutable(FDPath)) {
+        return -ENOTSUP;
+      }
+    } else if (Vexa_IsPortableExecutable(Filename.c_str())) {
+      // Use the existing loader fallback, never kernel binfmt_misc, for PE.
+      IsVexaPE = true;
+      Type = ELFLoader::ELFContainer::ELFType::TYPE_X86_64;
+    }
   }
 
   if (!IsShebang && Type == ELFLoader::ELFContainer::ELFType::TYPE_NONE) {
@@ -292,7 +311,7 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
 
   // If the FEX interpreter is installed then just execve the ELF file
   // This will stay inside of our emulated environment since binfmt_misc will capture it
-  const bool IsBinfmtCompatible = SyscallHandler->IsInterpreterInstalled() && (Type == ELFLoader::ELFContainer::ELFType::TYPE_X86_32 ||
+  const bool IsBinfmtCompatible = !IsVexaPE && SyscallHandler->IsInterpreterInstalled() && (Type == ELFLoader::ELFContainer::ELFType::TYPE_X86_32 ||
                                                                                Type == ELFLoader::ELFContainer::ELFType::TYPE_X86_64);
 
   // We are trying to execute an ELF of a different architecture
@@ -422,8 +441,64 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   // re-executing it cannot recreate the emulated environment. Allow the host
   // to name a trampoline binary that re-enters the runtime instead.
   const char* ReexecTarget = "/proc/self/exe";
+  fextl::vector<fextl::string> VexaNativeEnv;
+  fextl::vector<char*> VexaNativeEnvp;
   if (const char* EnvTarget = getenv("VEXA_REEXEC"); EnvTarget && *EnvTarget) {
     ReexecTarget = EnvTarget;
+    // The trampoline is an Android/Bionic executable. Guest glibc preload and
+    // search paths must not be interpreted by its native linker. Transfer their
+    // exact values (including empty) for the VEXA loader to restore to guest env.
+    fextl::string GuestPreload;
+    fextl::string GuestLibraryPath;
+    bool HasGuestPreload = false;
+    bool HasGuestLibraryPath = false;
+    if (EnvpPtr) {
+      for (auto Entry = EnvpPtr; *Entry; ++Entry) {
+        const std::string_view Value {*Entry};
+        if (Value.starts_with("VEXA_GUEST_LD_PRELOAD=") || Value.starts_with("VEXA_GUEST_LD_LIBRARY_PATH=")) {
+          // Never accept stale or guest-injected transfer values.
+          continue;
+        }
+        if (Value.starts_with("LD_PRELOAD=")) {
+          GuestPreload = *Entry + sizeof("LD_PRELOAD=") - 1;
+          HasGuestPreload = true;
+        } else if (Value.starts_with("LD_LIBRARY_PATH=")) {
+          GuestLibraryPath = *Entry + sizeof("LD_LIBRARY_PATH=") - 1;
+          HasGuestLibraryPath = true;
+        } else {
+          VexaNativeEnv.emplace_back(*Entry);
+        }
+      }
+    }
+    if (HasGuestPreload) {
+      VexaNativeEnv.emplace_back("VEXA_GUEST_LD_PRELOAD=" + GuestPreload);
+    }
+    if (HasGuestLibraryPath) {
+      VexaNativeEnv.emplace_back("VEXA_GUEST_LD_LIBRARY_PATH=" + GuestLibraryPath);
+    }
+    // Wine/Python may intentionally supply a minimal child environment. Keep
+    // only routing essentials from the host when absent; do not restore user
+    // variables or overwrite explicitly supplied (even empty) control values.
+    for (const char* Key : {"VEXA_REEXEC", "VEXA_ROOTFS", "VEXA_THUNK_HOST", "VEXA_THUNK_GUEST", "VEXA_WORKDIR", "VEXA_ARTIFACTS",
+                            "VEXA_COMPAT_SESSION", "VEXA_PROTON_PATH", "VEXA_STEAM_CLIENT_PATH", "VEXA_COMPAT_DATA_ROOT",
+                            "VEXA_PROTON_PYTHON", "VEXA_PROTON_SESSION_SCRIPT", "VEXA_PROTON_DISPLAY_BACKEND", "VEXA_PROTON_ROOTFS"}) {
+      const auto Prefix = fextl::string(Key) + "=";
+      const bool Present = std::any_of(VexaNativeEnv.begin(), VexaNativeEnv.end(), [&](const auto& Entry) {
+        return std::string_view(Entry.data(), Entry.size()).starts_with(std::string_view(Prefix.data(), Prefix.size()));
+      });
+      if (!Present) {
+        if (const char* Value = getenv(Key)) {
+          VexaNativeEnv.emplace_back(Prefix + Value);
+        }
+      }
+    }
+    // Build pointers only after all string storage is stable.
+    VexaNativeEnvp.reserve(VexaNativeEnv.size() + 1);
+    for (auto& Entry : VexaNativeEnv) {
+      VexaNativeEnvp.emplace_back(Entry.data());
+    }
+    VexaNativeEnvp.emplace_back(nullptr);
+    EnvpPtr = VexaNativeEnvp.data();
   }
   Result = ::syscall(SYS_execveat, Args.dirfd, ReexecTarget, const_cast<char* const*>(ExecveArgs.data()), EnvpPtr, Args.flags);
   CloseSeccompFD();

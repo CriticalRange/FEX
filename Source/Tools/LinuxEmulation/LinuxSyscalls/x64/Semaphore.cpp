@@ -24,6 +24,9 @@ ARG_TO_STR(FEX::HLE::x64::semun, "%lx")
 namespace FEX::HLE::x64 {
 void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL_X64(semctl, [](FEXCore::Core::CpuStateFrame* Frame, int semid, int semnum, int cmd, FEX::HLE::x64::semun semun) -> uint64_t {
+#if defined(__ANDROID__)
+    return -ENOSYS;
+#else
     uint64_t Result {};
     switch (cmd) {
     case IPC_SET: {
@@ -77,6 +80,7 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
     default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
     }
     SYSCALL_ERRNO();
+#endif
   });
 }
 } // namespace FEX::HLE::x64
