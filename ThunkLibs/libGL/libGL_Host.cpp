@@ -2169,6 +2169,14 @@ static bool VexaRectInsideSurface(int x, int y, int width, int height, int surfa
          x + width <= surface_w + 1 && y + height <= surface_h + 1;
 }
 
+// A main view parked at the GL origin, smaller than the surface, draws in the
+// bottom-left corner. A centered or edge-fitted frame has a non-zero origin or
+// already spans an axis, and must stay where the guest placed it.
+static bool VexaCornerShrink(int x, int y, int width, int height, int surface_w, int surface_h) {
+  return x <= 1 && y <= 1 && surface_w > 0 && surface_h > 0 &&
+         (width + 8 < surface_w || height + 8 < surface_h);
+}
+
 static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
   static bool logged = false;
   static bool logged_fbo = false;
@@ -2187,6 +2195,15 @@ static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei
     return;
   }
   VexaVisibleRect rect = VexaVisibleRectFor(width, height);
+  if (rect.ok && VexaCornerShrink(x, y, width, height, rect.surface_w, rect.surface_h)) {
+    glViewport(0, 0, rect.surface_w, rect.surface_h);
+    if (!logged) {
+      logged = true;
+      fprintf(stderr, "[VEXA][GL] glViewport corner %d,%d %dx%d -> 0,0 %dx%d\n", x, y, width, height, rect.surface_w,
+              rect.surface_h);
+    }
+    return;
+  }
   if (rect.ok && VexaRectInsideSurface(x, y, width, height, rect.surface_w, rect.surface_h)) {
     glViewport(x, y, width, height);
     return;
@@ -2219,6 +2236,15 @@ static void fexfn_impl_libGL_glScissor(GLint x, GLint y, GLsizei width, GLsizei 
     return;
   }
   VexaVisibleRect rect = VexaVisibleRectFor(width, height);
+  if (rect.ok && VexaCornerShrink(x, y, width, height, rect.surface_w, rect.surface_h)) {
+    glScissor(0, 0, rect.surface_w, rect.surface_h);
+    if (!logged) {
+      logged = true;
+      fprintf(stderr, "[VEXA][GL] glScissor corner %d,%d %dx%d -> 0,0 %dx%d\n", x, y, width, height, rect.surface_w,
+              rect.surface_h);
+    }
+    return;
+  }
   if (rect.ok && VexaRectInsideSurface(x, y, width, height, rect.surface_w, rect.surface_h)) {
     glScissor(x, y, width, height);
     return;
@@ -2372,6 +2398,19 @@ static void VexaBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint src
     const int dst_x = dstX0 < dstX1 ? dstX0 : dstX1;
     const int dst_y = dstY0 < dstY1 ? dstY0 : dstY1;
     VexaVisibleRect rect = VexaVisibleRectFor(guest_w, guest_h);
+    if (rect.surface_w > 0 && rect.surface_h > 0 &&
+        VexaCornerShrink(dst_x, dst_y, dw, dh, rect.surface_w, rect.surface_h)) {
+      dx0 = dstX0 < dstX1 ? 0 : rect.surface_w;
+      dx1 = dstX0 < dstX1 ? rect.surface_w : 0;
+      dy0 = dstY0 < dstY1 ? 0 : rect.surface_h;
+      dy1 = dstY0 < dstY1 ? rect.surface_h : 0;
+      static int corner_blit = 0;
+      if (corner_blit < 4) {
+        ++corner_blit;
+        fprintf(stderr, "[VEXA][GL] blit corner %d,%d,%d,%d -> %d,%d,%d,%d\n", dstX0, dstY0, dstX1, dstY1, dx0, dy0,
+                dx1, dy1);
+      }
+    }
     const bool placed = VexaRectInsideSurface(dst_x, dst_y, dw, dh, rect.surface_w, rect.surface_h);
     // Already the full surface. A guest window that is merely larger than half
     // the surface still needs to be scaled into the cover rect.

@@ -1407,8 +1407,10 @@ VEXA_GL_GUEST_EXPORT GLboolean glIsEnabled(GLenum cap) {
 }
 
 VEXA_GL_GUEST_EXPORT void glDepthRange(GLdouble z_near, GLdouble z_far) {
-  fprintf(stderr, "[libGL thunk] compat glDepthRange near=%f far=%f (no-op)\n",
-          static_cast<double>(z_near), static_cast<double>(z_far));
+  // Desktop GL. ETS2 slices the scene with this (0..0.009, 0.01..0.9, 0..1).
+  // A no-op leaves every pass on the default 0..1 window depth, so roads,
+  // vehicles and roofs z-fight into black bands. GLES only has the float form.
+  fexfn_pack_glDepthRangef(static_cast<GLfloat>(z_near), static_cast<GLfloat>(z_far));
 }
 
 VEXA_GL_GUEST_EXPORT void glGetPointerv(GLenum /*pname*/, void** params) {

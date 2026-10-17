@@ -22,6 +22,7 @@
   OP(glColorMask) \
   OP(glDepthFunc) \
   OP(glDepthMask) \
+  OP(glDepthRangef) \
   OP(glScissor) \
   OP(glStencilFunc) \
   OP(glStencilMask) \
@@ -296,6 +297,7 @@
   OP(glColorMask) \
   OP(glDepthFunc) \
   OP(glDepthMask) \
+  OP(glDepthRangef) \
   OP(glStencilFunc) \
   OP(glStencilMask) \
   OP(glStencilOp) \
