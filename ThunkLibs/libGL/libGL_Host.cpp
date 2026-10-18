@@ -1370,6 +1370,17 @@ static bool VexaGlShadowForVulkan() {
   }();
   return shadow;
 }
+// eglDestroySurface defers destruction while another thread holds the
+// surface current; call Surface::disconnect(api) directly as a fallback so
+// the producer frees now. NATIVE_WINDOW_API_EGL == 1, DisconnectModeNormal == 0.
+static void VexaDisconnectWindowApi(ANativeWindow* window) {
+  using SurfaceDisconnect = int (*)(void*, int, int);
+  static auto* surface_disconnect = reinterpret_cast<SurfaceDisconnect>(
+      dlsym(RTLD_DEFAULT, "_ZN7android7Surface10disconnectEiNS_22IGraphicBufferProducer14DisconnectModeE"));
+  if (surface_disconnect) {
+    surface_disconnect(window, 1, 0);
+  }
+}
 static bool VexaRefreshGlxSurface() {
   if (VexaHeadlessMode() || g_vexa_glx.shadow) return g_vexa_glx.surface != EGL_NO_SURFACE;
   const uint64_t serial = VexaRuntimeSurfaceSerial();
@@ -1385,8 +1396,20 @@ static bool VexaRefreshGlxSurface() {
     ANativeWindow_setBuffersGeometry(window, 0, 0, g_vexa_glx.buffer_format);
   const EGLint colors[] = {EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_SRGB_KHR, EGL_NONE};
   EGLSurface surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, VexaSrgbSurface() ? colors : nullptr);
+  if (surface == EGL_NO_SURFACE && eglGetError() == EGL_BAD_ALLOC) {
+    // The producer can still carry our previous surface's api connect when
+    // the runtime hands us a replacement window (idle doze, rotation): the
+    // old EGLSurface stays alive as long as another thread holds it current,
+    // so its deferred destroy never releases the slot. Force the stale
+    // connect off this producer and retry once.
+    VexaDisconnectWindowApi(window);
+    surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, VexaSrgbSurface() ? colors : nullptr);
+  }
   if (surface == EGL_NO_SURFACE) {
-    fprintf(stderr, "[VEXA][GLX] surface rebuild failed 0x%x\n", eglGetError());
+    static unsigned rebuild_failures = 0;
+    if ((rebuild_failures++ & 255) == 0) {
+      fprintf(stderr, "[VEXA][GLX] surface rebuild failed 0x%x (x%u)\n", eglGetError(), rebuild_failures);
+    }
     ANativeWindow_release(window);
     return false;
   }
@@ -7403,15 +7426,7 @@ void Vexa_ReleaseGlxWindowApi(ANativeWindow* window) {
     eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
     g_vexa_glx.surface = EGL_NO_SURFACE;
   }
-  // eglDestroySurface defers destruction while another thread holds the
-  // surface current; call Surface::disconnect(api) directly as a fallback so
-  // the producer frees now. NATIVE_WINDOW_API_EGL == 1, DisconnectModeNormal == 0.
-  using SurfaceDisconnect = int (*)(void*, int, int);
-  static auto* surface_disconnect = reinterpret_cast<SurfaceDisconnect>(
-      dlsym(RTLD_DEFAULT, "_ZN7android7Surface10disconnectEiNS_22IGraphicBufferProducer14DisconnectModeE"));
-  if (surface_disconnect) {
-    surface_disconnect(window, 1, 0);
-  }
+  VexaDisconnectWindowApi(window);
   g_vexa_glx.ready = false;
   fprintf(stderr, "[VEXA][GLX] released window api for Vulkan takeover\n");
 }
