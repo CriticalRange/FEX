@@ -62,6 +62,14 @@ static GLenum VexaDesktopInternalFormat(GLint internalformat, GLenum format, GLe
     if (type == 0x8033) return GL_RGBA4;
     return GL_RGBA8;
   }
+  // Desktop allows the unsized depth formats as glTexImage*D internalformat;
+  // GLES3 rejects them with INVALID_ENUM and the texture is never allocated
+  // (any FBO attaching it ends up incomplete -- ETS2 shadow maps).
+  if (internalformat == GL_DEPTH_COMPONENT) return 0x81A6;  // GL_DEPTH_COMPONENT24
+  if (internalformat == GL_DEPTH_STENCIL) return GL_DEPTH24_STENCIL8;
+  if (internalformat == GL_DEPTH_COMPONENT24 && (format == GL_DEPTH_STENCIL || type == GL_UNSIGNED_INT_24_8)) {
+    return GL_DEPTH24_STENCIL8;
+  }
   return static_cast<GLenum>(internalformat);
 }
 
@@ -228,9 +236,11 @@ static void VexaGL_glTexImage2D(GLenum target, GLint level, GLint internalformat
             internalformat, format, type, width, height);
   }
   if (VexaUploadDesktopImage2D(true, target, level, internalformat, 0, 0, width, height, border, format, type, data)) {
+    VexaDumpTexture(target, level, "img");
     return;
   }
   ::glTexImage2D(target, level, internalformat, width, height, border, format, type, data);
+  VexaDumpTexture(target, level, "img");
 }
 
 static void VexaGL_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
@@ -243,6 +253,7 @@ static void VexaGL_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
     }
   }
   if (VexaUploadDesktopImage2D(false, target, level, 0, x, y, width, height, 0, format, type, data)) {
+    VexaDumpTexture(target, level, "sub");
     return;
   }
   GLenum original = 0;
@@ -256,6 +267,7 @@ static void VexaGL_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
   const int channels = format == GL_RED ? 1 : format == GL_RG ? 2 : format == GL_RGBA ? 4 : 0;
   if (!original || !channels || (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE) || width <= 0 || height <= 0) {
     ::glTexSubImage2D(target, level, x, y, width, height, format, type, data);
+    VexaDumpTexture(target, level, "sub");
     return;
   }
   GLint row = 0, align = 4, skip_x = 0, skip_y = 0;
@@ -282,6 +294,7 @@ static void VexaGL_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
   }
   VexaUnpackScope unpack;
   ::glTexSubImage2D(target, level, x, y, width, height, format, GL_FLOAT, converted.data());
+  VexaDumpTexture(target, level, "n16");
   static unsigned logs = 0;
   if (logs++ < 8) fprintf(stderr, "[VEXA][UNORM16] upload %dx%d channels=%d type=%x -> normalized float\n", width, height, channels, type);
 }

@@ -26,6 +26,13 @@ extern "C" unsigned VEXA_FFUpload(const float* vertices, int float_count);
 extern "C" void VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp);
 extern "C" void VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color);
 extern "C" void VEXA_FFDelete(unsigned buffer);
+// One host transition per multi-call. 64-bit values travel as (lo, hi) GLuint
+// pairs so the layout is identical for 32- and 64-bit guests.
+extern "C" void VEXA_MultiDrawIndirect(unsigned mode, unsigned type, uintptr_t indirect, int drawcount, int stride);
+extern "C" void VEXA_MultiDrawElementsBV(unsigned mode, unsigned type, const int* counts, const unsigned* offsets,
+                                         const int* basevertex, int drawcount);
+extern "C" void VEXA_BindMany(unsigned op, unsigned target, unsigned first, int count, const unsigned* names,
+                              const unsigned* offsets, const unsigned* sizes);
 #else
 #include <GL/glx.h>
 #include <GL/glxext.h>
@@ -73,6 +80,12 @@ template<>
 struct fex_gen_config<VEXA_FFDrawImmediate> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_FFDelete> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_MultiDrawIndirect> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_MultiDrawElementsBV> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_BindMany> : fexgen::custom_host_impl {};
 #endif
 
 // internal use
@@ -808,7 +821,7 @@ struct fex_gen_config<glTestObjectAPPLE> {};
 template<>
 struct fex_gen_config<glUnmapBufferARB> {};
 template<>
-struct fex_gen_config<glUnmapBuffer> {};
+struct fex_gen_config<glUnmapBuffer> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glUnmapNamedBufferEXT> {};
 template<>
@@ -1058,7 +1071,7 @@ struct fex_gen_config<glBindBufferBase> {};
 template<>
 struct fex_gen_config<glBindBufferBaseNV> {};
 template<>
-struct fex_gen_config<glBindBuffer> {};
+struct fex_gen_config<glBindBuffer> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glBindBufferOffsetEXT> {};
 template<>
@@ -1242,7 +1255,7 @@ struct fex_gen_config<glBufferAttachMemoryNV> {};
 template<>
 struct fex_gen_config<glBufferDataARB> {};
 template<>
-struct fex_gen_config<glBufferData> {};
+struct fex_gen_config<glBufferData> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glBufferPageCommitmentARB> {};
 template<>
@@ -1250,13 +1263,13 @@ struct fex_gen_config<glBufferParameteriAPPLE> {};
 template<>
 struct fex_gen_config<glBufferStorageExternalEXT> {};
 template<>
-struct fex_gen_config<glBufferStorage> {};
+struct fex_gen_config<glBufferStorage> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glBufferStorageMemEXT> {};
 template<>
 struct fex_gen_config<glBufferSubDataARB> {};
 template<>
-struct fex_gen_config<glBufferSubData> {};
+struct fex_gen_config<glBufferSubData> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glCallCommandListNV> {};
 template<>
@@ -2130,7 +2143,7 @@ struct fex_gen_config<glFlush> {};
 template<>
 struct fex_gen_config<glFlushMappedBufferRangeAPPLE> {};
 template<>
-struct fex_gen_config<glFlushMappedBufferRange> {};
+struct fex_gen_config<glFlushMappedBufferRange> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glFlushMappedNamedBufferRangeEXT> {};
 template<>
@@ -3412,7 +3425,7 @@ struct fex_gen_config<glMapBufferARB> {};
 template<>
 struct fex_gen_config<glMapBuffer> {};
 template<>
-struct fex_gen_config<glMapBufferRange> {};
+struct fex_gen_config<glMapBufferRange> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glMapControlPointsNV> {};
 template<>

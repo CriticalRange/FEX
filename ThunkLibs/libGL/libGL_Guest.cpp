@@ -48,6 +48,10 @@ using __GLXextFuncPtr = void (*)();
 
 #include "common/Guest.h"
 
+#ifndef VEXA_GL_GUEST_EXPORT
+#define VEXA_GL_GUEST_EXPORT __attribute__((visibility("default")))
+#endif
+
 #ifdef BUILD_ANDROID
 // VEXA_FIXES: Desktop GL 4.3 makes these core, and this GLES driver does not
 // export them. Unity treats the context as desktop GL (GLES: 0) and calls the
@@ -558,24 +562,25 @@ static void VexaCompat_glGetTextureLevelParameteriv(GLuint, GLint, GLenum, GLint
 static void VexaWarnBaseInstance(const char* fn, GLuint baseinstance) {
   static int warned = 0;
   if (baseinstance != 0 && warned++ < 8) {
-    fprintf(stderr, "[libGL thunk] %s baseinstance=%u ignored (no GL_EXT_base_instance on this driver)\n", fn, baseinstance);
+    fprintf(stderr, "[libGL thunk] %s baseinstance=%u emulated via vertex-binding offsets\n", fn, baseinstance);
   }
 }
+// Base-instance emulation runs natively in the host thunks (one transition).
 static void VexaCompat_glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type,
                                                                const void* indices, GLsizei instancecount, GLuint baseinstance) {
   VexaWarnBaseInstance("glDrawElementsInstancedBaseInstance", baseinstance);
-  ::glDrawElementsInstanced(mode, count, type, indices, instancecount);
+  ::glDrawElementsInstancedBaseInstance(mode, count, type, indices, instancecount, baseinstance);
 }
 static void VexaCompat_glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type,
                                                                          const void* indices, GLsizei instancecount,
                                                                          GLint basevertex, GLuint baseinstance) {
   VexaWarnBaseInstance("glDrawElementsInstancedBaseVertexBaseInstance", baseinstance);
-  ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
+  ::glDrawElementsInstancedBaseVertexBaseInstance(mode, count, type, indices, instancecount, basevertex, baseinstance);
 }
 static void VexaCompat_glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
                                                              GLsizei instancecount, GLuint baseinstance) {
   VexaWarnBaseInstance("glDrawArraysInstancedBaseInstance", baseinstance);
-  ::glDrawArraysInstanced(mode, first, count, instancecount);
+  ::glDrawArraysInstancedBaseInstance(mode, first, count, instancecount, baseinstance);
 }
 void glPolygonOffsetClamp(GLfloat factor, GLfloat units, GLfloat clamp) {
   (void)clamp;
@@ -1352,7 +1357,23 @@ VEXA_GL_GUEST_EXPORT void glTexImage1D(GLenum target, GLint level, GLint interna
   ::glTexImage2D(target, level, internalformat, width, 1, border, format, type, pixels);
 }
 
-VEXA_GL_GUEST_EXPORT void glDrawBuffer(GLenum /*mode*/) {
+VEXA_GL_GUEST_EXPORT void glDrawBuffer(GLenum mode) {
+  // GLES3 has no glDrawBuffer, only glDrawBuffers. Desktop FBO code paths
+  // (e.g. ETS2's depth-only shadow maps) call glDrawBuffer(GL_NONE); dropping
+  // it leaves DRAW_BUFFER0 at GL_COLOR_ATTACHMENT0, so a depth-only FBO is
+  // incomplete and every draw/clear fails -> shadow map never rendered.
+  switch (mode) {
+    case GL_NONE:
+    case GL_BACK:
+    case GL_COLOR_ATTACHMENT0:
+      ::glDrawBuffers(1, &mode);
+      break;
+    default:
+      if (mode >= GL_COLOR_ATTACHMENT0 && mode <= GL_COLOR_ATTACHMENT0 + 31) {
+        ::glDrawBuffers(1, &mode);
+      }
+      break;
+  }
 }
 
 VEXA_GL_GUEST_EXPORT void glFinish(void) {
@@ -1522,78 +1543,90 @@ VEXA_GL_GUEST_EXPORT void glGetActiveUniformName(GLuint program, GLuint uniformI
   ::glGetActiveUniform(program, uniformIndex, bufSize, length, &size, &type, uniformName);
 }
 
+// Scratch for the (lo, hi) packing below: stack storage for typical batch
+// sizes, heap only for unusually large ones.
+struct VexaPackBuf {
+  unsigned local[64];
+  std::vector<unsigned> heap;
+  unsigned* get(GLsizei count) {
+    const size_t n = static_cast<size_t>(count) * 2;
+    if (n <= sizeof(local) / sizeof(local[0])) return local;
+    heap.resize(n);
+    return heap.data();
+  }
+};
+
+// Packs 64-bit values as (lo, hi) pairs for the VEXA_* batch thunks.
+static const unsigned* VexaPack64(const GLintptr* src, GLsizei count, unsigned* dst) {
+  if (!src) return nullptr;
+  for (GLsizei i = 0; i < count; ++i) {
+    const uint64_t v = static_cast<uint64_t>(static_cast<int64_t>(src[i]));
+    dst[2 * i] = static_cast<unsigned>(v);
+    dst[2 * i + 1] = static_cast<unsigned>(v >> 32);
+  }
+  return dst;
+}
+static const unsigned* VexaPack32(const GLsizei* src, GLsizei count, unsigned* dst) {
+  if (!src) return nullptr;
+  for (GLsizei i = 0; i < count; ++i) {
+    const uint64_t v = static_cast<uint64_t>(static_cast<int64_t>(src[i]));
+    dst[2 * i] = static_cast<unsigned>(v);
+    dst[2 * i + 1] = static_cast<unsigned>(v >> 32);
+  }
+  return dst;
+}
+
 VEXA_GL_GUEST_EXPORT void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type,
                                                          const void* const* indices, GLsizei drawcount, const GLint* basevertex) {
+  if (drawcount <= 0) return;
+  VexaPackBuf buf;
+  unsigned* offs = buf.get(drawcount);
   for (GLsizei i = 0; i < drawcount; ++i) {
-    ::glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
+    const uint64_t v = reinterpret_cast<uintptr_t>(indices[i]);
+    offs[2 * i] = static_cast<unsigned>(v);
+    offs[2 * i + 1] = static_cast<unsigned>(v >> 32);
   }
+  fexfn_pack_VEXA_MultiDrawElementsBV(mode, type, count, offs, basevertex, drawcount);
 }
 
 VEXA_GL_GUEST_EXPORT void glMultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
-  if (drawcount <= 0) return;
-  if (stride == 0) stride = 16;
-  const auto off = reinterpret_cast<uintptr_t>(indirect);
-  const GLsizeiptr map_size = off + static_cast<GLsizeiptr>(stride) * drawcount;
-  const uint8_t* p = static_cast<const uint8_t*>(
-      ::glMapBufferRange(0x8F3F /*GL_DRAW_INDIRECT_BUFFER*/, 0, map_size, 0x0001));
-  if (!p) return;
-  for (GLsizei i = 0; i < drawcount; ++i) {
-    const uint32_t* e = reinterpret_cast<const uint32_t*>(p + off + static_cast<size_t>(stride) * i);
-    ::glDrawArraysInstanced(mode, static_cast<GLint>(e[2]), static_cast<GLsizei>(e[0]), static_cast<GLsizei>(e[1]));
-  }
-  ::glUnmapBuffer(0x8F3F);
+  fexfn_pack_VEXA_MultiDrawIndirect(mode, 0, reinterpret_cast<uintptr_t>(indirect), drawcount, stride);
 }
 
 VEXA_GL_GUEST_EXPORT void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride) {
-  if (drawcount <= 0) return;
-  if (stride == 0) stride = 20;
-  const auto off = reinterpret_cast<uintptr_t>(indirect);
-  const GLsizeiptr map_size = off + static_cast<GLsizeiptr>(stride) * drawcount;
-  const uint8_t* p = static_cast<const uint8_t*>(
-      ::glMapBufferRange(0x8F3F /*GL_DRAW_INDIRECT_BUFFER*/, 0, map_size, 0x0001));
-  if (!p) return;
-  const GLsizeiptr elem_size = (type == 0x1403 /*UNSIGNED_SHORT*/) ? 2 : 4;
-  for (GLsizei i = 0; i < drawcount; ++i) {
-    const uint32_t* e = reinterpret_cast<const uint32_t*>(p + off + static_cast<size_t>(stride) * i);
-    ::glDrawElementsInstancedBaseVertex(mode, static_cast<GLsizei>(e[0]), type,
-                                        reinterpret_cast<const void*>(static_cast<uintptr_t>(e[2] * elem_size)),
-                                        static_cast<GLsizei>(e[1]), static_cast<GLint>(e[3]));
-  }
-  ::glUnmapBuffer(0x8F3F);
+  fexfn_pack_VEXA_MultiDrawIndirect(mode, type, reinterpret_cast<uintptr_t>(indirect), drawcount, stride);
 }
 
 VEXA_GL_GUEST_EXPORT void glBindBuffersBase(GLenum target, GLuint first, GLsizei count, const GLuint* buffers) {
-  for (GLsizei i = 0; i < count; ++i) ::glBindBufferBase(target, first + i, buffers[i]);
+  fexfn_pack_VEXA_BindMany(1, target, first, count, buffers, nullptr, nullptr);
 }
 
 VEXA_GL_GUEST_EXPORT void glBindBuffersRange(GLenum target, GLuint first, GLsizei count, const GLuint* buffers,
                                              const GLintptr* offsets, const GLsizeiptr* sizes) {
-  for (GLsizei i = 0; i < count; ++i) ::glBindBufferRange(target, first + i, buffers[i], offsets[i], sizes[i]);
+  if (count <= 0) return;
+  VexaPackBuf o, sz;
+  fexfn_pack_VEXA_BindMany(2, target, first, count, buffers, VexaPack64(offsets, count, o.get(count)),
+                           VexaPack64(sizes, count, sz.get(count)));
 }
 
 VEXA_GL_GUEST_EXPORT void glBindTextures(GLuint first, GLsizei count, const GLuint* textures) {
-  for (GLsizei i = 0; i < count; ++i) {
-    if (!textures[i]) continue;
-    ::glActiveTexture(0x84C0 /*GL_TEXTURE0*/ + first + i);
-    ::glBindTexture(GL_TEXTURE_2D, textures[i]);
-  }
+  fexfn_pack_VEXA_BindMany(3, 0, first, count, textures, nullptr, nullptr);
 }
 
 VEXA_GL_GUEST_EXPORT void glBindSamplers(GLuint first, GLsizei count, const GLuint* samplers) {
-  for (GLsizei i = 0; i < count; ++i) ::glBindSampler(first + i, samplers[i]);
+  fexfn_pack_VEXA_BindMany(4, 0, first, count, samplers, nullptr, nullptr);
 }
 
 VEXA_GL_GUEST_EXPORT void glBindImageTextures(GLuint first, GLsizei count, const GLuint* textures) {
-  for (GLsizei i = 0; i < count; ++i) {
-    ::glBindImageTexture(first + i, textures[i], 0, GL_TRUE, 0, 0x88B9 /*GL_WRITE_ONLY*/, 0x8058 /*GL_RGBA8*/);
-  }
+  fexfn_pack_VEXA_BindMany(6, 0, first, count, textures, nullptr, nullptr);
 }
 
 VEXA_GL_GUEST_EXPORT void glBindVertexBuffers(GLuint first, GLsizei count, const GLuint* buffers,
                                               const GLintptr* offsets, const GLsizei* strides) {
-  for (GLsizei i = 0; i < count; ++i) {
-    ::glBindVertexBuffer(first + i, buffers[i], offsets ? offsets[i] : 0, strides ? strides[i] : 0);
-  }
+  if (count <= 0) return;
+  VexaPackBuf o, st;
+  fexfn_pack_VEXA_BindMany(5, 0, first, count, buffers, VexaPack64(offsets, count, o.get(count)),
+                           VexaPack32(strides, count, st.get(count)));
 }
 
 VEXA_GL_GUEST_EXPORT void glInvalidateBufferData(GLuint /*buffer*/) {}

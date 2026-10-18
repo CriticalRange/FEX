@@ -101,7 +101,24 @@ static void VexaGetBufferPointer32(GLenum target, GLenum pname, void** output) {
     static_cast<uint32_t>(reinterpret_cast<uintptr_t>(it->second.guest));
 }
 
+static bool VexaTboLog() {
+  static int en = -1;
+  if (en < 0) en = access("/data/data/com.critical.vexaemulator/files/vexa_tbo_dump.flag", F_OK) == 0;
+  return en != 0;
+}
+static GLint VexaBoundBufferFor(GLenum target) {
+  GLint buf = 0;
+  ::glGetIntegerv(target == GL_ARRAY_BUFFER ? GL_ARRAY_BUFFER_BINDING :
+                  target == GL_COPY_WRITE_BUFFER ? GL_COPY_WRITE_BUFFER_BINDING :
+                  target == GL_COPY_READ_BUFFER ? GL_COPY_READ_BUFFER_BINDING :
+                  target == GL_ELEMENT_ARRAY_BUFFER ? GL_ELEMENT_ARRAY_BUFFER_BINDING :
+                  GL_ARRAY_BUFFER_BINDING, &buf);
+  return buf;
+}
 static void* fexfn_impl_libGL_glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+  if (VexaTboLog())
+    fprintf(stderr, "[libGL-host] map target=%x buf=%d off=%lld len=%lld acc=%x tid=%d\n",
+            target, VexaBoundBufferFor(target), (long long)offset, (long long)length, access, (int)gettid());
   void* host = ::glMapBufferRange(target, offset, length, access);
   if (!host) return nullptr;
   // GLES rejects persistent/coherent mappings. Copy ordinary maps into guest
@@ -131,6 +148,9 @@ static void fexfn_impl_libGL_glFlushMappedBufferRange(GLenum target, GLintptr of
 }
 
 static GLboolean fexfn_impl_libGL_glUnmapBuffer(GLenum target) {
+  if (VexaTboLog())
+    fprintf(stderr, "[libGL-host] unmap target=%x buf=%d tid=%d\n",
+            target, VexaBoundBufferFor(target), (int)gettid());
   void* host = nullptr;
   void* guest = nullptr;
   ::glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &host);

@@ -14,6 +14,11 @@ unsigned fexfn_pack_VEXA_FFUpload(const float* vertices, int float_count);
 void fexfn_pack_VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp);
 void fexfn_pack_VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color);
 void fexfn_pack_VEXA_FFDelete(unsigned buffer);
+void fexfn_pack_VEXA_MultiDrawIndirect(unsigned mode, unsigned type, uintptr_t indirect, int drawcount, int stride);
+void fexfn_pack_VEXA_MultiDrawElementsBV(unsigned mode, unsigned type, const int* counts, const unsigned* offsets,
+                                         const int* basevertex, int drawcount);
+void fexfn_pack_VEXA_BindMany(unsigned op, unsigned target, unsigned first, int count, const unsigned* names,
+                              const unsigned* offsets, const unsigned* sizes);
 }
 
 namespace vexa_ff {
