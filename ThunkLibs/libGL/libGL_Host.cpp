@@ -1324,10 +1324,51 @@ struct VexaFrameFbo {
 };
 static VexaFrameFbo g_vexa_frame_fbos[32];
 static size_t g_vexa_frame_fbo_count = 0;
+// Frames that touched more FBOs than the tracking array holds; the overflowed
+// entries are invisible to the present fallback, so it can pick a wrong target.
+static uint32_t g_vexa_frame_fbo_overflow = 0;
 
+static uint32_t g_vexa_fb0_draw_count = 0;
+static bool g_vexa_fb0_blit = false;
+// Diagnostic record of what actually went to FB0 this frame (up to 8 draws).
+struct VexaFb0Draw {
+  GLenum mode = 0;
+  GLsizei count = 0;
+  GLint vp_w = 0, vp_h = 0;
+  GLuint prog = 0;
+  GLint tex = 0;
+  GLint blend = 0;
+  GLint blend_src = 0, blend_dst = 0;
+  GLboolean mask[4] = {};
+};
+static VexaFb0Draw g_vexa_fb0_draws[8];
+static int g_vexa_fb0_draw_n = 0;
+// Ordered per-frame event log: seq of each draw (and the fbo it targeted) plus
+// bind transitions. Distinguishes "guest really drew the tilemap to the RT"
+// from "our tracking lied".
+static uint32_t g_vexa_frame_seq = 0;
+struct VexaFrameEvent {
+  uint32_t seq = 0;
+  GLuint fbo = 0;
+  GLsizei count = 0;
+  GLuint prog = 0;
+};
+static VexaFrameEvent g_vexa_frame_events[48];
+static int g_vexa_frame_event_n = 0;
+static char g_vexa_frame_binds[160];
+static int g_vexa_frame_binds_len = 0;
+static VexaGlxState g_vexa_glx;
 static void VexaTrackFrameFbo(GLuint fbo) {
   if (fbo == 0) {
-    g_vexa_fb0_drawn = true;
+    // Guest contexts that fail to bind the window surface fall back to a
+    // per-context pbuffer (VEXA_BindGlxSurface). Draws to "fb0" there are
+    // invisible — they must not suppress the present fallback, or the real
+    // frame left in an offscreen FBO is dropped and a black frame presents
+    // (VS Bat Country inverse flicker).
+    if (eglGetCurrentSurface(EGL_DRAW) == g_vexa_glx.surface) {
+      g_vexa_fb0_drawn = true;
+      ++g_vexa_fb0_draw_count;
+    }
     return;
   }
   for (size_t i = 0; i < g_vexa_frame_fbo_count; ++i) {
@@ -1340,6 +1381,8 @@ static void VexaTrackFrameFbo(GLuint fbo) {
     auto& e = g_vexa_frame_fbos[g_vexa_frame_fbo_count++];
     e.fbo = fbo;
     e.draws = 1;
+  } else {
+    ++g_vexa_frame_fbo_overflow;
   }
 }
 extern uint64_t g_vexa_diag_clears;
@@ -1347,7 +1390,6 @@ extern uint64_t g_vexa_diag_useprog;
 extern uint64_t g_vexa_diag_bindfbo;
 extern uint64_t g_vexa_diag_dispatches;
 
-static VexaGlxState g_vexa_glx;
 // Surface serial for which the VEXA_GLX_SWAP_INTERVAL env override was last
 // applied. ~0 forces an apply on the first swap of any surface.
 static uint64_t g_vexa_env_interval_serial = ~0ull;
@@ -1704,6 +1746,116 @@ static void VexaPresentFallback() {
   g_vexa_fb0_drawn = false;
   const size_t nfbo = g_vexa_frame_fbo_count;
   g_vexa_frame_fbo_count = 0;
+  const uint32_t overflow = g_vexa_frame_fbo_overflow;
+  g_vexa_frame_fbo_overflow = 0;
+  const uint32_t fb0_draws = g_vexa_fb0_draw_count;
+  g_vexa_fb0_draw_count = 0;
+  const bool fb0_blit = g_vexa_fb0_blit;
+  g_vexa_fb0_blit = false;
+  const int fb0_n = g_vexa_fb0_draw_n;
+  g_vexa_fb0_draw_n = 0;
+  const int frame_event_n = g_vexa_frame_event_n;
+  g_vexa_frame_event_n = 0;
+  const int frame_binds_len = g_vexa_frame_binds_len;
+  g_vexa_frame_binds_len = 0;
+  char frame_binds[sizeof(g_vexa_frame_binds)];
+  memcpy(frame_binds, g_vexa_frame_binds, sizeof(frame_binds));
+  g_vexa_frame_binds[0] = 0;
+  VexaFrameEvent frame_events[48];
+  memcpy(frame_events, g_vexa_frame_events, sizeof(frame_events));
+  if (overflow > 0) {
+    fprintf(stderr, "[VEXA][PRESENT] fbo tracking overflow +%u (nfbo=%zu fb0=%d)\n", overflow, nfbo, drew_fb0);
+  }
+  if (drew_fb0 && nfbo > 0) {
+    // fb0 was touched but offscreen FBOs also got draws: dump the candidates
+    // we are dropping so we can see if the real frame stayed in an FBO.
+    static int fb0_probe_logs = 0;
+    if (fb0_probe_logs < 256) {
+      ++fb0_probe_logs;
+      GLint prev_read = 0;
+      ::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+      std::string cand;
+      char tmp[96];
+      for (size_t i = 0; i < nfbo; ++i) {
+        const GLuint f = g_vexa_frame_fbos[i].fbo;
+        ::glBindFramebuffer(GL_READ_FRAMEBUFFER, f);
+        GLint ctype = 0, cname = 0, cw = 0, ch = 0;
+        ::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &ctype);
+        ::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &cname);
+        if (ctype == GL_TEXTURE) {
+          GLint level = 0, prev_tex = 0;
+          ::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                  GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+          ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+          ::glBindTexture(GL_TEXTURE_2D, cname);
+          ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_WIDTH, &cw);
+          ::glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_HEIGHT, &ch);
+          ::glBindTexture(GL_TEXTURE_2D, prev_tex);
+        } else if (ctype == GL_RENDERBUFFER) {
+          GLint prev_rb = 0;
+          ::glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
+          ::glBindRenderbuffer(GL_RENDERBUFFER, cname);
+          ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &cw);
+          ::glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &ch);
+          ::glBindRenderbuffer(GL_RENDERBUFFER, prev_rb);
+        }
+        snprintf(tmp, sizeof(tmp), " f%u:%ux%u(t%d x%u)", f, cw, ch,
+                 ctype == GL_TEXTURE ? cname : -1, g_vexa_frame_fbos[i].draws);
+        cand += tmp;
+      }
+      ::glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+      char draws[384];
+      int off = 0;
+      for (int i = 0; i < fb0_n; ++i) {
+        const auto& d = g_vexa_fb0_draws[i];
+        off += snprintf(draws + off, sizeof(draws) - off,
+                        " [m%x n%d vp%dx%d p%u t%d b%d]", d.mode, d.count, d.vp_w, d.vp_h, d.prog,
+                        d.tex, d.blend);
+      }
+      fprintf(stderr, "[VEXA][PRESENT] fb0 drawn (%u draws blit=%d)%s | skipped:%s\n", fb0_draws,
+              fb0_blit, draws, cand.c_str());
+      // Ordered event log: binds and draw targets in issue order.
+      char events[512];
+      int eoff = snprintf(events, sizeof(events), "binds %.*s draws", frame_binds_len, frame_binds);
+      for (int i = 0; i < frame_event_n && eoff < (int)sizeof(events) - 16; ++i) {
+        const auto& ev = frame_events[i];
+        eoff += snprintf(events + eoff, sizeof(events) - eoff, " %c%u(p%u)", ev.fbo ? 'F' : 'B',
+                         ev.fbo ? ev.fbo : 0, ev.prog);
+      }
+      fprintf(stderr, "[VEXA][PRESENT] %s\n", events);
+      // Dump what is actually about to be presented (fb0 pixels before swap).
+      static int fb0_dumps = 0;
+      if (fb0_dumps < 12) {
+        ++fb0_dumps;
+        GLint vp[4] = {};
+        ::glGetIntegerv(GL_VIEWPORT, vp);
+        const GLint w = vp[2] > 0 ? vp[2] : 2712;
+        const GLint h = vp[3] > 0 ? vp[3] : 1220;
+        std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
+        ::glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        ::glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        const GLenum rd_err = ::glGetError();
+        char path[192];
+        snprintf(path, sizeof(path),
+                 "/data/data/com.critical.vexaemulator/files/artifacts/ets2/fb0_d%u_%dx%d.ppm",
+                 fb0_draws, w, h);
+        if (FILE* f = fopen(path, "wb")) {
+          fprintf(f, "P6\n%d %d\n255\n", w, h);
+          for (GLint yy = h - 1; yy >= 0; --yy)
+            for (GLint xx = 0; xx < w; ++xx) {
+              const uint8_t* p = px.data() + (static_cast<size_t>(yy) * w + xx) * 4;
+              fputc(p[0], f);
+              fputc(p[1], f);
+              fputc(p[2], f);
+            }
+          fclose(f);
+        }
+        fprintf(stderr, "[VEXA][PRESENT] fb0 dump err=0x%x -> %s\n", rd_err, path);
+      }
+    }
+  }
   if (drew_fb0 || nfbo == 0) {
     return;
   }
@@ -1770,6 +1922,30 @@ static void VexaPresentFallback() {
   EGLint sw = 0, sh = 0;
   eglQuerySurface(g_vexa_glx.display, g_vexa_glx.surface, EGL_WIDTH, &sw);
   eglQuerySurface(g_vexa_glx.display, g_vexa_glx.surface, EGL_HEIGHT, &sh);
+  {
+    // A presented target that flips between FBO ids/sizes on consecutive
+    // frames is the visible-flicker signature (VS Bat Country inverse).
+    static GLuint last_dfbo = 0;
+    static int last_w = 0, last_h = 0;
+    static int flips = 0;
+    if (dfbo != last_dfbo || w != last_w || h != last_h) {
+      ++flips;
+      if (flips < 32) {
+        std::string cand;
+        char tmp[64];
+        for (size_t i = 0; i < nfbo; ++i) {
+          snprintf(tmp, sizeof(tmp), "%s%u(x%u)", i ? " " : "", g_vexa_frame_fbos[i].fbo,
+                   g_vexa_frame_fbos[i].draws);
+          cand += tmp;
+        }
+        fprintf(stderr, "[VEXA][PRESENT] winner change fbo=%d %dx%d draws=%d (prev=%d %dx%d) cands: %s\n", dfbo,
+                w, h, best_draws, last_dfbo, last_w, last_h, cand.c_str());
+      }
+      last_dfbo = dfbo;
+      last_w = w;
+      last_h = h;
+    }
+  }
   static int logged = 0;
   if (logged < 3) {
     ++logged;
@@ -2502,7 +2678,10 @@ static void VexaBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint src
   GLint draw_fbo = 0;
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
   if (draw_fbo == 0) {
-    g_vexa_fb0_drawn = true;
+    if (eglGetCurrentSurface(EGL_DRAW) == g_vexa_glx.surface) {
+      g_vexa_fb0_drawn = true;
+      g_vexa_fb0_blit = true;
+    }
     VexaNotePresentDest(dstX0, dstY0, dstX1, dstY1);
     const int dw = dstX1 >= dstX0 ? dstX1 - dstX0 : dstX0 - dstX1;
     const int dh = dstY1 >= dstY0 ? dstY1 - dstY0 : dstY0 - dstY1;
@@ -2732,6 +2911,32 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
   }
   ++g_vexa_diag_draws;
   VexaTrackFrameFbo(g_vexa_diag_drawfbo);
+  if (g_vexa_frame_event_n < 48) {
+    auto& ev = g_vexa_frame_events[g_vexa_frame_event_n++];
+    ev.seq = ++g_vexa_frame_seq;
+    ev.fbo = g_vexa_diag_drawfbo;
+    ev.count = count;
+    GLint prog = 0;
+    ::glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    ev.prog = static_cast<GLuint>(prog);
+  }
+  if (g_vexa_diag_drawfbo == 0 && g_vexa_fb0_draw_n < 8) {
+    GLint vp[4] = {};
+    ::glGetIntegerv(GL_VIEWPORT, vp);
+    GLint prog = 0;
+    ::glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    auto& d = g_vexa_fb0_draws[g_vexa_fb0_draw_n++];
+    d.mode = mode;
+    d.count = count;
+    d.vp_w = vp[2];
+    d.vp_h = vp[3];
+    d.prog = static_cast<GLuint>(prog);
+    ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &d.tex);
+    ::glGetIntegerv(GL_BLEND, &d.blend);
+    ::glGetIntegerv(GL_BLEND_SRC_RGB, &d.blend_src);
+    ::glGetIntegerv(GL_BLEND_DST_RGB, &d.blend_dst);
+    ::glGetBooleanv(GL_COLOR_WRITEMASK, d.mask);
+  }
   if (g_vexa_trace_frame) {
     GLint dfbo = -1;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
@@ -3458,6 +3663,12 @@ static void fexfn_impl_libGL_glBindFramebuffer(GLenum target, GLuint framebuffer
   g_vexa_diag_curfbo = framebuffer;
   if (target != GL_READ_FRAMEBUFFER) {
     g_vexa_diag_drawfbo = framebuffer;
+    int n = g_vexa_frame_binds_len;
+    if (n < (int)sizeof(g_vexa_frame_binds) - 8) {
+      g_vexa_frame_binds_len +=
+          snprintf(g_vexa_frame_binds + n, sizeof(g_vexa_frame_binds) - n, "%s%u",
+                   n ? ">" : "", framebuffer);
+    }
   }
   ++g_vexa_diag_bindfbo;
   if (g_vexa_trace_frame) {

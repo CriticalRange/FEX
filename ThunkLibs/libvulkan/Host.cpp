@@ -163,7 +163,7 @@ static void VexaAdpfOnPresent() {
     // Wait until Unity has spawned its render threads.
     if (frames < 180 || frames % 60 != 0) return;
     const char* env = std::getenv("VEXA_ADPF");
-    if (env && std::strcmp(env, "0") == 0) {
+    if ((env && std::strcmp(env, "0") == 0) || access("/data/data/com.critical.vexaemulator/files/vk_test_adpf_off.flag", F_OK) == 0) {
       disabled = true;
       return;
     }
@@ -265,6 +265,7 @@ static VkResult FEXFN_IMPL(vkAcquireNextImageKHR)(VkDevice device, VkSwapchainKH
   stats.Add("acquire", start, result, cpuStart);
   return result;
 }
+static VkResult VexaRotSubmit(VkQueue queue, const VkPresentInfoKHR& info, std::vector<VkSemaphore>& waits);
 static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* info) {
   if(auto f=reinterpret_cast<PFN_vkQueuePresentKHR>(VexaX11Proc("vkQueuePresentKHR")))return f(queue,info);
   if (info) {
@@ -279,6 +280,18 @@ static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfo
     if (lost) {
       fprintf(stderr, "[VEXA][VK] present dropped: runtime window replaced\n");
       return VK_ERROR_SURFACE_LOST_KHR;
+    }
+  }
+  VkPresentInfoKHR rotated;
+  std::vector<VkSemaphore> rotatedWaits;
+  if (info) {
+    const VkResult rot = VexaRotSubmit(queue, *info, rotatedWaits);
+    if (rot != VK_SUCCESS) return rot;
+    if (!rotatedWaits.empty()) {
+      rotated = *info;
+      rotated.waitSemaphoreCount = rotatedWaits.size();
+      rotated.pWaitSemaphores = rotatedWaits.data();
+      info = &rotated;
     }
   }
   auto present = [&] {
@@ -595,6 +608,7 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
 static VkPhysicalDevice g_vexa_physical_device = VK_NULL_HANDLE;
 #ifndef IS_32BIT_THUNK
 static void VexaDestroyPassProfiles(VkDevice device);
+#include "vulkan_prerotate.inc"
 #include "vulkan_gpu_profile.inc"
 #include "vulkan_pass_profile.inc"
 #include "vulkan_shader_opt.inc"
@@ -632,6 +646,8 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
     return VK_ERROR_INITIALIZATION_FAILED;
   }
   VkSwapchainCreateInfoKHR copy = *a_1;
+  int32_t rotMode = -1;
+  VkSurfaceTransformFlagBitsKHR rotTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
   // Offscreen performance experiments may opt out of FIFO pacing. Never
   // request a mode the actual Android surface does not advertise.
   const char* mailbox = std::getenv("VEXA_VK_MAILBOX");
@@ -650,6 +666,21 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
     VkSurfaceCapabilitiesKHR caps {};
     const VkResult caps_result = LDR_PTR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(g_vexa_physical_device, copy.surface, &caps);
     if (caps_result == VK_SUCCESS) {
+      // Diagnostic only: isolate swapchain backpressure without changing the
+      // game's resolution, shader work, or synchronization primitives.
+      int testImageCount = 0;
+      if (FILE* f = fopen("/data/data/com.critical.vexaemulator/files/vk_test_images", "r")) {
+        if (fscanf(f, "%d", &testImageCount) != 1) testImageCount = 0;
+        fclose(f);
+      }
+      if (testImageCount) {
+        const int requested = testImageCount;
+        if (requested >= 2 && requested <= 4 && static_cast<uint32_t>(requested) >= caps.minImageCount &&
+            (!caps.maxImageCount || static_cast<uint32_t>(requested) <= caps.maxImageCount)) {
+          fprintf(stderr, "[VEXA][VK-TEST] images %u -> %d mode=%d\n", copy.minImageCount, requested, int(copy.presentMode));
+          copy.minImageCount = requested;
+        }
+      }
       const bool real_extent = caps.currentExtent.width != 0xFFFFFFFFu && caps.currentExtent.height != 0xFFFFFFFFu && caps.currentExtent.width > 0 &&
                                caps.currentExtent.height > 0;
       if (real_extent && (copy.imageExtent.width != caps.currentExtent.width || copy.imageExtent.height != caps.currentExtent.height)) {
@@ -667,7 +698,17 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
                 (unsigned)caps.supportedCompositeAlpha);
         copy.compositeAlpha = alpha;
       }
+#ifndef IS_32BIT_THUNK
+      rotMode = VexaRotMode(copy, caps);
+      if (rotMode >= 0) rotTransform = caps.currentTransform;
+#endif
     }
+  }
+  const VkSwapchainCreateInfoKHR guest = copy;
+  if (rotMode >= 0) {
+    copy.preTransform = rotTransform;
+    if (rotMode != 2) std::swap(copy.imageExtent.width, copy.imageExtent.height);
+    copy.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   }
   if (LDR_PTR(vkGetDeviceProcAddr)) {
     void* create_swapchain = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateSwapchainKHR");
@@ -679,7 +720,18 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
     fprintf(stderr, "[VEXA][VK] vkCreateSwapchainKHR is missing\n");
     return VK_ERROR_EXTENSION_NOT_PRESENT;
   }
-  const VkResult result = LDR_PTR(vkCreateSwapchainKHR)(a_0, &copy, nullptr, a_3);
+  VkResult result = LDR_PTR(vkCreateSwapchainKHR)(a_0, &copy, nullptr, a_3);
+#ifndef IS_32BIT_THUNK
+  if (rotMode >= 0 && result == VK_SUCCESS && !VexaRotCreate(a_0, *a_3, guest, copy.imageExtent, rotMode)) {
+    // The retired oldSwapchain cannot be reused for the unrotated retry.
+    VexaRotFailed = true;
+    fprintf(stderr, "[VEXA][VK] pre-rotation setup failed; using compositor rotation\n");
+    LDR_PTR(vkDestroySwapchainKHR)(a_0, *a_3, nullptr);
+    copy = guest;
+    copy.oldSwapchain = VK_NULL_HANDLE;
+    result = LDR_PTR(vkCreateSwapchainKHR)(a_0, &copy, nullptr, a_3);
+  }
+#endif
   if (result == VK_SUCCESS && a_3 && *a_3) {
     std::lock_guard lk(g_vk_wsi_mutex);
     if (const auto it = g_vk_surface_serial.find(copy.surface); it != g_vk_surface_serial.end()) {
@@ -687,7 +739,7 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
     } else {
       g_vk_swapchain_serial[*a_3] = VexaRuntimeSurfaceSerial();
     }
-    g_vk_swapchain_extent[*a_3] = copy.imageExtent;
+    g_vk_swapchain_extent[*a_3] = guest.imageExtent;
   }
 #ifndef IS_32BIT_THUNK
   if (VexaVkProfileEnabled()) {
@@ -718,12 +770,22 @@ static void FEXFN_IMPL(vkDestroySurfaceKHR)(VkInstance a, VkSurfaceKHR b, const 
 }
 static void FEXFN_IMPL(vkDestroySwapchainKHR)(VkDevice a, VkSwapchainKHR b, const VkAllocationCallbacks* c) {
   auto bridge = reinterpret_cast<PFN_vkDestroySwapchainKHR>(VexaX11Proc("vkDestroySwapchainKHR"));
+#ifndef IS_32BIT_THUNK
+  VexaRotDestroy(b);
+#endif
   if (bridge) bridge(a, b, c); else LDR_PTR(vkDestroySwapchainKHR)(a, b, c);
   std::lock_guard lk(g_vk_wsi_mutex);
   g_vk_swapchain_serial.erase(b);
   g_vk_swapchain_extent.erase(b);
 }
-VEXA_WSI_RETURN(vkGetSwapchainImagesKHR,(VkDevice a,VkSwapchainKHR b,uint32_t *c,VkImage *d),(a,b,c,d))
+static VkResult FEXFN_IMPL(vkGetSwapchainImagesKHR)(VkDevice a, VkSwapchainKHR b, uint32_t* c, VkImage* d) {
+  if (auto bridge = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(VexaX11Proc("vkGetSwapchainImagesKHR"))) return bridge(a, b, c, d);
+#ifndef IS_32BIT_THUNK
+  VkResult result;
+  if (VexaRotImages(b, c, d, result)) return result;
+#endif
+  return LDR_PTR(vkGetSwapchainImagesKHR)(a, b, c, d);
+}
 VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceSupportKHR,(VkPhysicalDevice a,uint32_t b,VkSurfaceKHR c,VkBool32 *d),(a,b,c,d))
 VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceFormatsKHR,(VkPhysicalDevice a,VkSurfaceKHR b,uint32_t *c,VkSurfaceFormatKHR *d),(a,b,c,d))
 VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfacePresentModesKHR,(VkPhysicalDevice a,VkSurfaceKHR b,uint32_t *c,VkPresentModeKHR *d),(a,b,c,d))
@@ -826,6 +888,9 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
   auto ret = LDR_PTR(vkCreateDevice)(a_0, effective, nullptr, &out);
 #if defined(BUILD_ANDROID)
   if(ret==VK_SUCCESS){using Register=void(*)(VkPhysicalDevice,VkDevice,const VkDeviceCreateInfo*);if(auto f=reinterpret_cast<Register>(VexaX11Proc("VexaRegisterX11Device")))f(a_0,out,effective);}
+#ifndef IS_32BIT_THUNK
+  if (ret == VK_SUCCESS) VexaRotRecordDevice(out, effective);
+#endif
 #endif
   *a_3.get_pointer() = to_guest(to_host_layout(out));
 

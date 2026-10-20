@@ -152,6 +152,10 @@ static VkResult FEXFN_IMPL(vkQueueSubmit)(VkQueue queue, uint32_t count, const V
 static void FEXFN_IMPL(vkDestroyDevice)(VkDevice device, const VkAllocationCallbacks*) {
   VexaDestroyPassProfiles(device);
   {
+    std::lock_guard lock {VexaRotMutex};
+    VexaRotDeviceQueues.erase(device);
+  }
+  {
     std::lock_guard lock {VexaGpuProfilesMutex};
     for (auto it = VexaGpuProfiles.begin(); it != VexaGpuProfiles.end();) {
       if (it->second->Device == device) it = VexaGpuProfiles.erase(it);
