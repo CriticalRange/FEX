@@ -211,8 +211,9 @@ bool GLGuestTraceEnabled() {
 struct ScopedGLGuestTrace {
   explicit ScopedGLGuestTrace(const char* fn_)
     : fn {fn_ ? fn_ : "<null>"}
-    , seq {GLGuestTraceSeq.fetch_add(1, std::memory_order_acq_rel) + 1} {
+    , seq {0} {
     if (!GLGuestTraceEnabled()) return;
+    seq = GLGuestTraceSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
     fprintf(stderr,
                  "[libGL-guest] call-enter seq=%llu fn=%s\n",
                  static_cast<unsigned long long>(seq),
@@ -274,6 +275,10 @@ void glDeleteLists(GLuint list, GLsizei range);
 void glShadeModel(GLenum mode);
 void glLightfv(GLenum light, GLenum pname, const GLfloat* params);
 void glMaterialfv(GLenum face, GLenum pname, const GLfloat* params);
+void glTexEnvf(GLenum target, GLenum pname, GLfloat param);
+void glTexEnvi(GLenum target, GLenum pname, GLint param);
+void glTexEnvfv(GLenum target, GLenum pname, const GLfloat* params);
+void glTexEnviv(GLenum target, GLenum pname, const GLint* params);
 const char* glXQueryExtensionsString(void* display, int screen);
 void* glXGetCurrentDisplay();
 void* glXChooseFBConfig(void* display, int screen, const int* attributes, int* num_items);
@@ -722,6 +727,10 @@ uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
   if (procname == "glShadeModel") return reinterpret_cast<uintptr_t>(glShadeModel);
   if (procname == "glLightfv") return reinterpret_cast<uintptr_t>(glLightfv);
   if (procname == "glMaterialfv") return reinterpret_cast<uintptr_t>(glMaterialfv);
+  if (procname == "glTexEnvf") return reinterpret_cast<uintptr_t>(glTexEnvf);
+  if (procname == "glTexEnvi") return reinterpret_cast<uintptr_t>(glTexEnvi);
+  if (procname == "glTexEnvfv") return reinterpret_cast<uintptr_t>(glTexEnvfv);
+  if (procname == "glTexEnviv") return reinterpret_cast<uintptr_t>(glTexEnviv);
 #else
   (void)procname;
 #endif
@@ -1494,6 +1503,12 @@ VEXA_GL_GUEST_EXPORT void glLightfv(GLenum /*light*/, GLenum /*pname*/, const GL
 VEXA_GL_GUEST_EXPORT void glMaterialfv(GLenum /*face*/, GLenum pname, const GLfloat* params) {
   vexa_ff::material(pname, params);
 }
+// Texture-env state is not part of the emulated fixed-function pipeline; games
+// (Warband) link these directly, so they must exist even as no-ops.
+VEXA_GL_GUEST_EXPORT void glTexEnvf(GLenum /*target*/, GLenum /*pname*/, GLfloat /*param*/) {}
+VEXA_GL_GUEST_EXPORT void glTexEnvi(GLenum /*target*/, GLenum /*pname*/, GLint /*param*/) {}
+VEXA_GL_GUEST_EXPORT void glTexEnvfv(GLenum /*target*/, GLenum /*pname*/, const GLfloat* /*params*/) {}
+VEXA_GL_GUEST_EXPORT void glTexEnviv(GLenum /*target*/, GLenum /*pname*/, const GLint* /*params*/) {}
 
 // glMapBuffer is intentionally NOT defined here (see libvexa_glmap.c): exporting it from libGL makes
 // Unity (Megabonk, Vulkan mode) take its desktop-GL path and crash.

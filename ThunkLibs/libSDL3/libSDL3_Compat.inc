@@ -1096,6 +1096,82 @@ void VexaAnnouncePadSDL3() {
   CompatPushEvent(event);
 }
 
+namespace {
+// Surface -> window coordinate transform for pointer records (same scheme as
+// the SDL2 thunk): prefer the GL host's published /tmp/vexa-present map, else
+// recompute the aspect-fit from the SDL window size + /tmp/vexa-fit.
+struct VexaPointerTransform {
+  int64_t base_x = 0;
+  int64_t base_y = 0;
+  int64_t num_x = 1;
+  int64_t num_y = 1;
+  int64_t den_x = 1;
+  int64_t den_y = 1;
+  bool valid = false;
+};
+
+VexaPointerTransform VexaComputePointerTransform() {
+  VexaPointerTransform t {};
+  int vals[10] = {};
+  bool have_map = false;
+  if (FILE* f = std::fopen("/tmp/vexa-present", "r")) {
+    have_map = std::fscanf(f, "%d %d %d %d %d %d %d %d %d %d",
+                           &vals[0], &vals[1], &vals[2], &vals[3], &vals[4],
+                           &vals[5], &vals[6], &vals[7], &vals[8], &vals[9]) == 10;
+    std::fclose(f);
+  }
+  if (have_map && vals[6] > 0 && vals[7] > 0 && vals[8] > 0 && vals[9] > 0) {
+    t.base_x = vals[4];
+    t.base_y = vals[5];
+    t.num_x = vals[6];
+    t.num_y = vals[7];
+    t.den_x = vals[8];
+    t.den_y = vals[9];
+    t.valid = true;
+    return t;
+  }
+  int surface_w = have_map ? vals[8] : 0;
+  int surface_h = have_map ? vals[9] : 0;
+  if (surface_w <= 0 || surface_h <= 0) {
+    if (FILE* f = std::fopen("/tmp/vexa-window-size", "r")) {
+      std::fscanf(f, "%d %d", &surface_w, &surface_h);
+      std::fclose(f);
+    }
+  }
+  int win_w = 0;
+  int win_h = 0;
+  GetFallbackWindowSize(&win_w, &win_h);
+  if (surface_w <= 0 || surface_h <= 0 || win_w <= 0 || win_h <= 0) {
+    return t;
+  }
+  bool aspect = false;
+  if (FILE* f = std::fopen("/tmp/vexa-fit", "r")) {
+    char buf[16] = {};
+    if (std::fgets(buf, sizeof(buf), f)) {
+      aspect = std::strncmp(buf, "aspect", 6) == 0;
+    }
+    std::fclose(f);
+  }
+  int fw = surface_w;
+  int fh = surface_h;
+  if (aspect) {
+    fh = static_cast<int>((static_cast<int64_t>(surface_w) * win_h + win_w / 2) / win_w);
+    if (fh > surface_h) {
+      fh = surface_h;
+      fw = static_cast<int>((static_cast<int64_t>(surface_h) * win_w + win_h / 2) / win_h);
+    }
+  }
+  t.base_x = -((surface_w - fw) / 2);
+  t.base_y = -((surface_h - fh) / 2);
+  t.num_x = win_w;
+  t.num_y = win_h;
+  t.den_x = fw;
+  t.den_y = fh;
+  t.valid = true;
+  return t;
+}
+} // namespace
+
 void VexaPollPointerEvents() {
   std::lock_guard<std::mutex> guard(PointerMutex);
   const auto now = std::chrono::steady_clock::now();
@@ -1115,6 +1191,7 @@ void VexaPollPointerEvents() {
     unsigned char rec[16];
     int handled = 0;
     const Uint64 timestamp = SDL_GetTicksNS();
+    const VexaPointerTransform transform = VexaComputePointerTransform();
     while (handled < 64 && read(fd, rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec))) {
       PointerOffset += sizeof(rec);
       ++handled;
@@ -1190,14 +1267,28 @@ void VexaPollPointerEvents() {
       }
       SDL_Event event {};
       if (type == 6 || type == 4 || type == 5) {
-        const float fx = static_cast<float>(x);
-        const float fy = static_cast<float>(y);
+        float fx = static_cast<float>(x);
+        float fy = static_cast<float>(y);
+        if (transform.valid) {
+          fx = static_cast<float>(transform.base_x + (static_cast<int64_t>(x) * transform.num_x) / transform.den_x);
+          fy = static_cast<float>(transform.base_y + (static_cast<int64_t>(y) * transform.num_y) / transform.den_y);
+        }
+        const int x_button = (state >> 24) & 0xff;
+        const bool is_wheel = x_button == 4 || x_button == 5;
+        const Uint8 sdl_button = x_button == 3 ? SDL_BUTTON_RIGHT
+                               : x_button == 2 ? SDL_BUTTON_MIDDLE
+                                               : SDL_BUTTON_LEFT;
+        const Uint32 sdl_mask = sdl_button == SDL_BUTTON_RIGHT ? SDL_BUTTON_RMASK
+                              : sdl_button == SDL_BUTTON_MIDDLE ? SDL_BUTTON_MMASK
+                                                                : SDL_BUTTON_LMASK;
         const float oldX = CompatMouseX.exchange(fx);
         const float oldY = CompatMouseY.exchange(fy);
-        if (type == 4) {
-          CompatMouseButtons |= SDL_BUTTON_LMASK;
-        } else if (type == 5) {
-          CompatMouseButtons &= ~static_cast<Uint32>(SDL_BUTTON_LMASK);
+        if (!is_wheel) {
+          if (type == 4) {
+            CompatMouseButtons |= sdl_mask;
+          } else if (type == 5) {
+            CompatMouseButtons &= ~sdl_mask;
+          }
         }
         if (type == 6 || oldX != fx || oldY != fy) {
           event.type = SDL_EVENT_MOUSE_MOTION;
@@ -1210,12 +1301,25 @@ void VexaPollPointerEvents() {
           event.motion.yrel = fy - oldY;
           CompatPushEvent(event);
         }
-        if (type != 6) {
+        if (type != 6 && is_wheel) {
+          if (type == 4) {
+            SDL_Event wheel {};
+            wheel.type = SDL_EVENT_MOUSE_WHEEL;
+            wheel.wheel.timestamp = timestamp;
+            wheel.wheel.windowID = 1;
+            wheel.wheel.x = 0;
+            wheel.wheel.y = x_button == 4 ? 1.0f : -1.0f;
+            wheel.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+            wheel.wheel.mouse_x = fx;
+            wheel.wheel.mouse_y = fy;
+            CompatPushEvent(wheel);
+          }
+        } else if (type != 6) {
           SDL_Event button {};
           button.type = type == 4 ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
           button.button.timestamp = timestamp;
           button.button.windowID = 1;
-          button.button.button = SDL_BUTTON_LEFT;
+          button.button.button = sdl_button;
           button.button.down = type == 4;
           button.button.clicks = 1;
           button.button.x = fx;

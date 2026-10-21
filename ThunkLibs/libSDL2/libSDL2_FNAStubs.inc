@@ -636,7 +636,9 @@ extern "C" SDL_Finger* SDL_GetTouchFinger(SDL_TouchID touchID, int index) {  ret
 // covers only the state queries and warps SDL2-CS may poke at startup.
 
 extern "C" Uint32 SDL_GetMouseState(int *x, int *y) {
-
+  // State-polling games (e.g. Warband) never call SDL_PollEvent/PumpEvents;
+  // without this the /tmp/vexa-pointer pump never runs and all input dies.
+  VexaSDL2PollPointerEvents();
   if (x) {
     *x = CompatMouseX.load(std::memory_order_relaxed);
   }
@@ -650,7 +652,7 @@ extern "C" Uint32 SDL_GetGlobalMouseState(int *x, int *y) {
   return SDL_GetMouseState(x, y);
 }
 extern "C" Uint32 SDL_GetRelativeMouseState(int *x, int *y) {
-
+  VexaSDL2PollPointerEvents();
   if (x) {
     *x = CompatMouseRelX.exchange(0, std::memory_order_relaxed);
   }
@@ -671,7 +673,7 @@ extern "C" int SDL_CaptureMouse(SDL_bool enabled) {  return 0; }
 
 extern "C" SDL_Window* SDL_GetKeyboardFocus(void) {  return nullptr; }
 extern "C" const Uint8* SDL_GetKeyboardState(int *numkeys) {
-
+  VexaSDL2PollPointerEvents();
   if (numkeys) {
     *numkeys = SDL_NUM_SCANCODES;
   }
@@ -681,6 +683,7 @@ extern "C" void SDL_ResetKeyboard(void) {
   std::memset(CompatKeyStates, 0, sizeof(CompatKeyStates));
 }
 extern "C" SDL_Keymod SDL_GetModState(void) {
+  VexaSDL2PollPointerEvents();
   return static_cast<SDL_Keymod>(CurrentModState.load(std::memory_order_acquire));
 }
 extern "C" void SDL_SetModState(SDL_Keymod modstate) {

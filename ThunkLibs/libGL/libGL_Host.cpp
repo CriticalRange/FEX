@@ -22,6 +22,7 @@ $end_info$
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "clone_binary_cache.h"
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -206,6 +207,14 @@ static bool VexaGLVerbose() {
 }
 #define VEXA_LOGV(...) do { if (VexaGLVerbose()) fprintf(stderr, __VA_ARGS__); } while (0)
 
+// Heavy GL diagnostics (synchronous KHR_debug callbacks, present-path pixel
+// readbacks and framebuffer dumps) are opt-in: create files/vexa_gldbg.flag.
+static bool VexaGLDebugEnabled() {
+  static const int enabled =
+    access("/data/data/com.critical.vexaemulator/files/vexa_gldbg.flag", F_OK) == 0 ? 1 : 0;
+  return enabled != 0;
+}
+
 #ifdef BUILD_ANDROID
 void GLHostLogCurrentEGLState(const char* site) {
   const EGLDisplay display = eglGetCurrentDisplay();
@@ -335,10 +344,11 @@ void GLHostLogDuration(const char* call, uint64_t elapsed_ns) {
 struct ScopedGLCallTimer {
   explicit ScopedGLCallTimer(const char* name_)
     : name {name_}
-    , start_ns {GLHostNowNs()} {
+    , start_ns {VexaGLVerbose() ? GLHostNowNs() : 0} {
     GLHostMarkProgress(name);
   }
   ~ScopedGLCallTimer() {
+    if (!start_ns) return;
     const uint64_t elapsed_ns = GLHostNowNs() - start_ns;
     GLHostLogDuration(name, elapsed_ns);
     GLHostMarkProgress(name);
@@ -1718,6 +1728,9 @@ static void GL_APIENTRY VexaGLDebugCallback(GLenum source, GLenum type, GLuint i
 }
 
 static void VexaInstallGLDebugOnce() {
+  // GL_DEBUG_OUTPUT_SYNCHRONOUS makes the driver run its validation branch on
+  // every GL call; only install the callback when diagnostics are requested.
+  if (!VexaGLDebugEnabled()) return;
   static bool done = false;
   if (done) {
     return;
@@ -1770,7 +1783,7 @@ static void VexaPresentFallback() {
     // fb0 was touched but offscreen FBOs also got draws: dump the candidates
     // we are dropping so we can see if the real frame stayed in an FBO.
     static int fb0_probe_logs = 0;
-    if (fb0_probe_logs < 256) {
+    if (VexaGLDebugEnabled() && fb0_probe_logs < 256) {
       ++fb0_probe_logs;
       GLint prev_read = 0;
       ::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
@@ -1961,7 +1974,8 @@ static void VexaPresentFallback() {
   {
     static int calls = 0, sampled = 0;
     ++calls;
-    if (calls == 5 || calls == 500 || calls == 1500 || calls == 3000 || calls == 8000) {
+    if (VexaGLDebugEnabled() &&
+        (calls == 5 || calls == 500 || calls == 1500 || calls == 3000 || calls == 8000)) {
       ++sampled;
       ::glBindFramebuffer(GL_READ_FRAMEBUFFER, dfbo);
       while (::glGetError() != GL_NO_ERROR) {
@@ -2176,7 +2190,7 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
     const char* trace_flag = "/data/data/com.critical.vexaemulator/files/unity_trace_frame.flag";
     const bool trace_requested = access(trace_flag, F_OK) == 0;
     if (trace_requested) unlink(trace_flag);
-    g_vexa_trace_frame = (diag_swaps == 600 || trace_requested) ? 1 : 0;
+    g_vexa_trace_frame = trace_requested ? 1 : 0;
     if (g_vexa_trace_frame) {
       fprintf(stderr, "[VEXA][TRACE] begin frame after swap %d tid=%ld\n", diag_swaps, (long)syscall(SYS_gettid));
     }
@@ -2355,6 +2369,10 @@ static GLint g_vexa_guest_x = 0;
 static GLint g_vexa_guest_y = 0;
 static GLsizei g_vexa_guest_w = 0;
 static GLsizei g_vexa_guest_h = 0;
+// Largest near-origin fb0 viewport: the guest's drawable size. Direct-draw
+// games never blit, so VexaCoverPresent derives their pointer map from this.
+static GLsizei g_vexa_win_w = 0;
+static GLsizei g_vexa_win_h = 0;
 
 static void VexaNoteGuestViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
   // The 300x300 EnsureGlx viewport is below half of the 1280x720 guest window.
@@ -2365,6 +2383,11 @@ static void VexaNoteGuestViewport(GLint x, GLint y, GLsizei width, GLsizei heigh
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
   if (draw_fbo != 0) {
     return;
+  }
+  if (x <= 1 && y <= 1 &&
+      static_cast<int64_t>(width) * height > static_cast<int64_t>(g_vexa_win_w) * g_vexa_win_h) {
+    g_vexa_win_w = width;
+    g_vexa_win_h = height;
   }
   if (g_vexa_guest_x == x && g_vexa_guest_y == y && g_vexa_guest_w == width && g_vexa_guest_h == height) {
     return;
@@ -2438,6 +2461,9 @@ static VexaFitRect VexaFitFor(int win_w, int win_h, int sw, int sh) {
   return {(sw - fw) / 2, (sh - fh) / 2, fw, fh};
 }
 
+static void VexaPublishPresentMap(int x0, int y0, int cw, int ch, int sx, int sy, int src_w, int src_h, int sw,
+                                  int sh);
+
 static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
   static bool logged = false;
   static bool logged_fbo = false;
@@ -2459,6 +2485,20 @@ static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei
   if (rect.ok && VexaCornerShrink(x, y, width, height, rect.surface_w, rect.surface_h)) {
     const VexaFitRect fit = VexaFitFor(width, height, rect.surface_w, rect.surface_h);
     glViewport(fit.x, fit.y, fit.w, fit.h);
+    // The window-sized viewport is where the guest's content lands, fitted
+    // into the surface. Publish it so the SDL2/X11 input paths undo the same
+    // letterbox transform even when the game never blits (VexaCoverPresent
+    // only runs on the swap path).
+    if (x <= 1 && y <= 1 &&
+        static_cast<int64_t>(width) * height >=
+            static_cast<int64_t>(g_vexa_win_w) * g_vexa_win_h) {
+      const int sx = static_cast<int>(-static_cast<int64_t>(fit.x) * width / fit.w);
+      const int sy = static_cast<int>(-static_cast<int64_t>(fit.y) * height / fit.h);
+      const int src_w = static_cast<int>(static_cast<int64_t>(width) * rect.surface_w / fit.w);
+      const int src_h = static_cast<int>(static_cast<int64_t>(height) * rect.surface_h / fit.h);
+      VexaPublishPresentMap(0, rect.surface_h - height, width, height, sx, sy, src_w, src_h, rect.surface_w,
+                            rect.surface_h);
+    }
     if (!logged) {
       logged = true;
       fprintf(stderr, "[VEXA][GL] glViewport corner %d,%d %dx%d -> 0,0 %dx%d\n", x, y, width, height, rect.surface_w,
@@ -2593,16 +2633,23 @@ static void VexaNotePresentDest(GLint dstX0, GLint dstY0, GLint dstX1, GLint dst
 }
 
 static void VexaCoverPresent() {
-  if (!g_present_ready) {
+  int x0, y0, cw, ch;
+  if (g_present_ready) {
+    x0 = g_present_x0;
+    y0 = g_present_y0;
+    cw = g_present_x1 - x0;
+    ch = g_present_y1 - y0;
+    g_present_ready = false;
+  } else if (g_vexa_win_w >= 64 && g_vexa_win_h >= 64) {
+    // The guest draws straight to fb0 instead of blitting: its window-sized
+    // viewport is the content rect the pointer map must undo.
+    x0 = 0;
+    y0 = 0;
+    cw = g_vexa_win_w;
+    ch = g_vexa_win_h;
+  } else {
     return;
   }
-  const int x0 = g_present_x0;
-  const int y0 = g_present_y0;
-  const int x1 = g_present_x1;
-  const int y1 = g_present_y1;
-  g_present_ready = false;
-  const int cw = x1 - x0;
-  const int ch = y1 - y0;
   const VexaVisibleRect surface = VexaVisibleRectFor(cw, ch);
   const int sw = surface.surface_w;
   const int sh = surface.surface_h;
@@ -3249,6 +3296,8 @@ static bool VexaDemoteOutputs(std::string& src, const std::vector<std::string>& 
 
 // Builds a separable clone of the pipeline's vertex program with the varyings
 // the fragment stage doesn't read removed, and installs it into the pipeline.
+#include "clone_binary_cache.inc"
+
 static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
   GLint vs_prog = 0, fs_prog = 0;
   ::glGetProgramPipelineiv(pipe, GL_VERTEX_SHADER, &vs_prog);
@@ -3315,33 +3364,39 @@ static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
   }
   if (!VexaDemoteOutputs(src, unused)) return 0;
 
-  const GLuint shader = ::glCreateShader(GL_VERTEX_SHADER);
-  const char* sp = src.c_str();
-  ::glShaderSource(shader, 1, &sp, nullptr);
-  ::glCompileShader(shader);
-  GLint compiled = 0;
-  ::glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
-  if (!compiled) {
-    GLint len = 0;
-    ::glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
-    std::string log(static_cast<size_t>(len > 0 ? len : 1), '\0');
-    if (len > 0) ::glGetShaderInfoLog(shader, len, nullptr, log.data());
-    fprintf(stderr, "[VEXA][PIPE] clone compile failed vs=%d: %.200s\n", (int)vs_prog, log.c_str());
+  GLuint clone = VexaLoadCloneBinary(src);
+  const bool binary_hit = clone != 0;
+  if (!binary_hit) {
+    const GLuint shader = ::glCreateShader(GL_VERTEX_SHADER);
+    const char* sp = src.c_str();
+    ::glShaderSource(shader, 1, &sp, nullptr);
+    ::glCompileShader(shader);
+    GLint compiled = 0;
+    ::glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (!compiled) {
+      GLint len = 0;
+      ::glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
+      std::string log(static_cast<size_t>(len > 0 ? len : 1), '\0');
+      if (len > 0) ::glGetShaderInfoLog(shader, len, nullptr, log.data());
+      fprintf(stderr, "[VEXA][PIPE] clone compile failed vs=%d: %.200s\n", (int)vs_prog, log.c_str());
+      ::glDeleteShader(shader);
+      return 0;
+    }
+    clone = ::glCreateProgram();
+    ::glProgramParameteri(clone, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    if (VexaCloneCacheEnabled()) ::glProgramParameteri(clone, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+    ::glAttachShader(clone, shader);
+    ::glLinkProgram(clone);
+    ::glDetachShader(clone, shader);
     ::glDeleteShader(shader);
-    return 0;
-  }
-  const GLuint clone = ::glCreateProgram();
-  ::glProgramParameteri(clone, GL_PROGRAM_SEPARABLE, GL_TRUE);
-  ::glAttachShader(clone, shader);
-  ::glLinkProgram(clone);
-  ::glDetachShader(clone, shader);
-  ::glDeleteShader(shader);
-  GLint linked = 0;
-  ::glGetProgramiv(clone, GL_LINK_STATUS, &linked);
-  if (!linked) {
-    fprintf(stderr, "[VEXA][PIPE] clone link failed vs=%d clone=%u\n", (int)vs_prog, clone);
-    ::glDeleteProgram(clone);
-    return 0;
+    GLint linked = 0;
+    ::glGetProgramiv(clone, GL_LINK_STATUS, &linked);
+    if (!linked) {
+      fprintf(stderr, "[VEXA][PIPE] clone link failed vs=%d clone=%u\n", (int)vs_prog, clone);
+      ::glDeleteProgram(clone);
+      return 0;
+    }
+    VexaRememberCloneBinary(clone, src);
   }
 
   // Uniform locations differ between programs; remember the mapping so
@@ -3397,10 +3452,10 @@ static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
   ::glUseProgramStages(pipe, GL_VERTEX_SHADER_BIT, clone);
   while (::glGetError() != GL_NO_ERROR) {
   }
-  fprintf(stderr, "[VEXA][PIPE] pipeline=%d vs=%d clone=%u stripped=%zu inst=%d grass=%d\n",
+  fprintf(stderr, "[VEXA][PIPE] pipeline=%d vs=%d clone=%u stripped=%zu inst=%d grass=%d binary_hit=%d\n",
           (int)pipe, (int)vs_prog, clone, unused.size(),
           src.find("gl_InstanceID") != std::string::npos ? 1 : 0,
-          src.find("_GrassBuffer") != std::string::npos ? 1 : 0);
+          src.find("_GrassBuffer") != std::string::npos ? 1 : 0, binary_hit ? 1 : 0);
   return clone;
 }
 
@@ -4387,6 +4442,7 @@ struct VexaUnpackScope {
 };
 
 void VexaBCLogOnce(const char* where, GLenum fmt) {
+  if (!VexaGLVerbose()) return;
   static std::atomic<int> logged {0};
   if (logged.fetch_add(1) < 16) {
     VEXA_LOGV("[VEXA][BCN] %s fmt=0x%x -> software decode\n", where, fmt);
@@ -5802,6 +5858,12 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
         source.append(host_strings[i]);
       }
     }
+    // Legacy GLSL 1.10 shaders (Warband) ship without a #version directive.
+    // Compiling them raw makes the driver default to ESSL 100 anyway, so give
+    // them the version line explicitly and let the rewrite below add precision.
+    if (!source.empty() && source.find("#version") == std::string::npos) {
+      source.insert(0, "#version 100\n");
+    }
     const auto version_pos = source.find("#version");
     if (version_pos != std::string::npos) {
       const auto line_end = source.find('\n', version_pos);
@@ -5831,7 +5893,7 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
             source.find("imageBuffer") != std::string::npos ||
             source.find("GL_ARB_separate_shader_objects") != std::string::npos;
         rewritten_version = needs_es_320 ? "#version 320 es" : "#version 300 es";
-      } else if (desktop && desktop_version >= 110 && desktop_version <= 120) {
+      } else if (desktop && desktop_version >= 100 && desktop_version <= 120) {
         rewritten_version = "#version 100";
       }
       if (rewritten_version) {

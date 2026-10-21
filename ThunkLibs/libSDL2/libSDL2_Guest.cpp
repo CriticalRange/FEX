@@ -603,6 +603,90 @@ void CompatUpdateModState(SDL_Keycode key, bool down) {
   CurrentModState.store(state, std::memory_order_release);
 }
 
+// Surface -> window coordinate transform for pointer records.
+// Pointer records arrive in Android surface pixels while the game renders its
+// SDL window through the GL host's fit/stretch path: stretched to the full
+// surface or letterboxed centered. The GL host publishes the applied mapping
+// to /tmp/vexa-present (x0 y0 cw ch sx sy src_w src_h sw sh, same layout the
+// fake X11 consumes); when it is absent or malformed we recompute the same
+// aspect-fit from the SDL window size so taps still land on the content.
+struct VexaPointerTransform {
+  // out = base + surface_px * scale_num / scale_den
+  int64_t base_x = 0;
+  int64_t base_y = 0;
+  int64_t num_x = 1;
+  int64_t num_y = 1;
+  int64_t den_x = 1;
+  int64_t den_y = 1;
+  bool valid = false;
+};
+
+VexaPointerTransform VexaComputePointerTransform() {
+  VexaPointerTransform t {};
+  int vals[10] = {};
+  bool have_map = false;
+  if (FILE* f = std::fopen("/tmp/vexa-present", "r")) {
+    have_map = std::fscanf(f, "%d %d %d %d %d %d %d %d %d %d",
+                           &vals[0], &vals[1], &vals[2], &vals[3], &vals[4],
+                           &vals[5], &vals[6], &vals[7], &vals[8], &vals[9]) == 10;
+    std::fclose(f);
+  }
+  if (have_map && vals[6] > 0 && vals[7] > 0 && vals[8] > 0 && vals[9] > 0) {
+    // mx = sx + px * src_w / sw ; my = sy + py * src_h / sh. The x0/y0 fields
+    // encode the fake-X11 window layout (bottom-origin, surface-height); the
+    // SDL window's content always starts at its own 0,0 so they are skipped.
+    t.base_x = vals[4];
+    t.base_y = vals[5];
+    t.num_x = vals[6];
+    t.num_y = vals[7];
+    t.den_x = vals[8];
+    t.den_y = vals[9];
+    t.valid = true;
+    return t;
+  }
+  // Fallback: recompute VexaFitFor from the SDL window size and the surface
+  // size carried by /tmp/vexa-window-size (or the malformed map fields).
+  int surface_w = have_map ? vals[8] : 0;
+  int surface_h = have_map ? vals[9] : 0;
+  if (surface_w <= 0 || surface_h <= 0) {
+    if (FILE* f = std::fopen("/tmp/vexa-window-size", "r")) {
+      std::fscanf(f, "%d %d", &surface_w, &surface_h);
+      std::fclose(f);
+    }
+  }
+  int win_w = 0;
+  int win_h = 0;
+  GetFallbackWindowSize(&win_w, &win_h);
+  if (surface_w <= 0 || surface_h <= 0 || win_w <= 0 || win_h <= 0) {
+    return t;
+  }
+  bool aspect = false;
+  if (FILE* f = std::fopen("/tmp/vexa-fit", "r")) {
+    char buf[16] = {};
+    if (std::fgets(buf, sizeof(buf), f)) {
+      aspect = std::strncmp(buf, "aspect", 6) == 0;
+    }
+    std::fclose(f);
+  }
+  int fw = surface_w;
+  int fh = surface_h;
+  if (aspect) {
+    fh = static_cast<int>((static_cast<int64_t>(surface_w) * win_h + win_w / 2) / win_w);
+    if (fh > surface_h) {
+      fh = surface_h;
+      fw = static_cast<int>((static_cast<int64_t>(surface_h) * win_w + win_h / 2) / win_h);
+    }
+  }
+  t.base_x = -((surface_w - fw) / 2);
+  t.base_y = -((surface_h - fh) / 2);
+  t.num_x = win_w;
+  t.num_y = win_h;
+  t.den_x = fw;
+  t.den_y = fh;
+  t.valid = true;
+  return t;
+}
+
 void VexaSDL2PollPointerEvents() {
   std::lock_guard<std::mutex> guard(PointerMutex);
   const auto now = std::chrono::steady_clock::now();
@@ -612,6 +696,8 @@ void VexaSDL2PollPointerEvents() {
   PointerLastPoll = now;
   const int fd = open("/tmp/vexa-pointer", O_RDONLY);
   if (fd < 0) {
+    static int logged_open_fail = 0;
+    if (!logged_open_fail) { logged_open_fail = 1; fprintf(stderr, "[VEXA][SDL2-IN] open /tmp/vexa-pointer failed: %d\n", errno); }
     return;
   }
   const off_t end = lseek(fd, 0, SEEK_END);
@@ -622,6 +708,7 @@ void VexaSDL2PollPointerEvents() {
     unsigned char rec[16];
     int handled = 0;
     const Uint32 timestamp = GetTicksMS();
+    const VexaPointerTransform transform = VexaComputePointerTransform();
     while (handled < 64 && read(fd, rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec))) {
       PointerOffset += sizeof(rec);
       ++handled;
@@ -701,14 +788,34 @@ void VexaSDL2PollPointerEvents() {
       }
       SDL_Event event {};
       if (type == 6 || type == 4 || type == 5) {
-        const Sint32 fx = static_cast<Sint32>(x);
-        const Sint32 fy = static_cast<Sint32>(y);
+        Sint32 fx = static_cast<Sint32>(x);
+        Sint32 fy = static_cast<Sint32>(y);
+        if (transform.valid) {
+          fx = static_cast<Sint32>(transform.base_x + (fx * transform.num_x) / transform.den_x);
+          fy = static_cast<Sint32>(transform.base_y + (fy * transform.num_y) / transform.den_y);
+        }
+        if (type != 6 && (state & 0x40000000) == 0 && getenv("VEXA_SDL2_IN_TRACE")) {
+          fprintf(stderr, "[VEXA][SDL2-IN] mouse type=%d -> fx=%d fy=%d valid=%d\n", type, fx, fy,
+                  transform.valid ? 1 : 0);
+        }
+        // state bits 24-31 carry the X11 button number (0 = plain touch/left,
+        // 2 = middle, 3 = right, 4/5 = wheel up/down emitted as press+release).
+        const int x_button = (state >> 24) & 0xff;
+        const bool is_wheel = x_button == 4 || x_button == 5;
+        const Uint8 sdl_button = x_button == 3 ? SDL_BUTTON_RIGHT
+                               : x_button == 2 ? SDL_BUTTON_MIDDLE
+                                               : SDL_BUTTON_LEFT;
+        const Uint32 sdl_mask = sdl_button == SDL_BUTTON_RIGHT ? SDL_BUTTON_RMASK
+                              : sdl_button == SDL_BUTTON_MIDDLE ? SDL_BUTTON_MMASK
+                                                                : SDL_BUTTON_LMASK;
         const Sint32 old_x = CompatMouseX.exchange(fx);
         const Sint32 old_y = CompatMouseY.exchange(fy);
-        if (type == 4) {
-          CompatMouseButtons |= SDL_BUTTON_LMASK;
-        } else if (type == 5) {
-          CompatMouseButtons &= ~static_cast<Uint32>(SDL_BUTTON_LMASK);
+        if (!is_wheel) {
+          if (type == 4) {
+            CompatMouseButtons |= sdl_mask;
+          } else if (type == 5) {
+            CompatMouseButtons &= ~sdl_mask;
+          }
         }
         if (type == 6 || old_x != fx || old_y != fy) {
           event.type = SDL_MOUSEMOTION;
@@ -724,13 +831,27 @@ void VexaSDL2PollPointerEvents() {
           CompatMouseRelY.fetch_add(event.motion.yrel, std::memory_order_relaxed);
           QueueSyntheticEvent(event);
         }
-        if (type != 6) {
+        if (type != 6 && is_wheel) {
+          if (type == 4) {
+            SDL_Event wheel {};
+            wheel.type = SDL_MOUSEWHEEL;
+            wheel.wheel.timestamp = timestamp;
+            wheel.wheel.windowID = PrimaryWindowId;
+            wheel.wheel.which = 0;
+            wheel.wheel.x = 0;
+            wheel.wheel.y = x_button == 4 ? 1 : -1;
+            wheel.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+            wheel.wheel.mouseX = fx;
+            wheel.wheel.mouseY = fy;
+            QueueSyntheticEvent(wheel);
+          }
+        } else if (type != 6) {
           SDL_Event button {};
           button.type = type == 4 ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
           button.button.timestamp = timestamp;
           button.button.windowID = PrimaryWindowId;
           button.button.which = 0;
-          button.button.button = SDL_BUTTON_LEFT;
+          button.button.button = sdl_button;
           button.button.state = type == 4 ? SDL_PRESSED : SDL_RELEASED;
           button.button.clicks = 1;
           button.button.x = fx;
@@ -754,6 +875,31 @@ void VexaSDL2PollPointerEvents() {
           event.key.keysym.sym = key;
           event.key.keysym.mod = CurrentModState.load(std::memory_order_acquire);
           QueueSyntheticEvent(event);
+          // Games using SDL text entry (name fields etc.) need SDL_TEXTINPUT;
+          // synthesize it from printable key presses honoring the shift state.
+          if (down) {
+            const Uint16 mods = CurrentModState.load(std::memory_order_acquire);
+            if ((mods & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) == 0) {
+              const bool shift = (mods & KMOD_SHIFT) != 0;
+              int cp = 0;
+              if (key >= SDLK_a && key <= SDLK_z) {
+                cp = shift ? static_cast<int>(key - SDLK_a + 'A') : static_cast<int>(key);
+              } else if (key >= SDLK_0 && key <= SDLK_9) {
+                static const char shifted[] = ")!@#$%^&*(";
+                cp = shift ? shifted[key - SDLK_0] : static_cast<int>(key);
+              } else if (key >= 0x20 && key < 0x7f) {
+                cp = static_cast<int>(key);
+              }
+              if (cp) {
+                SDL_Event text {};
+                text.type = SDL_TEXTINPUT;
+                text.text.timestamp = timestamp;
+                text.text.windowID = PrimaryWindowId;
+                text.text.text[0] = static_cast<char>(cp);
+                QueueSyntheticEvent(text);
+              }
+            }
+          }
         }
       }
     }
