@@ -1776,7 +1776,7 @@ static void VexaPresentFallback() {
   g_vexa_frame_binds[0] = 0;
   VexaFrameEvent frame_events[48];
   memcpy(frame_events, g_vexa_frame_events, sizeof(frame_events));
-  if (overflow > 0) {
+  if (VexaGLDebugEnabled() && overflow > 0) {
     fprintf(stderr, "[VEXA][PRESENT] fbo tracking overflow +%u (nfbo=%zu fb0=%d)\n", overflow, nfbo, drew_fb0);
   }
   if (drew_fb0 && nfbo > 0) {
@@ -2958,7 +2958,11 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
   }
   ++g_vexa_diag_draws;
   VexaTrackFrameFbo(g_vexa_diag_drawfbo);
-  if (g_vexa_frame_event_n < 48) {
+  // These snapshots are consumed only by the debug present probe. Keep the
+  // FBO tracking above active for presentation, without querying driver state
+  // for diagnostic records during normal rendering.
+  const bool capture_present_debug = VexaGLDebugEnabled();
+  if (capture_present_debug && g_vexa_frame_event_n < 48) {
     auto& ev = g_vexa_frame_events[g_vexa_frame_event_n++];
     ev.seq = ++g_vexa_frame_seq;
     ev.fbo = g_vexa_diag_drawfbo;
@@ -2967,7 +2971,7 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
     ::glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
     ev.prog = static_cast<GLuint>(prog);
   }
-  if (g_vexa_diag_drawfbo == 0 && g_vexa_fb0_draw_n < 8) {
+  if (capture_present_debug && g_vexa_diag_drawfbo == 0 && g_vexa_fb0_draw_n < 8) {
     GLint vp[4] = {};
     ::glGetIntegerv(GL_VIEWPORT, vp);
     GLint prog = 0;
@@ -3718,11 +3722,13 @@ static void fexfn_impl_libGL_glBindFramebuffer(GLenum target, GLuint framebuffer
   g_vexa_diag_curfbo = framebuffer;
   if (target != GL_READ_FRAMEBUFFER) {
     g_vexa_diag_drawfbo = framebuffer;
-    int n = g_vexa_frame_binds_len;
-    if (n < (int)sizeof(g_vexa_frame_binds) - 8) {
-      g_vexa_frame_binds_len +=
-          snprintf(g_vexa_frame_binds + n, sizeof(g_vexa_frame_binds) - n, "%s%u",
-                   n ? ">" : "", framebuffer);
+    if (VexaGLDebugEnabled()) {
+      int n = g_vexa_frame_binds_len;
+      if (n < (int)sizeof(g_vexa_frame_binds) - 8) {
+        g_vexa_frame_binds_len +=
+            snprintf(g_vexa_frame_binds + n, sizeof(g_vexa_frame_binds) - n, "%s%u",
+                     n ? ">" : "", framebuffer);
+      }
     }
   }
   ++g_vexa_diag_bindfbo;
