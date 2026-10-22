@@ -15,6 +15,8 @@ $end_info$
 #include <cstdint>
 #include <chrono>
 #include <mutex>
+#include <memory>
+#include <algorithm>
 #include <sstream>
 #include <regex>
 #include <string>
@@ -64,6 +66,7 @@ $end_info$
 #endif
 
 #if defined(BUILD_ANDROID)
+#include "program_cache_state.inc"
 static int VexaGLHostFprintf(FILE* stream, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -1640,6 +1643,7 @@ static auto fexfn_impl_libGL_VEXA_CreateGlxContext(uintptr_t share) -> uintptr_t
   static uint32_t next_id = 1;
   uint32_t id;
   do { id = next_id++; } while (!id || g_vexa_contexts.contains(id));
+  VexaRegisterProgramContext(context, shared);
   g_vexa_contexts.emplace(id, VexaGuestGlxContext {context, pbuffer, window});
   fprintf(stderr, "[VEXA][GLX] create context=%p share=%p window=%d\n", context,
           reinterpret_cast<void*>(share), window);
@@ -1652,6 +1656,7 @@ static auto fexfn_impl_libGL_VEXA_DestroyGlxContext(uintptr_t id) -> void {
   if (it == g_vexa_contexts.end()) return;
   if (eglGetCurrentContext() == it->second.context)
     eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  VexaUnregisterProgramContext(it->second.context);
   eglDestroyContext(g_vexa_glx.display, it->second.context);
   if (it->second.pbuffer != EGL_NO_SURFACE) eglDestroySurface(g_vexa_glx.display, it->second.pbuffer);
   g_vexa_contexts.erase(it);
@@ -1663,12 +1668,18 @@ static auto fexfn_impl_libGL_VEXA_BindGlxSurface(uintptr_t id) -> int {
   if (it == g_vexa_contexts.end()) return 0;
   if (!VexaRefreshGlxSurface()) return 0;
   const auto& c = it->second;
-  if (eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, c.context) == EGL_TRUE) return 1;
+  if (eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, c.context) == EGL_TRUE) {
+    VexaSelectProgramContext(c.context);
+    return 1;
+  }
   const EGLint error = eglGetError();
   // A resource-upload context can be current concurrently with the render
   // context. EGL surfaces cannot be current on two threads at once.
   if (error == EGL_BAD_ACCESS &&
-      eglMakeCurrent(g_vexa_glx.display, c.pbuffer, c.pbuffer, c.context) == EGL_TRUE) return 1;
+      eglMakeCurrent(g_vexa_glx.display, c.pbuffer, c.pbuffer, c.context) == EGL_TRUE) {
+    VexaSelectProgramContext(c.context);
+    return 1;
+  }
   fprintf(stderr, "[VEXA][GLX] bind context=%p failed 0x%x\n", c.context, error);
   return 0;
 }
@@ -1685,6 +1696,7 @@ static auto fexfn_impl_libGL_VEXA_ReleaseGlxSurface() -> int {
     fprintf(stderr, "[VEXA][GLX] release failed 0x%x\n", eglGetError());
     return 0;
   }
+  VexaSelectProgramContext(EGL_NO_CONTEXT);
   return 1;
 }
 
@@ -2873,7 +2885,7 @@ uint64_t g_vexa_diag_dispatches = 0;
 uint64_t g_vexa_diag_clears = 0;
 uint64_t g_vexa_diag_useprog = 0;
 uint64_t g_vexa_diag_bindfbo = 0;
-static GLuint g_vexa_diag_curprog = 0;
+// Current program is tracked per EGL context (program_cache_state.inc).
 static GLuint g_vexa_diag_curfbo = 0;
 static GLuint g_vexa_diag_drawfbo = 0;
 
@@ -3143,7 +3155,7 @@ static void VexaPostDrawDiag() {
   }
 }
 
-static GLuint g_vexa_stage_program = 0;
+// Active stage program is tracked per EGL context.
 
 static GLuint VexaStageProgram() {
   if (g_vexa_stage_program) return g_vexa_stage_program;
@@ -3178,28 +3190,8 @@ static GLuint VexaStageProgram() {
 // eliminated), then swap it into the pipeline's vertex stage. The pipeline
 // stays a real pipeline; uniform and block-binding calls aimed at the
 // original program are mirrored to the clone.
-static std::unordered_map<GLuint, int> g_vexa_pipe_state;
-static GLuint g_vexa_intended_pipe = 0;
-// program -> attached shader ids / shader -> type, recorded in glAttachShader.
-// ETS2 detaches+deletes shaders after linking, so glGetAttachedShaders cannot
-// rebuild them; we recompile from the remembered translated sources instead.
-static std::unordered_map<GLuint, std::vector<GLuint>> g_vexa_prog_shaders;
-static std::unordered_map<GLuint, GLenum> g_vexa_shader_type;
-// program -> (type, translated source) snapshotted at link time. The
-// shader-keyed source cache evicts at 512 entries, so anything meant to
-// outlive the app's detach+delete churn must live here.
-static std::unordered_map<GLuint, std::vector<std::pair<GLenum, std::string>>> g_vexa_prog_sources;
-// program -> (type, source) for glCreateShaderProgramv direct creation.
-static std::unordered_map<GLuint, std::pair<GLenum, std::string>> g_vexa_prog_direct_source;
-static const std::string* VexaFindShaderSource(GLuint shader);
-// Copies the shader's retained source into dst and erases the shader-keyed
-// entry so the eviction cap cannot wipe sources a live program still needs.
-static bool VexaTakeShaderSource(GLuint shader, std::string* dst);
-
-// original program -> sibling separable programs installed in its place.
-static std::unordered_map<GLuint, std::vector<GLuint>> g_vexa_clones_of_prog;
-// clone program -> (original uniform location -> clone uniform location).
-static std::unordered_map<GLuint, std::unordered_map<GLint, GLint>> g_vexa_clone_locs;
+// Pipeline validation state is local to each EGL context.
+// Sources and clone metadata live in the EGL share group.
 
 static bool VexaIsNameChar(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
@@ -3303,6 +3295,8 @@ static bool VexaDemoteOutputs(std::string& src, const std::vector<std::string>& 
 #include "clone_binary_cache.inc"
 
 static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
+  VEXA_PROGRAM_LOCK();
+  const auto cache_start = std::chrono::steady_clock::now();
   GLint vs_prog = 0, fs_prog = 0;
   ::glGetProgramPipelineiv(pipe, GL_VERTEX_SHADER, &vs_prog);
   ::glGetProgramPipelineiv(pipe, GL_FRAGMENT_SHADER, &fs_prog);
@@ -3409,28 +3403,30 @@ static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
     GLint n = 0;
     ::glGetProgramInterfaceiv((GLuint)vs_prog, GL_UNIFORM, GL_ACTIVE_RESOURCES, &n);
     auto& lm = g_vexa_clone_locs[clone];
-    const GLenum props[] = {0x930E /* GL_LOCATION */, 0x92FB /* GL_ARRAY_SIZE */};
-    for (GLint i = 0; i < n && i < 128; ++i) {
-      GLint vals[2] = {-1, 1};
-      ::glGetProgramResourceiv((GLuint)vs_prog, GL_UNIFORM, (GLuint)i, 2, props, 2, nullptr, vals);
+    const GLenum props[] = {GL_LOCATION, GL_ARRAY_SIZE, GL_TYPE, GL_NAME_LENGTH};
+    for (GLint i = 0; i < n; ++i) {
+      GLint vals[4] = {-1, 1, GL_FLOAT, 0};
+      ::glGetProgramResourceiv((GLuint)vs_prog, GL_UNIFORM, (GLuint)i, 4, props, 4, nullptr, vals);
       if (vals[0] < 0) continue;
-      char uname[128] = {};
-      ::glGetProgramResourceName((GLuint)vs_prog, GL_UNIFORM, (GLuint)i, (GLsizei)sizeof(uname),
-                               nullptr, uname);
-      char* bracket = std::strchr(uname, '[');
-      if (bracket) *bracket = 0;
+      if (vals[3] <= 0) continue;
+      std::string uname(static_cast<size_t>(vals[3]), '\0');
+      GLsizei name_length = 0;
+      ::glGetProgramResourceName((GLuint)vs_prog, GL_UNIFORM, (GLuint)i, vals[3], &name_length, uname.data());
+      uname.resize(static_cast<size_t>(name_length));
       // Map every array element: element locations are not guaranteed to be
       // consecutive, so look each one up by name on both programs.
-      for (GLint e = 0; e < vals[1] && e < 64; ++e) {
-        char ename[160];
+      for (GLint e = 0; e < vals[1]; ++e) {
+        std::string ename = uname;
         if (vals[1] > 1) {
-          snprintf(ename, sizeof(ename), "%s[%d]", uname, e);
-        } else {
-          snprintf(ename, sizeof(ename), "%s", uname);
+          const auto bracket = ename.find("[0]");
+          const auto index = "[" + std::to_string(e) + "]";
+          if (bracket == std::string::npos) ename += index;
+          else ename.replace(bracket, 3, index);
         }
-        const GLint oloc = ::glGetUniformLocation((GLuint)vs_prog, ename);
+        const GLint oloc = ::glGetUniformLocation((GLuint)vs_prog, ename.c_str());
         if (oloc >= 0) {
-          lm[oloc] = ::glGetUniformLocation(clone, ename);
+          lm[oloc] = ::glGetUniformLocation(clone, ename.c_str());
+          VexaCopyUniform(static_cast<GLuint>(vs_prog), clone, oloc, lm[oloc], static_cast<GLenum>(vals[2]));
         }
       }
     }
@@ -3439,7 +3435,7 @@ static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
   {
     GLint n = 0;
     ::glGetProgramInterfaceiv((GLuint)vs_prog, GL_UNIFORM_BLOCK, GL_ACTIVE_RESOURCES, &n);
-    for (GLint i = 0; i < n && i < 16; ++i) {
+    for (GLint i = 0; i < n; ++i) {
       GLuint idx = (GLuint)i;
       GLint binding = -1;
       ::glGetActiveUniformBlockiv((GLuint)vs_prog, idx, GL_UNIFORM_BLOCK_BINDING, &binding);
@@ -3452,20 +3448,25 @@ static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
     }
   }
 
+  VexaProgramContext().OwnedClones[pipe] = {static_cast<GLuint>(vs_prog), clone};
   g_vexa_clones_of_prog[(GLuint)vs_prog].push_back(clone);
   ::glUseProgramStages(pipe, GL_VERTEX_SHADER_BIT, clone);
   while (::glGetError() != GL_NO_ERROR) {
   }
-  fprintf(stderr, "[VEXA][PIPE] pipeline=%d vs=%d clone=%u stripped=%zu inst=%d grass=%d binary_hit=%d\n",
+  const double cache_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cache_start).count();
+  fprintf(stderr, "[VEXA][PIPE] pipeline=%d vs=%d clone=%u stripped=%zu inst=%d grass=%d binary_hit=%d cache=%s build_ms=%.3f\n",
           (int)pipe, (int)vs_prog, clone, unused.size(),
           src.find("gl_InstanceID") != std::string::npos ? 1 : 0,
-          src.find("_GrassBuffer") != std::string::npos ? 1 : 0, binary_hit ? 1 : 0);
+          src.find("_GrassBuffer") != std::string::npos ? 1 : 0, binary_hit ? 1 : 0,
+          g_vexa_clone_hit_source, cache_ms);
   return clone;
 }
 
 // Validates each bound pipeline once. On failure, tries to repair it with a
 // stripped-output vertex clone (see VexaBuildStrippedVertexProgram).
 static void VexaPreDraw() {
+  VEXA_PROGRAM_LOCK();
+  VexaRefreshProgramGeneration();
   if (!g_vexa_intended_pipe) return;
   int st = g_vexa_pipe_state[g_vexa_intended_pipe];
   if (st != 0) return;
@@ -3487,9 +3488,10 @@ static void VexaPreDraw() {
 // ETS2 keeps a program pipeline bound and glUseProgram(0). glUniform* then
 // applies to program 0, and glGetUniformLocation(0) is rejected, so sampler
 // and material values stay at zero and the shaded frame is black.
-static std::unordered_set<GLuint> g_vexa_linked_programs;
+// Link-status cache belongs to the program share group.
 
 static GLuint VexaUniformTarget(GLuint program) {
+  VEXA_PROGRAM_LOCK();
   // Hot path: every glUniform* under a bound pipeline lands here with 0.
   if (!program && !g_vexa_diag_curprog) return VexaStageProgram();
   auto linked = [](GLuint candidate) {
@@ -3518,6 +3520,7 @@ static GLint VexaGL_glGetUniformLocation(GLuint program, const GLchar* name) {
 }
 
 static void VexaGL_glUniformBlockBinding(GLuint program, GLuint blockIndex, GLuint bindingPoint) {
+  VEXA_PROGRAM_LOCK();
   ::glUniformBlockBinding(program, blockIndex, bindingPoint);
   // Mirror to clone programs (block bindings are per-program state, and the
   // guest only knows about the original).
@@ -3532,6 +3535,9 @@ static void VexaGL_glUniformBlockBinding(GLuint program, GLuint blockIndex, GLui
 }
 
 static void VexaGL_glUseProgramStages(GLuint pipeline, GLbitfield stages, GLuint program) {
+  VEXA_PROGRAM_LOCK();
+  VexaRefreshProgramGeneration();
+  VexaReleasePipelineClone(pipeline, true);
   // GL_FRAGMENT_SHADER_BIT is 0x2. GL_ALL_SHADER_BITS is all ones.
   if ((stages & 0x2u) != 0 || stages == 0xFFFFFFFFu) g_vexa_stage_program = program;
   else if (!g_vexa_stage_program) g_vexa_stage_program = program;
@@ -3540,17 +3546,20 @@ static void VexaGL_glUseProgramStages(GLuint pipeline, GLbitfield stages, GLuint
 }
 
 static void VexaGL_glBindProgramPipeline(GLuint pipeline) {
-  if (!pipeline) g_vexa_stage_program = 0;
+  VEXA_PROGRAM_LOCK();
+  g_vexa_stage_program = 0;
   g_vexa_intended_pipe = pipeline;
   ::glBindProgramPipeline(pipeline);
 }
 
 static void VexaGL_glActiveShaderProgram(GLuint pipeline, GLuint program) {
+  VEXA_PROGRAM_LOCK();
   g_vexa_stage_program = program;
   ::glActiveShaderProgram(pipeline, program);
 }
 
 static void VexaGL_glProgramUniform1i(GLuint program, GLint location, GLint v0) {
+  VEXA_PROGRAM_LOCK();
   const GLuint target = VexaUniformTarget(program);
   if (target) ::glProgramUniform1i(target, location, v0);
   if (const auto it = g_vexa_clones_of_prog.find(program); it != g_vexa_clones_of_prog.end()) {
@@ -3565,6 +3574,7 @@ static void VexaGL_glProgramUniform1i(GLuint program, GLint location, GLint v0) 
 // cloned stage programs the same way the vector/matrix forms are.
 #define VEXA_WRAP_PROG_UNI_S(uname, T, decl, ...) \
 static void VexaGL_glProgramUniform##uname(GLuint program, GLint location, decl) { \
+  VEXA_PROGRAM_LOCK(); \
   ::glProgramUniform##uname(program, location, __VA_ARGS__); \
   if (const auto it = g_vexa_clones_of_prog.find(program); it != g_vexa_clones_of_prog.end()) { \
     for (GLuint c : it->second) { \
@@ -3594,6 +3604,7 @@ VEXA_WRAP_PROG_UNI_S(4ui, GLuint, VEXA_4V(GLuint), v0, v1, v2, v3)
 // Applies `apply(clone, mapped_location)` for every clone of `program`.
 template<typename F>
 static void VexaMirrorUniform(GLuint program, GLint location, F apply) {
+  VEXA_PROGRAM_LOCK();
   const auto it = g_vexa_clones_of_prog.find(program);
   if (it == g_vexa_clones_of_prog.end()) return;
   for (GLuint c : it->second) {
@@ -4688,10 +4699,20 @@ static void fexfn_impl_libGL_glCompressedTexSubImage3D(GLenum target, GLint leve
 
 using VexaProgramBinaryFn = void (*)(GLuint, GLenum, const void*, GLsizei);
 static void fexfn_impl_libGL_glProgramBinary(GLuint program, GLenum binaryFormat, const void* binary, GLsizei length) {
+  VEXA_PROGRAM_LOCK();
   static auto fn = reinterpret_cast<VexaProgramBinaryFn>(eglGetProcAddress("glProgramBinary"));
   static auto fn_oes = reinterpret_cast<VexaProgramBinaryFn>(eglGetProcAddress("glProgramBinaryOES"));
   if (fn) fn(program, binaryFormat, binary, length);
   else if (fn_oes) fn_oes(program, binaryFormat, binary, length);
+  GLint linked = GL_FALSE;
+  ::glGetProgramiv(program, GL_LINK_STATUS, &linked);
+  if (linked) {
+    g_vexa_prog_sources.erase(program);
+    g_vexa_prog_direct_source.erase(program);
+    g_vexa_linked_programs.erase(program);
+    ++VexaProgramContext().Shared->Generation;
+    VexaRefreshProgramGeneration();
+  }
 }
 
 using VexaGetProgramBinaryFn = void (*)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
@@ -4706,6 +4727,7 @@ static void fexfn_impl_libGL_glGetProgramBinary(GLuint program, GLsizei bufSize,
 
 #define VEXA_IMPL_PROG_UNIFORM_V(uname, T) \
 static void fexfn_impl_libGL_glProgramUniform##uname(GLuint program, GLint location, GLsizei count, const T* value) { \
+  VEXA_PROGRAM_LOCK(); \
   using Fn = void (*)(GLuint, GLint, GLsizei, const T*); \
   static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glProgramUniform" #uname)); \
   if (fn) fn(program, location, count, value); \
@@ -4732,6 +4754,7 @@ VEXA_IMPL_PROG_UNIFORM_V(4uiv, GLuint)
 
 #define VEXA_IMPL_PROG_UNIFORM_M(uname) \
 static void fexfn_impl_libGL_glProgramUniform##uname(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { \
+  VEXA_PROGRAM_LOCK(); \
   using Fn = void (*)(GLuint, GLint, GLsizei, GLboolean, const GLfloat*); \
   static Fn fn = reinterpret_cast<Fn>(eglGetProcAddress("glProgramUniform" #uname)); \
   if (fn) fn(program, location, count, transpose, value); \
@@ -5680,6 +5703,8 @@ static void VexaStripPerVertexRedeclaration(std::string* source) {
 // next failure can be reasoned about from the outside.
 
 #include <mutex>
+#include <memory>
+#include <algorithm>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unordered_map>
@@ -5687,8 +5712,7 @@ static void VexaStripPerVertexRedeclaration(std::string* source) {
 // VEXA_FIXES: Keep the last source we handed to each shader so a compile failure
 // can be dumped in full. The driver only reports a line and column, which is not
 // enough to reason about a rewritten shader from the outside.
-static std::mutex VexaShaderSourceMutex;
-static std::unordered_map<GLuint, std::string> VexaShaderSourceById;
+// Shader diagnostic sources belong to the program share group.
 
 static void VexaRememberShaderSource(GLuint shader, const std::string& source) {
   if (source.empty()) {
@@ -5699,21 +5723,6 @@ static void VexaRememberShaderSource(GLuint shader, const std::string& source) {
     VexaShaderSourceById.clear();
   }
   VexaShaderSourceById[shader] = source;
-}
-
-static const std::string* VexaFindShaderSource(GLuint shader) {
-  std::lock_guard lk(VexaShaderSourceMutex);
-  const auto it = VexaShaderSourceById.find(shader);
-  return it != VexaShaderSourceById.end() ? &it->second : nullptr;
-}
-
-static bool VexaTakeShaderSource(GLuint shader, std::string* dst) {
-  std::lock_guard lk(VexaShaderSourceMutex);
-  const auto it = VexaShaderSourceById.find(shader);
-  if (it == VexaShaderSourceById.end()) return false;
-  *dst = std::move(it->second);
-  VexaShaderSourceById.erase(it);
-  return true;
 }
 
 static void VexaDumpFailedShaderSource(GLuint shader, const char* info) {
@@ -6017,6 +6026,11 @@ void FEX_glShaderSource(GLuint shader, GLsizei count, uintptr_t strings, const G
 GLuint fexfn_impl_libGL_glCreateShader(GLenum a_0);
 void fexfn_impl_libGL_glAttachShader(GLuint a_0, GLuint a_1);
 void fexfn_impl_libGL_glDetachShader(GLuint a_0, GLuint a_1);
+GLuint fexfn_impl_libGL_glCreateProgram();
+void fexfn_impl_libGL_glGetProgramiv(GLuint program, GLenum pname, GLint* value);
+void fexfn_impl_libGL_glDeleteProgram(GLuint program);
+void fexfn_impl_libGL_glDeleteShader(GLuint shader);
+void fexfn_impl_libGL_glDeleteProgramPipelines(GLsizei count, const GLuint* pipelines);
 void fexfn_impl_libGL_glCompileShader(GLuint a_0);
 void fexfn_impl_libGL_glLinkProgram(GLuint a_0);
 void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1);
@@ -6406,6 +6420,11 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
                         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), 6);
     return result;
   }
+  if (name_sv == "glCreateProgram") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glCreateProgram);
+  if (name_sv == "glGetProgramiv") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetProgramiv);
+  if (name_sv == "glDeleteProgram") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDeleteProgram);
+  if (name_sv == "glDeleteShader") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDeleteShader);
+  if (name_sv == "glDeleteProgramPipelines") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glDeleteProgramPipelines);
   if (name_sv == "glCreateShader") {
     auto result = reinterpret_cast<VoidFn>(fexfn_impl_libGL_glCreateShader);
     VEXA_LOGV("[libGL-host] glXGetProcAddress('%s') => %p via create-shader-wrapper\n",
@@ -6932,9 +6951,68 @@ void fexfn_impl_libGL_glFlush() {
   ::glFlush();
 }
 
+
+GLuint fexfn_impl_libGL_glCreateProgram() {
+  VEXA_PROGRAM_LOCK();
+  VexaCollectProgramState();
+  const GLuint program = ::glCreateProgram();
+  if (program) {
+    g_vexa_prog_sources.erase(program);
+    g_vexa_prog_direct_source.erase(program);
+    g_vexa_linked_programs.erase(program);
+  }
+  return program;
+}
+
+void fexfn_impl_libGL_glDeleteProgram(GLuint program) {
+  VEXA_PROGRAM_LOCK();
+  if (!program || !::glIsProgram(program)) { ::glDeleteProgram(program); return; }
+  VexaProgramContext().Shared->Deleted.insert(program);
+  VexaCollectProgramState();
+}
+
+void fexfn_impl_libGL_glGetProgramiv(GLuint program, GLenum pname, GLint* value) {
+  VEXA_PROGRAM_LOCK();
+  if (pname == GL_DELETE_STATUS && VexaProgramContext().Shared->Deleted.contains(program)) {
+    *value = GL_TRUE;
+    return;
+  }
+  ::glGetProgramiv(program, pname, value);
+}
+
+void fexfn_impl_libGL_glDeleteShader(GLuint shader) {
+  VEXA_PROGRAM_LOCK();
+  ::glDeleteShader(shader);
+  // A deleted but attached shader remains valid; the driver retains its
+  // translated source until the last attachment goes away.
+  if (shader) VexaProgramContext().Shared->DeletedShaders.insert(shader);
+  VexaCollectProgramState();
+}
+
+void fexfn_impl_libGL_glDeleteProgramPipelines(GLsizei count, const GLuint* pipelines) {
+  VEXA_PROGRAM_LOCK();
+  if (count < 0 || (count && !pipelines)) { ::glDeleteProgramPipelines(count, pipelines); return; }
+  ::glDeleteProgramPipelines(count, pipelines);
+  for (GLsizei i = 0; i < count; ++i) {
+    VexaReleasePipelineClone(pipelines[i], false);
+    g_vexa_pipe_state.erase(pipelines[i]);
+    if (g_vexa_intended_pipe == pipelines[i]) {
+      g_vexa_intended_pipe = 0;
+      g_vexa_stage_program = 0;
+    }
+  }
+  VexaCollectProgramState();
+}
+
 GLuint fexfn_impl_libGL_glCreateShader(GLenum a_0) {
+  VEXA_PROGRAM_LOCK();
   GLHOST_TRACE_SCOPE();
   const GLuint shader = ::glCreateShader(a_0);
+  if (shader) {
+    VexaShaderSourceById.erase(shader);
+    VexaProgramContext().Shared->CompiledSources.erase(shader);
+    VexaProgramContext().Shared->DeletedShaders.erase(shader);
+  }
   VEXA_LOGV("[libGL-host] glCreateShader(type=0x%x) => %u\n",
                static_cast<unsigned>(a_0), static_cast<unsigned>(shader));
   return shader;
@@ -6970,15 +7048,6 @@ void fexfn_impl_libGL_glAttachShader(GLuint a_0, GLuint a_1) {
   LogShaderDriverError("attach-call", a_0, detail);
 #endif
   ::glAttachShader(a_0, a_1);
-  if (a_0 && a_1) {
-    auto& list = g_vexa_prog_shaders[a_0];
-    if (std::find(list.begin(), list.end(), a_1) == list.end()) {
-      list.push_back(a_1);
-    }
-    if (a_1 != 0) {
-      g_vexa_shader_type[a_1] = static_cast<GLenum>(shader_type);
-    }
-  }
   VEXA_LOGV("[libGL-host] glAttachShader done program=%u shader=%u\n",
                static_cast<unsigned>(a_0), static_cast<unsigned>(a_1));
 }
@@ -7017,10 +7086,12 @@ void fexfn_impl_libGL_glShaderSourceARB(GLuint a_0, GLsizei count, guest_layout<
 }
 
 void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
+  VEXA_PROGRAM_LOCK();
   GLHOST_TRACE_SCOPE();
   ::glCompileShader(a_0);
   GLint compiled = GL_FALSE;
   ::glGetShaderiv(a_0, GL_COMPILE_STATUS, &compiled);
+  if (compiled == GL_TRUE) VexaSnapshotCompiledShader(a_0);
   if (compiled != GL_TRUE) {
     static std::atomic<int> logs {0};
     if (logs.fetch_add(1) < 16) {
@@ -7045,33 +7116,19 @@ void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
 }
 
 void fexfn_impl_libGL_glLinkProgram(GLuint a_0) {
+  VEXA_PROGRAM_LOCK();
   GLHOST_TRACE_SCOPE();
   VEXA_LOGV("[libGL-host] glLinkProgram(%u) enter\n", static_cast<unsigned>(a_0));
   g_vexa_linked_programs.erase(a_0);
   ::glLinkProgram(a_0);
-  {
-    GLuint attached[64] = {};
-    GLsizei attached_count = 0;
-    ::glGetAttachedShaders(a_0, 64, &attached_count, attached);
-    // Snapshot of the program's shader set at link time: authoritative even
-    // after the app detaches/deletes shaders post-link.
-    auto& tracked = g_vexa_prog_shaders[a_0];
-    tracked.assign(attached, attached + attached_count);
-    auto& sources = g_vexa_prog_sources[a_0];
-    for (int i = 0; i < attached_count; ++i) {
-      GLint st = 0;
-      ::glGetShaderiv(attached[i], GL_SHADER_TYPE, &st);
-      g_vexa_shader_type[attached[i]] = static_cast<GLenum>(st);
-      std::string src;
-      if (VexaTakeShaderSource(attached[i], &src)) {
-        sources.push_back({static_cast<GLenum>(st), std::move(src)});
-      }
-    }
-  }
   GLint failed_status = 0;
   ::glGetProgramiv(a_0, GL_LINK_STATUS, &failed_status);
 #ifdef BUILD_ANDROID
-  if (failed_status) VexaLinkGrassBuffer(a_0);
+  if (failed_status) {
+    VexaSnapshotProgramSources(a_0);
+    VexaRefreshProgramGeneration();
+    VexaLinkGrassBuffer(a_0);
+  }
 #endif
   if (access("/data/data/com.critical.vexaemulator/files/unity_shader_dump.flag", F_OK) == 0) {
     GLuint shaders[8] = {};
@@ -7179,8 +7236,12 @@ GLuint fexfn_impl_libGL_glCreateShaderProgramv(GLuint a_0, GLsizei count, guest_
     sources[i] = host_layout<const char* const> {a_2.get_pointer()[i]}.data;
   }
 #endif
+  VEXA_PROGRAM_LOCK();
+  VexaCollectProgramState();
   const GLuint prog = fexldr_ptr_libGL_glCreateShaderProgramv(a_0, count, sources);
   if (prog != 0 && sources != nullptr) {
+    g_vexa_prog_sources.erase(prog);
+    g_vexa_linked_programs.erase(prog);
     std::string joined;
     for (GLsizei i = 0; i < count; ++i) {
       if (sources[i]) joined += sources[i];
@@ -7731,6 +7792,11 @@ extern "C" ExportEntry* fexthunks_exports_libGL() {
   VEXA_BIND_HOST_WRAPPER(glBindBufferBase)
   VEXA_BIND_HOST_WRAPPER(glBindBufferRange)
   VEXA_BIND_HOST_WRAPPER(glGetInternalformativ)
+  VEXA_BIND_HOST_WRAPPER(glCreateProgram)
+  VEXA_BIND_HOST_WRAPPER(glGetProgramiv)
+  VEXA_BIND_HOST_WRAPPER(glDeleteProgram)
+  VEXA_BIND_HOST_WRAPPER(glDeleteShader)
+  VEXA_BIND_HOST_WRAPPER(glDeleteProgramPipelines)
   VEXA_BIND_HOST_WRAPPER(glCreateShader)
   VEXA_BIND_HOST_WRAPPER(glCompileShader)
   VEXA_BIND_HOST_WRAPPER(glAttachShader)
