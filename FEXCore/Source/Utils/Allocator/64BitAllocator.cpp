@@ -547,7 +547,18 @@ void OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::
 OSAllocator_64Bit::OSAllocator_64Bit() {
   DetermineVASize();
 
+#ifdef __ANDROID__
+  // Bionic/Scudo and driver pthread stacks do not use the jemalloc mmap hook.
+  // Reserving every high VA leaves them only small fragmented holes: Portal
+  // aborts in bionic's shadow-call-stack mmap when it starts another thread.
+  // Keep FEX's host allocations above the guest's 4 GiB, but leave native
+  // mappings room to grow. This is virtual address space, not committed RAM.
+  constexpr uintptr_t AndroidPoolBegin=8ULL<<30;
+  constexpr uintptr_t AndroidPoolEnd=40ULL<<30;
+  auto Ranges = FEXCore::Allocator::StealMemoryRegion(AndroidPoolBegin, std::min(UPPER_BOUND,AndroidPoolEnd));
+#else
   auto Ranges = FEXCore::Allocator::StealMemoryRegion(LOWER_BOUND, UPPER_BOUND);
+#endif
 
   AllocateMemoryRegions(Ranges);
 }
