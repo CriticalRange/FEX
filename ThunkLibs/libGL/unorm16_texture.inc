@@ -79,6 +79,15 @@ static uint16_t VexaSwap16(uint16_t value) {
 
 // Repack one pixel into the GLES channel order. 565/5551/4444 stay packed.
 static void VexaRepackPixel(GLenum format, GLenum type, const uint8_t* src, uint8_t* dst) {
+  if (type==0x8367 || type==0x8035) {
+    // Desktop packed 8-bit components occupy a full 32-bit word. Falling
+    // through the 16-bit path drops blue/alpha (transparent yellow glyphs).
+    uint32_t value=0;std::memcpy(&value,src,4);
+    if(g_vexa_unpack_swap_bytes)value=__builtin_bswap32(value);
+    for(unsigned c=0;c<4;++c)dst[c]=static_cast<uint8_t>(value>>(type==0x8367?c*8:(3-c)*8));
+    if(format==0x80E1||format==0x80E0)std::swap(dst[0],dst[2]);
+    return;
+  }
   if (type == GL_UNSIGNED_BYTE && format == 0x80E1) {
     dst[0] = src[2];
     dst[1] = src[1];
@@ -150,7 +159,7 @@ static bool VexaUploadDesktopImage2D(bool allocate, GLenum target, GLint level, 
   const bool swap_channels = VexaDesktopNeedsChannelSwap(format) || type == 0x8035;
   const GLenum storage = VexaDesktopInternalFormat(internalformat, format, type);
   bool rgb_destination = false;
-  if (format == 0x80E1 && type == GL_UNSIGNED_BYTE) {
+  if ((format == 0x80E1 && type == GL_UNSIGNED_BYTE) || type == 0x8367 || type == 0x8035) {
     GLint destination = storage;
     if (!allocate) ::glGetTexLevelParameteriv(target, level, GL_TEXTURE_INTERNAL_FORMAT, &destination);
     rgb_destination = destination == GL_RGB8 || destination == GL_SRGB8 || destination == 0x8D62;
@@ -189,12 +198,9 @@ static bool VexaUploadDesktopImage2D(bool allocate, GLenum target, GLint level, 
       const uint8_t* pix = src + static_cast<size_t>(xx) * pixel_bytes;
       uint8_t* out = dst + static_cast<size_t>(xx) * output_bytes;
       if (rgb_destination) {
-        out[0] = pix[2]; out[1] = pix[1]; out[2] = pix[0];
-      } else if (type == 0x8035 && pixel_bytes == 4) {
-        out[0] = pix[3];
-        out[1] = pix[2];
-        out[2] = pix[1];
-        out[3] = pix[0];
+        uint8_t rgba[4];VexaRepackPixel(format,type,pix,rgba);std::memcpy(out,rgba,3);
+      } else if ((type == 0x8035 || type == 0x8367) && pixel_bytes == 4) {
+        VexaRepackPixel(format,type,pix,out);
       } else if (swap_channels) {
         VexaRepackPixel(format, type, pix, out);
       } else {
@@ -300,9 +306,10 @@ static void VexaGL_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
 }
 
 static bool VexaConvertDesktopVolume(GLenum format, GLenum type, GLsizei width, GLsizei height, GLsizei depth,
-                                    const void* data, std::vector<uint8_t>* converted) {
+                                    const void* data, std::vector<uint8_t>* converted, bool rgb_destination) {
   if (!VexaDesktopPackedFormat(format, type)) return false;
-  if (!data || width <= 0 || height <= 0 || depth <= 0) return true;
+  GLint source_pbo=0;::glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING,&source_pbo);
+  if ((!data&&!source_pbo) || width <= 0 || height <= 0 || depth <= 0) return true;
   GLint row = 0, align = 4, skip_x = 0, skip_y = 0, image_h = 0, skip_images = 0;
   ::glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row);
   ::glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
@@ -324,16 +331,18 @@ static bool VexaConvertDesktopVolume(GLenum format, GLenum type, GLsizei width, 
   if (length > static_cast<size_t>(INT32_MAX)) return true;
   VexaBCSource source(data, static_cast<GLsizei>(length));
   if (!source.ptr) return true;
-  converted->resize(static_cast<size_t>(width) * height * depth * pixel_bytes);
+  const int output_bytes=rgb_destination?3:pixel_bytes;
+  converted->resize(static_cast<size_t>(width) * height * depth * output_bytes);
   for (GLsizei z = 0; z < depth; ++z) {
     for (GLsizei yy = 0; yy < height; ++yy) {
       const uint8_t* src = source.ptr + first + static_cast<size_t>(z) * slice_stride + static_cast<size_t>(yy) * stride;
-      uint8_t* dst = converted->data() + (static_cast<size_t>(z) * height + yy) * width * pixel_bytes;
+      uint8_t* dst = converted->data() + (static_cast<size_t>(z) * height + yy) * width * output_bytes;
       const bool swap_channels = VexaDesktopNeedsChannelSwap(format);
       for (GLsizei xx = 0; xx < width; ++xx) {
         const uint8_t* pix = src + static_cast<size_t>(xx) * pixel_bytes;
-        uint8_t* out = dst + static_cast<size_t>(xx) * pixel_bytes;
-        if (swap_channels) VexaRepackPixel(format, type, pix, out);
+        uint8_t* out = dst + static_cast<size_t>(xx) * output_bytes;
+        if(rgb_destination){uint8_t rgba[4];VexaRepackPixel(format,type,pix,rgba);std::memcpy(out,rgba,3);}
+        else if (swap_channels || type==0x8035 || type==0x8367) VexaRepackPixel(format, type, pix, out);
         else std::memcpy(out, pix, pixel_bytes);
       }
     }
@@ -343,11 +352,13 @@ static bool VexaConvertDesktopVolume(GLenum format, GLenum type, GLsizei width, 
 
 static void VexaGL_glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
                                 GLsizei depth, GLint border, GLenum format, GLenum type, const void* data) {
+  const GLenum storage=VexaDesktopInternalFormat(internalformat,format,type);
+  const bool rgb_destination=(storage==GL_RGB8||storage==GL_SRGB8)&&((format==0x80E1&&type==GL_UNSIGNED_BYTE)||type==0x8367||type==0x8035);
   std::vector<uint8_t> converted;
-  if (VexaConvertDesktopVolume(format, type, width, height, depth, data, &converted)) {
+  if (VexaConvertDesktopVolume(format, type, width, height, depth, data, &converted,rgb_destination)) {
     VexaUnpackScope unpack;
     ::glTexImage3D(target, level, VexaDesktopInternalFormat(internalformat, format, type), width, height, depth, border,
-                   VexaDesktopUploadFormat(format, type), type, data ? converted.data() : nullptr);
+                   rgb_destination?GL_RGB:VexaDesktopUploadFormat(format, type), VexaDesktopUploadType(type), converted.empty() ? nullptr : converted.data());
     return;
   }
   ::glTexImage3D(target, level, internalformat, width, height, depth, border, format, type, data);
@@ -355,10 +366,12 @@ static void VexaGL_glTexImage3D(GLenum target, GLint level, GLint internalformat
 
 static void VexaGL_glTexSubImage3D(GLenum target, GLint level, GLint x, GLint y, GLint z, GLsizei width, GLsizei height,
                                   GLsizei depth, GLenum format, GLenum type, const void* data) {
+  GLint storage=0;::glGetTexLevelParameteriv(target,level,GL_TEXTURE_INTERNAL_FORMAT,&storage);
+  const bool rgb_destination=(storage==GL_RGB8||storage==GL_SRGB8)&&((format==0x80E1&&type==GL_UNSIGNED_BYTE)||type==0x8367||type==0x8035);
   std::vector<uint8_t> converted;
-  if (VexaConvertDesktopVolume(format, type, width, height, depth, data, &converted)) {
+  if (VexaConvertDesktopVolume(format, type, width, height, depth, data, &converted,rgb_destination)) {
     VexaUnpackScope unpack;
-    ::glTexSubImage3D(target, level, x, y, z, width, height, depth, VexaDesktopUploadFormat(format, type), type,
+    ::glTexSubImage3D(target, level, x, y, z, width, height, depth, rgb_destination?GL_RGB:VexaDesktopUploadFormat(format, type), VexaDesktopUploadType(type),
                       converted.data());
     return;
   }

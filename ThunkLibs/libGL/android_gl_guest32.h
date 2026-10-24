@@ -119,12 +119,26 @@ static void* fexfn_impl_libGL_glMapBufferRange(GLenum target, GLintptr offset, G
   if (VexaTboLog())
     fprintf(stderr, "[libGL-host] map target=%x buf=%d off=%lld len=%lld acc=%x tid=%d\n",
             target, VexaBoundBufferFor(target), (long long)offset, (long long)length, access, (int)gettid());
+  // WRITE_ONLY forbids guest reads; it does not invalidate untouched bytes.
+  // Preserve them through a separate native read mapping so the real mapping's
+  // access flags (and GL_BUFFER_ACCESS_FLAGS queries) remain unchanged. This
+  // can synchronize an UNSYNCHRONIZED hint, which is legal but less concurrent.
+  void* guest = nullptr;
+  if ((access & GL_MAP_WRITE_BIT) && !(access & (GL_MAP_READ_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT))) {
+    void* previous = ::glMapBufferRange(target, offset, length, GL_MAP_READ_BIT);
+    if (!previous) return nullptr;
+    guest = GuestMalloc && length > 0 && uint64_t(length) <= UINT32_MAX
+              ? GuestMalloc(static_cast<uint32_t>(length)) : nullptr;
+    if (guest) std::memcpy(guest, previous, length);
+    ::glUnmapBuffer(target);
+    if (!guest) return nullptr;
+  }
   void* host = ::glMapBufferRange(target, offset, length, access);
-  if (!host) return nullptr;
+  if (!host) { if (guest && GuestFree) GuestFree(guest); return nullptr; }
   // GLES rejects persistent/coherent mappings. Copy ordinary maps into guest
   // memory and copy writes back on explicit flush or unmap.
-  void* guest = GuestMalloc && length > 0 && uint64_t(length) <= UINT32_MAX
-                  ? GuestMalloc(static_cast<uint32_t>(length)) : nullptr;
+  if (!guest) guest = GuestMalloc && length > 0 && uint64_t(length) <= UINT32_MAX
+                        ? GuestMalloc(static_cast<uint32_t>(length)) : nullptr;
   if (!guest) { ::glUnmapBuffer(target); return nullptr; }
   if (access & GL_MAP_READ_BIT) std::memcpy(guest, host, length);
   std::lock_guard lock(VexaMapMutex);

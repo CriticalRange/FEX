@@ -471,6 +471,13 @@ void EnsureFramebufferAttachmentCompatPrelinked() {
 }
 
 std::string_view ResolveGLInvokerAlias(std::string_view procname) {
+  if (procname == "glBindBufferARB") return "glBindBuffer";
+  if (procname == "glDeleteBuffersARB") return "glDeleteBuffers";
+  if (procname == "glGenBuffersARB") return "glGenBuffers";
+  if (procname == "glBufferDataARB") return "glBufferData";
+  if (procname == "glBufferSubDataARB") return "glBufferSubData";
+  if (procname == "glMapBufferARB") return "glMapBufferOES";
+  if (procname == "glUnmapBufferARB") return "glUnmapBuffer";
   if (procname == "glQueryCounterEXT") {
     return "glQueryCounter";
   }
@@ -547,10 +554,16 @@ uintptr_t ResolveAndroidDirectGuestProc(std::string_view procname) {
 }
 
 // Forward decls for compat exports defined at file end.
+extern "C" {
+void glClipPlane(GLenum, const GLdouble*);
+void glColor4f(GLfloat,GLfloat,GLfloat,GLfloat);void glColor4sv(const GLshort*);void glTexCoord2f(GLfloat,GLfloat);void glPopAttrib(void);
+void glOrtho(GLdouble,GLdouble,GLdouble,GLdouble,GLdouble,GLdouble);
+void glLoadMatrixf(const GLfloat*);void glLoadMatrixd(const GLdouble*);
+void glMultMatrixf(const GLfloat*);void glMultMatrixd(const GLdouble*);
+void glScalef(GLfloat,GLfloat,GLfloat);void glScaled(GLdouble,GLdouble,GLdouble);
+}
 void glDepthBounds(GLclampd, GLclampd);
 void glSelectBuffer(GLsizei, GLuint*);
-void glColorPointer(GLint, GLenum, GLsizei, const void*);
-void glEnableClientState(GLenum);
 void glFrameTerminator(void);
 void glPushGroupMarker(GLsizei, const GLchar*);
 void glPopGroupMarker(void);
@@ -597,6 +610,20 @@ unsigned int glXGetContextGPUIDAMD(void*);
 int glXSwapIntervalSGI(int);
 
 uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
+  if(procname=="glColor4f")return reinterpret_cast<uintptr_t>(glColor4f);
+  if(procname=="glColor4sv")return reinterpret_cast<uintptr_t>(glColor4sv);
+  if(procname=="glTexCoord2f")return reinterpret_cast<uintptr_t>(glTexCoord2f);
+  if(procname=="glPopAttrib")return reinterpret_cast<uintptr_t>(glPopAttrib);
+
+  if(procname=="glClipPlane")return reinterpret_cast<uintptr_t>(glClipPlane);
+  if(procname=="glOrtho")return reinterpret_cast<uintptr_t>(glOrtho);
+  if(procname=="glLoadMatrixf")return reinterpret_cast<uintptr_t>(glLoadMatrixf);
+  if(procname=="glLoadMatrixd")return reinterpret_cast<uintptr_t>(glLoadMatrixd);
+  if(procname=="glMultMatrixf")return reinterpret_cast<uintptr_t>(glMultMatrixf);
+  if(procname=="glMultMatrixd")return reinterpret_cast<uintptr_t>(glMultMatrixd);
+  if(procname=="glScalef")return reinterpret_cast<uintptr_t>(glScalef);
+  if(procname=="glScaled")return reinterpret_cast<uintptr_t>(glScaled);
+
 #ifdef BUILD_ANDROID
   if (procname == "glXChooseVisual") return reinterpret_cast<uintptr_t>(glXChooseVisual);
   if (procname == "glXCreateContext") return reinterpret_cast<uintptr_t>(glXCreateContext);
@@ -1106,6 +1133,7 @@ VEXA_GL_GUEST_EXPORT void VexaCompat_glFramebufferTexture1D(unsigned int target,
 VEXA_GL_GUEST_EXPORT void glXDestroyContext(void* /*display*/, void* context) {
   fprintf(stderr, "[libGL thunk] compat glXDestroyContext context=%p\n", context);
   fexfn_pack_VEXA_DestroyGlxContext(reinterpret_cast<uintptr_t>(context));
+  vexa_ff::forget_context(reinterpret_cast<uintptr_t>(context));
 }
 
 VEXA_GL_GUEST_EXPORT void* glXGetCurrentContext() {
@@ -1125,6 +1153,7 @@ VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawabl
   if (result) {
     g_vexa_current_context = context;
     g_vexa_current_drawable = context ? drawable : 0;
+    vexa_ff::select_context(reinterpret_cast<uintptr_t>(context));
     vexa_ff::init_matrices();
   } else {
     fprintf(stderr, "[libGL thunk] glXMakeCurrent failed\n");
@@ -1402,7 +1431,8 @@ VEXA_GL_GUEST_EXPORT void glGetDoublev(GLenum pname, GLdouble* params) {
   }
   GLfloat tmp[16] {};
   ::glGetFloatv(pname, tmp);
-  for (int i = 0; i < 16; ++i) {
+  const int count = (pname >= 0x0BC0 && pname <= 0x0BC2) || pname == 0x864B || pname == 0x8620 || pname == 0x8804 || pname == 0x0BA0 || pname == 0x0D32 || (pname>=0x3000 && pname<0x3006) || (pname>=0x8074&&pname<=0x808D) || pname==0x84E1 || pname==0x84E2 || pname==0x8871 || (pname>=0x8896&&pname<=0x889A) ? 1 : 16;
+  for (int i = 0; i < count; ++i) {
     params[i] = static_cast<GLdouble>(tmp[i]);
   }
 }
@@ -1431,10 +1461,6 @@ VEXA_GL_GUEST_EXPORT void glGetTexLevelParameteriv(GLenum /*target*/, GLint /*le
   }
 }
 
-VEXA_GL_GUEST_EXPORT GLboolean glIsEnabled(GLenum cap) {
-  fprintf(stderr, "[libGL thunk] compat glIsEnabled cap=0x%x -> GL_FALSE\n", cap);
-  return GL_FALSE;
-}
 
 VEXA_GL_GUEST_EXPORT void glDepthRange(GLdouble z_near, GLdouble z_far) {
   // Desktop GL. ETS2 slices the scene with this (0..0.009, 0.01..0.9, 0..1).
@@ -1443,10 +1469,9 @@ VEXA_GL_GUEST_EXPORT void glDepthRange(GLdouble z_near, GLdouble z_far) {
   fexfn_pack_glDepthRangef(static_cast<GLfloat>(z_near), static_cast<GLfloat>(z_far));
 }
 
-VEXA_GL_GUEST_EXPORT void glGetPointerv(GLenum /*pname*/, void** params) {
-  if (params) {
-    *params = nullptr;
-  }
+VEXA_GL_GUEST_EXPORT void glGetPointerv(GLenum pname, void** params) {
+  if(pname!=0x808E&&pname!=0x808F&&pname!=0x8090&&pname!=0x8092){fexfn_pack_VEXA_CompatError(0x0500);return;}
+  if(params)*params=reinterpret_cast<void*>(fexfn_pack_VEXA_GetLegacyPointer(pname));
 }
 
 VEXA_GL_GUEST_EXPORT void glCopyTexImage1D(GLenum target, GLint level, GLenum internalformat,
@@ -1476,22 +1501,37 @@ VEXA_GL_GUEST_EXPORT GLboolean glIsTexture(GLuint texture) {
   return texture != 0 ? GL_TRUE : GL_FALSE;
 }
 
+VEXA_GL_GUEST_EXPORT void glColor4f(GLfloat r,GLfloat g,GLfloat b,GLfloat a){GLfloat v[]{r,g,b,a};vexa_ff::material(0x1201,v);fexfn_pack_glColor4f(r,g,b,a);}
+VEXA_GL_GUEST_EXPORT void glColor4sv(const GLshort* v){if(v)glColor4f(std::max(v[0]/32767.0f,-1.f),std::max(v[1]/32767.0f,-1.f),std::max(v[2]/32767.0f,-1.f),std::max(v[3]/32767.0f,-1.f));}
+VEXA_GL_GUEST_EXPORT void glTexCoord2f(GLfloat s,GLfloat t){fexfn_pack_glTexCoord2f(s,t);}
+VEXA_GL_GUEST_EXPORT void glPopAttrib(){fexfn_pack_glPopAttrib();if(vexa_ff::clip_enabled()){::glGetVertexAttribfv(3,GL_CURRENT_VERTEX_ATTRIB,vexa_ff::S().color);GLint mode=0;::glGetIntegerv(0x0BA0,&mode);vexa_ff::S().matrix_mode=mode;}}
+VEXA_GL_GUEST_EXPORT void glClipPlane(GLenum plane, const GLdouble* equation) {vexa_ff::sync_clip_matrices();fexfn_pack_glClipPlane(plane,equation);}
+VEXA_GL_GUEST_EXPORT void glLoadMatrixf(const GLfloat* matrix) {if(matrix){memcpy(vexa_ff::current(),matrix,16*sizeof(float));vexa_ff::sync_clip_matrices();}}
+VEXA_GL_GUEST_EXPORT void glLoadMatrixd(const GLdouble* matrix) {if(matrix){float m[16];for(int i=0;i<16;++i)m[i]=matrix[i];glLoadMatrixf(m);}}
+VEXA_GL_GUEST_EXPORT void glMultMatrixf(const GLfloat* matrix) {if(matrix){vexa_ff::multiply(vexa_ff::current(),matrix);vexa_ff::sync_clip_matrices();}}
+VEXA_GL_GUEST_EXPORT void glMultMatrixd(const GLdouble* matrix) {if(matrix){float m[16];for(int i=0;i<16;++i)m[i]=matrix[i];glMultMatrixf(m);}}
+VEXA_GL_GUEST_EXPORT void glScalef(GLfloat x, GLfloat y, GLfloat z) {float m[16]{};m[0]=x;m[5]=y;m[10]=z;m[15]=1;glMultMatrixf(m);}
+VEXA_GL_GUEST_EXPORT void glScaled(GLdouble x, GLdouble y, GLdouble z) {glScalef(x,y,z);}
+VEXA_GL_GUEST_EXPORT void glOrtho(GLdouble l,GLdouble r,GLdouble b,GLdouble t,GLdouble n,GLdouble f) {
+  if(l==r||b==t||n==f){fexfn_pack_VEXA_CompatError(0x0501);return;}
+  GLfloat m[16]{};m[0]=2/(r-l);m[5]=2/(t-b);m[10]=-2/(f-n);m[12]=-(r+l)/(r-l);m[13]=-(t+b)/(t-b);m[14]=-(f+n)/(f-n);m[15]=1;glMultMatrixf(m);
+}
 VEXA_GL_GUEST_EXPORT void glBegin(GLenum mode) { vexa_ff::begin(mode); }
 VEXA_GL_GUEST_EXPORT void glEnd(void) { vexa_ff::end(); }
 VEXA_GL_GUEST_EXPORT void glVertex3f(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::vertex(x, y, z); }
 VEXA_GL_GUEST_EXPORT void glNormal3f(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::normal(x, y, z); }
-VEXA_GL_GUEST_EXPORT void glMatrixMode(GLenum mode) { vexa_ff::matrix_mode(mode); }
-VEXA_GL_GUEST_EXPORT void glLoadIdentity(void) { vexa_ff::load_identity(); }
-VEXA_GL_GUEST_EXPORT void glTranslatef(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::translate(x, y, z); }
-VEXA_GL_GUEST_EXPORT void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z) { vexa_ff::rotate(angle, x, y, z); }
+VEXA_GL_GUEST_EXPORT void glMatrixMode(GLenum mode) { vexa_ff::matrix_mode(mode); vexa_ff::sync_clip_matrices(); }
+VEXA_GL_GUEST_EXPORT void glLoadIdentity(void) { vexa_ff::load_identity(); vexa_ff::sync_clip_matrices(); }
+VEXA_GL_GUEST_EXPORT void glTranslatef(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::translate(x, y, z); vexa_ff::sync_clip_matrices(); }
+VEXA_GL_GUEST_EXPORT void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z) { vexa_ff::rotate(angle, x, y, z); vexa_ff::sync_clip_matrices(); }
 VEXA_GL_GUEST_EXPORT void glTranslated(GLdouble x, GLdouble y, GLdouble z) {
-  vexa_ff::translate(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+  vexa_ff::translate(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)); vexa_ff::sync_clip_matrices();
 }
-VEXA_GL_GUEST_EXPORT void glPushMatrix(void) { vexa_ff::push_matrix(); }
-VEXA_GL_GUEST_EXPORT void glPopMatrix(void) { vexa_ff::pop_matrix(); }
+VEXA_GL_GUEST_EXPORT void glPushMatrix(void) { vexa_ff::push_matrix(); vexa_ff::sync_clip_matrices(); }
+VEXA_GL_GUEST_EXPORT void glPopMatrix(void) { vexa_ff::pop_matrix(); vexa_ff::sync_clip_matrices(); }
 VEXA_GL_GUEST_EXPORT void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble znear, GLdouble zfar) {
   vexa_ff::frustum(static_cast<float>(left), static_cast<float>(right), static_cast<float>(bottom), static_cast<float>(top),
-                   static_cast<float>(znear), static_cast<float>(zfar));
+                   static_cast<float>(znear), static_cast<float>(zfar)); vexa_ff::sync_clip_matrices();
 }
 VEXA_GL_GUEST_EXPORT GLuint glGenLists(GLsizei range) { return vexa_ff::gen_lists(range); }
 VEXA_GL_GUEST_EXPORT void glNewList(GLuint list, GLenum mode) { vexa_ff::new_list(list, mode); }
@@ -1650,8 +1690,8 @@ VEXA_GL_GUEST_EXPORT void glDepthBounds(GLclampd /*zmin*/, GLclampd /*zmax*/) {}
 VEXA_GL_GUEST_EXPORT void glClipControl(GLenum /*origin*/, GLenum /*depth*/) {}
 VEXA_GL_GUEST_EXPORT void glVertexAttribLFormat(GLuint /*index*/, GLint /*size*/, GLenum /*type*/, GLuint /*relativeoffset*/) {}
 VEXA_GL_GUEST_EXPORT void glSelectBuffer(GLsizei /*size*/, GLuint* /*buffer*/) {}
-VEXA_GL_GUEST_EXPORT void glColorPointer(GLint /*size*/, GLenum /*type*/, GLsizei /*stride*/, const void* /*pointer*/) {}
-VEXA_GL_GUEST_EXPORT void glEnableClientState(GLenum /*array*/) {}
+
+
 VEXA_GL_GUEST_EXPORT void glFrameTerminator(void) {}
 VEXA_GL_GUEST_EXPORT void glPushGroupMarker(GLsizei /*length*/, const GLchar* /*marker*/) {}
 VEXA_GL_GUEST_EXPORT void glPopGroupMarker(void) {}

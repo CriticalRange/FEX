@@ -253,6 +253,28 @@ struct fex_gen_config<glEnable> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glDisable> : fexgen::custom_host_impl {};
 template<>
+struct fex_gen_config<glAlphaFunc> : fexgen::custom_host_impl {};
+#define VEXA_LEGACY_CONFIG(name, result, params) template<> struct fex_gen_config<name> : fexgen::custom_host_impl {};
+VEXA_LEGACY_STATE_HOST_PROCS(VEXA_LEGACY_CONFIG)
+#undef VEXA_LEGACY_CONFIG
+#define VEXA_LEGACY_CONFIG(name, result, params) template<> struct fex_gen_config<name> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
+VEXA_LEGACY_STATE_GUEST_PROCS(VEXA_LEGACY_CONFIG)
+#undef VEXA_LEGACY_CONFIG
+template<> struct fex_gen_config<glClipPlane> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
+template<> struct fex_gen_config<glGetClipPlane> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_GetLegacyPointer> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_CompatError> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_SetClipMatrices> : fexgen::custom_host_impl {};
+
+#define VEXA_ARB_CONFIG(name, core, result, params, args) template<> struct fex_gen_config<name> : fexgen::custom_host_impl {};
+VEXA_ARB_SHADER_CORE_ALIASES(VEXA_ARB_CONFIG)
+#undef VEXA_ARB_CONFIG
+#define VEXA_ARB_CONFIG(name, result, params) template<> struct fex_gen_config<name> : fexgen::custom_host_impl {};
+VEXA_ARB_SHADER_GENERIC(VEXA_ARB_CONFIG)
+VEXA_ARB_ASSEMBLY_PROCS(VEXA_ARB_CONFIG)
+#undef VEXA_ARB_CONFIG
+
+template<>
 struct fex_gen_config<glTexParameterf> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glTexParameteri> : fexgen::custom_host_impl {};
@@ -1835,8 +1857,7 @@ template<>
 struct fex_gen_config<glDeleteTransformFeedbacksNV> {};
 template<>
 struct fex_gen_config<glDeleteVertexArraysAPPLE> {};
-template<>
-struct fex_gen_config<glDeleteVertexArrays> {};
+
 template<>
 struct fex_gen_config<glDeleteVertexShaderEXT> {};
 template<>
@@ -1895,8 +1916,7 @@ template<>
 struct fex_gen_config<glDisableVertexAttribAPPLE> {};
 template<>
 struct fex_gen_config<glDisableVertexAttribArrayARB> {};
-template<>
-struct fex_gen_config<glDisableVertexAttribArray> {};
+
 template<>
 struct fex_gen_config<glDispatchCompute> {};
 template<>
@@ -2046,8 +2066,7 @@ template<>
 struct fex_gen_config<glEnableVertexAttribAPPLE> {};
 template<>
 struct fex_gen_config<glEnableVertexAttribArrayARB> {};
-template<>
-struct fex_gen_config<glEnableVertexAttribArray> {};
+
 template<>
 struct fex_gen_config<glEnd> {};
 template<>
@@ -3120,8 +3139,7 @@ template<>
 struct fex_gen_config<glGetVertexAttribdvNV> {};
 template<>
 struct fex_gen_config<glGetVertexAttribfvARB> {};
-template<>
-struct fex_gen_config<glGetVertexAttribfv> {};
+
 template<>
 struct fex_gen_config<glGetVertexAttribfvNV> {};
 template<>
@@ -3134,8 +3152,7 @@ template<>
 struct fex_gen_config<glGetVertexAttribIuiv> {};
 template<>
 struct fex_gen_config<glGetVertexAttribivARB> {};
-template<>
-struct fex_gen_config<glGetVertexAttribiv> {};
+
 template<>
 struct fex_gen_config<glGetVertexAttribivNV> {};
 template<>
@@ -6342,10 +6359,8 @@ template<>
 struct fex_gen_config<glVertexAttribP4uiv> {};
 template<>
 struct fex_gen_config<glVertexAttribParameteriAMD> {};
-template<>
-struct fex_gen_config<glVertexAttribPointerARB> {};
-template<>
-struct fex_gen_config<glVertexAttribPointer> {};
+
+
 template<>
 struct fex_gen_config<glVertexAttribPointerNV> {};
 template<>

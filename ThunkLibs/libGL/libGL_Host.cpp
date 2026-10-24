@@ -66,6 +66,9 @@ $end_info$
 #endif
 
 #if defined(BUILD_ANDROID)
+#include "arb_assembly_state.h"
+#include "legacy_clip_state.h"
+#include "legacy_client_state.h"
 #include "program_cache_state.inc"
 static int VexaGLHostFprintf(FILE* stream, const char* fmt, ...) {
   va_list args;
@@ -186,6 +189,20 @@ uint64_t GLHostNowNs() {
     .count();
 }
 
+
+// Temporary A/B upload experiment.
+static std::atomic<bool> VexaOrphanExperiment{false};
+struct VexaUploadSample { GLenum target; GLintptr offset; GLsizeiptr size; GLint64 capacity; uint64_t count=0, ns=0; };
+static thread_local std::vector<VexaUploadSample> VexaUploadSamples;
+static void VexaUploadReport() {
+ uint64_t total=0,full=0;for(const auto& x:VexaUploadSamples){total+=x.count;if(x.offset==0&&x.size==x.capacity)full+=x.count;}
+ fprintf(stderr,"[UPLOAD] enabled=%d total=%llu full=%llu\n",VexaOrphanExperiment.load(),(unsigned long long)total,(unsigned long long)full);
+ std::sort(VexaUploadSamples.begin(),VexaUploadSamples.end(),[](const auto&a,const auto&b){return a.ns>b.ns;});
+ for(size_t i=0;i<std::min(size_t(12),VexaUploadSamples.size());++i){const auto &x=VexaUploadSamples[i];fprintf(stderr,"[UPLOAD] target=%x offset=%lld size=%lld capacity=%lld count=%llu ms=%.4f\n",x.target,(long long)x.offset,(long long)x.size,(long long)x.capacity,(unsigned long long)x.count,x.ns/1e6);}
+ VexaUploadSamples.clear();
+ VexaOrphanExperiment.store(access("/data/data/com.critical.vexaemulator/files/vexa_buffer_orphan.flag",F_OK)==0);
+}
+
 void GLHostMarkProgress(const char* call) {
   GLHostLastCall.store(call ? call : "<null>", std::memory_order_release);
   GLHostLastProgressNs.store(GLHostNowNs(), std::memory_order_release);
@@ -209,6 +226,12 @@ static bool VexaGLVerbose() {
   return enabled != 0;
 }
 #define VEXA_LOGV(...) do { if (VexaGLVerbose()) fprintf(stderr, __VA_ARGS__); } while (0)
+
+// Startup-only shader diagnostics without enabling per-frame verbose logging.
+static bool VexaShaderAuditEnabled() {
+  static const bool enabled = access("/data/data/com.critical.vexaemulator/files/vexa_shader_audit.flag", F_OK) == 0;
+  return enabled;
+}
 
 // Heavy GL diagnostics (synchronous KHR_debug callbacks, present-path pixel
 // readbacks and framebuffer dumps) are opt-in: create files/vexa_gldbg.flag.
@@ -328,6 +351,16 @@ constexpr std::string_view kVexaShaderPrecisionEs320Extra {
 
   return insert_pos;
 }
+#include "arb_assembly_translate.h"
+static bool VexaClipAvailable();
+static int VexaClipQuery(GLenum pname, GLfloat* value);
+static int VexaLegacyQuery(GLenum pname, GLfloat* value);
+static int VexaAssemblyTarget(GLenum target);
+static bool VexaAssemblyQuery(GLenum pname, GLfloat* value);
+#include "alpha_test.inc"
+#include "legacy_clip.inc"
+#include "arb_assembly_runtime.inc"
+#include "legacy_client_runtime.inc"
 #endif
 
 void GLHostLogDuration(const char* call, uint64_t elapsed_ns) {
@@ -2207,6 +2240,8 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
       fprintf(stderr, "[VEXA][TRACE] begin frame after swap %d tid=%ld\n", diag_swaps, (long)syscall(SYS_gettid));
     }
     if ((diag_swaps & 127) == 0) {
+      VexaUploadReport();
+      VexaBGRAGPUEnabled.store(access("/data/data/com.critical.vexaemulator/files/vexa_bgra_cpu.flag",F_OK)!=0);
       static uint64_t previous_draws = 0, previous_dispatches = 0;
       fprintf(stderr,
               "[VEXA][GLX] diag swaps=%d draws=%llu draws/frame=%.2f dispatches=%llu dispatches/frame=%.2f window=128 clears=%llu useprog=%llu bindfbo=%llu traced_calls_total=%llu\n",
@@ -3057,7 +3092,7 @@ static void VexaDiagDraw(const char* name, GLenum mode, GLsizei count) {
 static void VexaPostDrawDiag() {
   // glGetError() on a tiled GPU drains the command pipeline, so calling it
   // after every draw costs real frame time. Diagnostic only.
-  if (!GLHostTraceEnabled()) {
+  if (!GLHostTraceEnabled() && !g_vexa_trace_frame) {
     return;
   }
   const GLenum err = ::glGetError();
@@ -3467,6 +3502,8 @@ static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
 static void VexaPreDraw() {
   VEXA_PROGRAM_LOCK();
   VexaRefreshProgramGeneration();
+  VexaApplyAlphaTest();
+  VexaApplyClipPlanes();
   if (!g_vexa_intended_pipe) return;
   int st = g_vexa_pipe_state[g_vexa_intended_pipe];
   if (st != 0) return;
@@ -3854,6 +3891,9 @@ static bool VexaIgnoreDesktopCap(GLenum cap) {
 }
 
 static void fexfn_impl_libGL_glEnable(GLenum cap) {
+  if(VexaClipAvailable()&&cap>=0x3000&&cap<0x3006){VexaProgramContext().Clip.Enabled[cap-0x3000]=1;return;}
+  if (const int stage=VexaAssemblyTarget(cap);stage>=0) {VexaProgramContext().Assembly.Enabled[stage]=true;return;}
+  if (VexaAlphaTestAvailable() && cap == 0x0BC0) { VexaProgramContext().AlphaTest = true; return; }
   if (g_vexa_trace_frame) fprintf(stderr, "[VEXA][TRACE] enable cap=%x\n", cap);
   if (VexaIgnoreDesktopCap(cap)) return;
   ::glEnable(cap);
@@ -3861,6 +3901,9 @@ static void fexfn_impl_libGL_glEnable(GLenum cap) {
 }
 
 static void fexfn_impl_libGL_glDisable(GLenum cap) {
+  if(VexaClipAvailable()&&cap>=0x3000&&cap<0x3006){VexaProgramContext().Clip.Enabled[cap-0x3000]=0;return;}
+  if (const int stage=VexaAssemblyTarget(cap);stage>=0) {VexaProgramContext().Assembly.Enabled[stage]=false;return;}
+  if (VexaAlphaTestAvailable() && cap == 0x0BC0) { VexaProgramContext().AlphaTest = false; return; }
   if (g_vexa_trace_frame) fprintf(stderr, "[VEXA][TRACE] disable cap=%x\n", cap);
   if (VexaIgnoreDesktopCap(cap)) return;
   ::glDisable(cap);
@@ -3984,7 +4027,21 @@ static void fexfn_impl_libGL_glBufferSubData(GLenum target, GLintptr offset, GLs
   if (VexaTboWriteLog() && VexaTboBoundTarget(target, nullptr))
     fprintf(stderr, "[libGL-host] tbosub target=%x buf=%d off=%lld size=%lld tid=%ld\n",
             target, VexaHostBoundBuffer(target), (long long)offset, (long long)size, (long)syscall(SYS_gettid));
-  ::glBufferSubData(target, offset, size, data);
+  const auto begin=GLHostNowNs();
+  GLint64 capacity=0;::glGetBufferParameteri64v(target,GL_BUFFER_SIZE,&capacity);
+  bool orphan=false;
+  if(VexaOrphanExperiment.load()&&offset==0&&size>0&&size==capacity&&data) {
+    GLint mapped=0,immutable=0,usage=GL_STATIC_DRAW;
+    ::glGetBufferParameteriv(target,GL_BUFFER_MAPPED,&mapped);
+    const char* extensions=reinterpret_cast<const char*>(::glGetString(GL_EXTENSIONS));
+    if(extensions&&strstr(extensions,"GL_EXT_buffer_storage"))::glGetBufferParameteriv(target,GL_BUFFER_IMMUTABLE_STORAGE,&immutable);
+    if(!mapped&&!immutable){::glGetBufferParameteriv(target,GL_BUFFER_USAGE,&usage);::glBufferData(target,size,data,usage);orphan=true;}
+  }
+  if(!orphan)::glBufferSubData(target, offset, size, data);
+  const auto elapsed=GLHostNowNs()-begin;
+  auto it=std::find_if(VexaUploadSamples.begin(),VexaUploadSamples.end(),[&](const auto& x){return x.target==target&&x.offset==offset&&x.size==size&&x.capacity==capacity;});
+  if(it==VexaUploadSamples.end()){VexaUploadSamples.push_back({target,offset,size,capacity});it=VexaUploadSamples.end()-1;}
+  ++it->count;it->ns+=elapsed;
 }
 static void fexfn_impl_libGL_glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
   if (VexaTboWriteLog())
@@ -4043,21 +4100,21 @@ static void fexfn_impl_libGL_glTexBufferRange(GLenum target, GLenum internalform
 
 static void fexfn_impl_libGL_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   VexaDiagDraw("arrays", mode, count);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope(first,count); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawArrays(mode, first, count);
   VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
   VexaDiagDraw("elements", mode, count);
-  VexaPreDraw();
-  ::glDrawElements(mode, count, type, indices);
+  VexaLegacyArrayScope client_scope(0,count,type,indices); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
+  ::glDrawElements(mode, count, type, client_scope.Indices);
   VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
   VexaDiagDraw("arrays_inst", mode, count * primcount);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope(first,count); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawArraysInstanced(mode, first, count, primcount);
   VexaPostDrawDiag();
 }
@@ -4065,14 +4122,14 @@ static void fexfn_impl_libGL_glDrawArraysInstanced(GLenum mode, GLint first, GLs
 static void fexfn_impl_libGL_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                      GLsizei primcount) {
   VexaDiagDraw("elements_inst", mode, count * primcount);
-  VexaPreDraw();
-  ::glDrawElementsInstanced(mode, count, type, indices, primcount);
+  VexaLegacyArrayScope client_scope(0,count,type,indices); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
+  ::glDrawElementsInstanced(mode, count, type, client_scope.Indices, primcount);
   VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
   VexaDiagDraw("elements_indirect", mode, -1);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawElementsIndirect(mode, type, indirect);
 }
 
@@ -4100,15 +4157,15 @@ static void fexfn_impl_libGL_glRenderbufferStorageMultisample(GLenum target, GLs
 
 static void fexfn_impl_libGL_glDrawArraysIndirect(GLenum mode, const void* indirect) {
   VexaDiagDraw("arrays_indirect", mode, -1);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawArraysIndirect(mode, indirect);
 }
 
 static void fexfn_impl_libGL_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                       GLint basevertex) {
   VexaDiagDraw("elements_basev", mode, count);
-  VexaPreDraw();
-  ::glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+  VexaLegacyArrayScope client_scope(0,count,type,indices,basevertex); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
+  ::glDrawElementsBaseVertex(mode, count, type, client_scope.Indices, basevertex);
   VexaPostDrawDiag();
 }
 
@@ -4116,8 +4173,8 @@ static void fexfn_impl_libGL_glDrawElementsInstancedBaseVertex(GLenum mode, GLsi
                                                                const void* indices, GLsizei primcount,
                                                                GLint basevertex) {
   VexaDiagDraw("elements_inst_basev", mode, count * primcount);
-  VexaPreDraw();
-  ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, primcount, basevertex);
+  VexaLegacyArrayScope client_scope(0,count,type,indices,basevertex); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
+  ::glDrawElementsInstancedBaseVertex(mode, count, type, client_scope.Indices, primcount, basevertex);
 }
 
 static void fexfn_impl_libGL_glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z) {
@@ -4706,7 +4763,12 @@ static void fexfn_impl_libGL_glProgramBinary(GLuint program, GLenum binaryFormat
   else if (fn_oes) fn_oes(program, binaryFormat, binary, length);
   GLint linked = GL_FALSE;
   ::glGetProgramiv(program, GL_LINK_STATUS, &linked);
+  if (VexaShaderAuditEnabled()) fprintf(stderr, "[VEXA][SHADER-AUDIT] binary context=%p program=%u bytes=%d linked=%d\n", eglGetCurrentContext(), program, length, linked);
   if (linked) {
+    VexaProgramContext().Shared->AlphaPrograms.erase(program);
+
+    VexaProgramContext().Shared->ClipPrograms.erase(program);
+    VexaProgramContext().Shared->BGRAPrograms.erase(program);
     g_vexa_prog_sources.erase(program);
     g_vexa_prog_direct_source.erase(program);
     g_vexa_linked_programs.erase(program);
@@ -4928,16 +4990,16 @@ static void fexfn_impl_libGL_glResolveMultisampleFramebufferAPPLE(void) {}
 static void fexfn_impl_libGL_glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices) {
   (void)start; (void)end;
   VexaDiagDraw("range_elements", mode, count);
-  VexaPreDraw();
-  ::glDrawElements(mode, count, type, indices);
+  VexaLegacyArrayScope client_scope(0,count,type,indices); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
+  ::glDrawElements(mode, count, type, client_scope.Indices);
   VexaPostDrawDiag();
 }
 
 static void fexfn_impl_libGL_glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices, GLint basevertex) {
   (void)start; (void)end;
   VexaDiagDraw("range_elements_bv", mode, count);
-  VexaPreDraw();
-  ::glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+  VexaLegacyArrayScope client_scope(0,count,type,indices,basevertex); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
+  ::glDrawElementsBaseVertex(mode, count, type, client_scope.Indices, basevertex);
   VexaPostDrawDiag();
 }
 
@@ -4985,7 +5047,7 @@ static void VexaRestoreBaseInstance(const VexaSavedVB* saved, int n) {
 using VexaDrawArraysInstBIFn = void (*)(GLenum, GLint, GLsizei, GLsizei, GLuint);
 static void fexfn_impl_libGL_glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei primcount, GLuint baseinstance) {
   VexaDiagDraw("arrays_inst_bi", mode, count * primcount);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   VexaSavedVB saved[32];
   const int n = VexaApplyBaseInstance(baseinstance, saved, 32);
   ::glDrawArraysInstanced(mode, first, count, primcount);
@@ -4996,7 +5058,7 @@ static void fexfn_impl_libGL_glDrawArraysInstancedBaseInstance(GLenum mode, GLin
 using VexaDrawElemsInstBIFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLuint);
 static void fexfn_impl_libGL_glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount, GLuint baseinstance) {
   VexaDiagDraw("elements_inst_bi", mode, count * primcount);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   VexaSavedVB saved[32];
   const int n = VexaApplyBaseInstance(baseinstance, saved, 32);
   ::glDrawElementsInstanced(mode, count, type, indices, primcount);
@@ -5007,7 +5069,7 @@ static void fexfn_impl_libGL_glDrawElementsInstancedBaseInstance(GLenum mode, GL
 using VexaDrawElemsInstBVBiIFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint, GLuint);
 static void fexfn_impl_libGL_glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount, GLint basevertex, GLuint baseinstance) {
   VexaDiagDraw("elements_inst_bv_bi", mode, count * primcount);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   VexaSavedVB saved[32];
   const int n = VexaApplyBaseInstance(baseinstance, saved, 32);
   ::glDrawElementsInstancedBaseVertex(mode, count, type, indices, primcount, basevertex);
@@ -5024,7 +5086,7 @@ static auto fexfn_impl_libGL_VEXA_MultiDrawIndirect(unsigned mode, unsigned type
   if (drawcount <= 0) return;
   if (stride == 0) stride = type ? 20 : 16;
   VexaDiagDraw(type ? "multi_elements_indirect" : "multi_arrays_indirect", mode, drawcount);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   for (int i = 0; i < drawcount; ++i) {
     const void* cmd = reinterpret_cast<const void*>(indirect + static_cast<uintptr_t>(stride) * i);
     if (type) ::glDrawElementsIndirect(mode, type, cmd);
@@ -5038,7 +5100,7 @@ static auto fexfn_impl_libGL_VEXA_MultiDrawElementsBV(unsigned mode, unsigned ty
                                                       int drawcount) -> void {
   if (drawcount <= 0 || !counts || !offsets) return;
   VexaDiagDraw("multi_elements_bv", mode, drawcount);
-  VexaPreDraw();
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   for (int i = 0; i < drawcount; ++i) {
     if (counts[i] <= 0) continue;
     ::glDrawElementsBaseVertex(mode, counts[i], type, reinterpret_cast<const void*>(VexaPair64(offsets, i)),
@@ -5158,10 +5220,11 @@ static void fexfn_impl_libGL_glMultiDrawArrays(GLenum mode, const GLint* first, 
   GLsizei total = 0;
   for (GLsizei i = 0; i < drawcount; ++i) total += count[i];
   VexaDiagDraw("multi_arrays", mode, total);
+  VexaLegacyArrayScope client_scope; if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   static auto fn = reinterpret_cast<VexaMultiDrawArraysFn>(eglGetProcAddress("glMultiDrawArraysEXT"));
   if (fn) { fn(mode, first, count, drawcount); return; }
   for (GLsizei i = 0; i < drawcount; ++i) {
-    if (count[i] > 0) { VexaPreDraw(); ::glDrawArrays(mode, first[i], count[i]); }
+    if (count[i] > 0) { ::glDrawArrays(mode, first[i], count[i]); }
   }
 }
 
@@ -5229,7 +5292,11 @@ static bool VexaFFEnsureProgram() {
     "}\n";
   const GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   const GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+  const std::string clip_vertex=VexaClipInstrument(vertex,GL_VERTEX_SHADER);vertex=clip_vertex.c_str();
   glShaderSource(vs, 1, &vertex, nullptr);
+  const std::string alpha_fragment = VexaAlphaTestAvailable() ? VexaAlphaInstrument(fragment) : fragment;
+  const std::string clip_fragment=VexaClipInstrument(alpha_fragment,GL_FRAGMENT_SHADER);
+  fragment = clip_fragment.c_str();
   glShaderSource(fs, 1, &fragment, nullptr);
   glCompileShader(vs);
   glCompileShader(fs);
@@ -5299,6 +5366,8 @@ static auto fexfn_impl_libGL_VEXA_FFDrawList(const unsigned* buffers, const int*
     glUniform4fv(g_vexa_ff_color, 1, colors + (i * 4));
     glBindBuffer(GL_ARRAY_BUFFER, mesh->second.vbo);
     VexaFFBindMeshAttribs();
+    VexaApplyAlphaTest();
+  VexaApplyClipPlanes();
     glDrawArrays(GL_TRIANGLES, 0, counts[i]);
   }
   glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -5314,6 +5383,8 @@ static auto fexfn_impl_libGL_VEXA_FFDrawImmediate(const float* vertices, int flo
   glUseProgram(g_vexa_ff_program);
   glUniformMatrix4fv(g_vexa_ff_mvp, 1, GL_FALSE, mvp);
   glUniform4fv(g_vexa_ff_color, 1, color);
+  VexaApplyAlphaTest();
+  VexaApplyClipPlanes();
   glDrawArrays(GL_TRIANGLES, 0, float_count / 6);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
@@ -5328,7 +5399,16 @@ static auto fexfn_impl_libGL_VEXA_FFDelete(unsigned buffer) -> void {
 }
 #endif
 
+#include "arb_shader_objects.h"
+#include "legacy_state.h"
+#include "arb_assembly.h"
 #include "thunkgen_host_libGL.inl"
+
+#ifdef BUILD_ANDROID
+static void fexfn_impl_libGL_glAlphaFunc(GLenum func, GLfloat ref) {
+  VexaAlphaFunc(func, ref);
+}
+#endif
 
 static void VexaRebindUploadThunks() {
   static bool done = false;
@@ -5714,6 +5794,8 @@ static void VexaStripPerVertexRedeclaration(std::string* source) {
 // enough to reason about a rewritten shader from the outside.
 // Shader diagnostic sources belong to the program share group.
 
+#include "legacy_shader_varyings.inc"
+
 static void VexaRememberShaderSource(GLuint shader, const std::string& source) {
   if (source.empty()) {
     return;
@@ -5723,6 +5805,29 @@ static void VexaRememberShaderSource(GLuint shader, const std::string& source) {
     VexaShaderSourceById.clear();
   }
   VexaShaderSourceById[shader] = source;
+}
+
+static void VexaSubmitShaderSource(GLuint shader, GLsizei count, const GLchar* const* strings, const GLint* lengths) {
+  if ((VexaAlphaTestAvailable() || VexaClipAvailable()) && strings && count > 0) {
+    GLint type = 0;
+    ::glGetShaderiv(shader, GL_SHADER_TYPE, &type);
+    if (type == GL_FRAGMENT_SHADER || (VexaClipAvailable() && type == GL_VERTEX_SHADER)) {
+      std::string source;
+      for (GLsizei i = 0; i < count; ++i) {
+        if (!strings[i]) continue;
+        if (lengths && lengths[i] >= 0) source.append(strings[i], static_cast<size_t>(lengths[i]));
+        else source += strings[i];
+      }
+      if(type==GL_FRAGMENT_SHADER&&VexaAlphaTestAvailable())source = VexaAlphaInstrument(std::move(source));
+      if(type==GL_VERTEX_SHADER)source=VexaBGRAInstrument(std::move(source));
+      source=VexaClipInstrument(std::move(source),type);
+      VexaRememberShaderSource(shader, source);
+      const GLchar* text = source.c_str();
+      ::glShaderSource(shader, 1, &text, nullptr);
+      return;
+    }
+  }
+  ::glShaderSource(shader, count, strings, lengths);
 }
 
 static void VexaDumpFailedShaderSource(GLuint shader, const char* info) {
@@ -5827,7 +5932,7 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
           LogShaderTranspileEvent("emit-translated", static_cast<GLenum>(shader_type), detail);
         }
         const GLchar* translated_ptr = translated_source.c_str();
-        ::glShaderSource(shader, 1, &translated_ptr, nullptr);
+        VexaSubmitShaderSource(shader, 1, &translated_ptr, nullptr);
         return;
       }
 
@@ -5842,7 +5947,7 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
           LogShaderTranspileEvent("emit-fallback-320es", static_cast<GLenum>(shader_type), detail);
         }
         const GLchar* fallback_ptr = fallback_source.c_str();
-        ::glShaderSource(shader, 1, &fallback_ptr, nullptr);
+        VexaSubmitShaderSource(shader, 1, &fallback_ptr, nullptr);
         return;
       }
 
@@ -5909,10 +6014,18 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
             source.find("GL_ARB_separate_shader_objects") != std::string::npos;
         rewritten_version = needs_es_320 ? "#version 320 es" : "#version 300 es";
       } else if (desktop && desktop_version >= 100 && desktop_version <= 120) {
-        rewritten_version = "#version 100";
+        rewritten_version = VexaClipAvailable() ? "#version 300 es" : "#version 100";
       }
       if (rewritten_version) {
         source.replace(version_pos, line_len, rewritten_version);
+        // Mali requires the ESSL 300 version on physical line one. ToGL
+        // prefixes GLSL 1.20 sources with a stage-marker comment.
+        if (version_pos && VexaClipAvailable()) {
+          const auto prefix=source.substr(0,version_pos);
+          source.erase(0,version_pos);
+          const auto first_end=source.find('\n');
+          source.insert(first_end==std::string::npos?source.size():first_end+1,prefix);
+        }
         // Desktop precision qualifiers have no effect. Leaving lowp/mediump
         // active in ESSL loses coordinate and animation-time precision on Mali.
         auto is_identifier = [](char c) {
@@ -5996,6 +6109,10 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
             }
           }
         }
+        if (desktop_version <= 120) {
+          VexaRewriteLegacyVaryings(&source, static_cast<GLenum>(shader_type));
+          if (VexaClipAvailable()) VexaUpgradeLegacyShader(&source, static_cast<GLenum>(shader_type));
+        }
         VEXA_LOGV("[libGL-host] shader version %d -> %s type=0x%x len=%zu binding=%d\n",
                 desktop_version,
                 rewritten_version,
@@ -6005,14 +6122,18 @@ static void fexfn_impl_libGL_FEX_glShaderSource(GLuint shader, GLsizei count, ui
         VexaRewriteGrassBuffer(shader, shader_type, source);
         VexaRememberShaderSource(shader, source);
         const GLchar* rewritten = source.c_str();
-        ::glShaderSource(shader, 1, &rewritten, nullptr);
+        VexaSubmitShaderSource(shader, 1, &rewritten, nullptr);
         return;
       }
     }
     VexaRememberShaderSource(shader, source);
   }
 #endif
+#ifdef BUILD_ANDROID
+  VexaSubmitShaderSource(shader, count, host_strings, length);
+#else
   ::glShaderSource(shader, count, host_strings, length);
+#endif
 }
 
 #ifdef BUILD_ANDROID
@@ -6056,6 +6177,9 @@ GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVis
 // Mali cannot link (GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS == 0). Without the name
 // it emits the 3.3 uniform-block form instead.
 static const char* const kVexaDesktopSpoofExts[] = {
+  // Buffer objects are core GLES functionality. Legacy ToGL checks the ARB
+  // extension name even when its core entry points have already resolved.
+  "GL_ARB_vertex_buffer_object",
   "GL_ARB_framebuffer_object",
   "GL_EXT_framebuffer_object",
   "GL_ARB_draw_indirect",
@@ -6070,12 +6194,23 @@ static const char* const kVexaDesktopSpoofExts[] = {
 };
 static constexpr unsigned kVexaDesktopSpoofExtCount =
   sizeof(kVexaDesktopSpoofExts) / sizeof(kVexaDesktopSpoofExts[0]);
+static bool VexaHasIndexedDrawBuffers() {
+  const auto raw=reinterpret_cast<const char*>(::glGetString(GL_EXTENSIONS));
+  if(!raw)return false;
+  if(strstr(raw,"GL_EXT_draw_buffers_indexed")||strstr(raw,"GL_OES_draw_buffers_indexed"))return true;
+  GLint major=0,minor=0;::glGetIntegerv(GL_MAJOR_VERSION,&major);::glGetIntegerv(GL_MINOR_VERSION,&minor);
+  return major>3||(major==3&&minor>=2);
+}
+static unsigned VexaDesktopExtensionCount(){return kVexaDesktopSpoofExtCount+(VexaHasIndexedDrawBuffers()?1:0);}
+static const char* VexaDesktopExtension(unsigned index){return index<kVexaDesktopSpoofExtCount?kVexaDesktopSpoofExts[index]:"GL_EXT_draw_buffers2";}
+
 #endif
 
 const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
   GLHOST_TRACE_SCOPE();
 #ifdef BUILD_ANDROID
   GLHostLogCurrentEGLState("glGetString");
+  if (name==0x8874) return VexaGuestString(reinterpret_cast<const GLubyte*>(VexaProgramContext().Assembly.ErrorString.c_str()));
   // Godot 3's Linux export is GLES-over-GL and rejects anything below desktop
   // OpenGL 3.3. Mali reports "OpenGL ES 3.2", so both the GLES3 and GLES2
   // viability checks fail before a frame is drawn.
@@ -6095,6 +6230,15 @@ const GLubyte* fexfn_impl_libGL_glGetString(GLenum name) {
                  "[libGL-host] glGetString(GL_SHADING_LANGUAGE_VERSION) desktop spoof => '%s'\n",
                  reinterpret_cast<const char*>(kDesktopShading));
     return VexaGuestString(kDesktopShading);
+  }
+  if(name==GL_EXTENSIONS) {
+    const auto raw=reinterpret_cast<const char*>(::glGetString(name));if(!raw)return nullptr;
+    static thread_local std::string extensions;extensions=raw;
+    for(unsigned i=0;i<VexaDesktopExtensionCount();++i) {
+      const char* extension=VexaDesktopExtension(i);
+      if(extensions.find(extension)==std::string::npos){extensions+=' ';extensions+=extension;}
+    }
+    return VexaGuestString(reinterpret_cast<const GLubyte*>(extensions.c_str()));
   }
   const GLubyte* result = ::glGetString(name);
   if (!result) {
@@ -6133,8 +6277,8 @@ const GLubyte* fexfn_impl_libGL_glGetStringi(GLenum name, GLuint index) {
       real_count = 0;
     }
     const auto real = static_cast<GLuint>(real_count);
-    if (index >= real && index < real + kVexaDesktopSpoofExtCount) {
-      const char* ext = kVexaDesktopSpoofExts[index - real];
+    if (index >= real && index < real + VexaDesktopExtensionCount()) {
+      const char* ext = VexaDesktopExtension(index - real);
       VEXA_LOGV(
                    "[libGL-host] glGetStringi(GL_EXTENSIONS index=%u) desktop spoof => '%s'\n",
                    static_cast<unsigned>(index),
@@ -6313,6 +6457,39 @@ auto fexfn_impl_libGL_glXGetProcAddress(const GLubyte* name) -> __GLXextFuncPtr 
   }
   std::string_view name_sv {proc_name};
 #ifdef BUILD_ANDROID
+#define VEXA_ARB_LOOKUP(name, core, result, params, args) if (name_sv == #name) return reinterpret_cast<VoidFn>(fexfn_impl_libGL_##name);
+  VEXA_ARB_SHADER_CORE_ALIASES(VEXA_ARB_LOOKUP)
+#undef VEXA_ARB_LOOKUP
+#define VEXA_ARB_LOOKUP(name, result, params) if (name_sv == #name) return reinterpret_cast<VoidFn>(fexfn_impl_libGL_##name);
+  VEXA_LEGACY_STATE_HOST_PROCS(VEXA_ARB_LOOKUP)
+  VEXA_LEGACY_STATE_GUEST_PROCS(VEXA_ARB_LOOKUP)
+  VEXA_ARB_SHADER_GENERIC(VEXA_ARB_LOOKUP)
+  VEXA_ARB_ASSEMBLY_PROCS(VEXA_ARB_LOOKUP)
+#undef VEXA_ARB_LOOKUP
+  if (name_sv == "glClipPlane") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glClipPlane);
+  if (name_sv == "glGetClipPlane") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetClipPlane);
+  if (name_sv == "glBufferSubData") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glBufferSubData);
+  if (name_sv == "glAlphaFunc") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glAlphaFunc);
+  if (name_sv == "glGetFloatv") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetFloatv);
+  if (name_sv == "glGetBooleanv") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetBooleanv);
+  if (name_sv == "glIsEnabled") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glIsEnabled);
+  if (name_sv == "glGetError") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glGetError);
+  // ARB vertex-buffer entry points have the core ABI. GLES exposes the core
+  // names; resolve through this function so existing buffer wrappers still run.
+  for (const auto& alias : {
+         std::pair{"glBindBufferARB", "glBindBuffer"},
+         std::pair{"glDeleteBuffersARB", "glDeleteBuffers"},
+         std::pair{"glGenBuffersARB", "glGenBuffers"},
+         std::pair{"glBufferDataARB", "glBufferData"},
+         std::pair{"glBufferSubDataARB", "glBufferSubData"},
+         std::pair{"glUnmapBufferARB", "glUnmapBuffer"}}) {
+    if (name_sv == alias.first) {
+      return fexfn_impl_libGL_glXGetProcAddress(reinterpret_cast<const GLubyte*>(alias.second));
+    }
+  }
+  if (name_sv == "glMapBufferARB") {
+    return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glMapBufferOES);
+  }
 #ifdef IS_32BIT_THUNK
   if (name_sv == "glMapBufferRange") return reinterpret_cast<VoidFn>(fexfn_impl_libGL_glMapBufferRange);
   if (name_sv == "glDeleteBuffers") return reinterpret_cast<VoidFn>(VexaDeleteBuffers32);
@@ -6957,6 +7134,10 @@ GLuint fexfn_impl_libGL_glCreateProgram() {
   VexaCollectProgramState();
   const GLuint program = ::glCreateProgram();
   if (program) {
+    VexaProgramContext().Shared->AlphaPrograms.erase(program);
+
+    VexaProgramContext().Shared->ClipPrograms.erase(program);
+    VexaProgramContext().Shared->BGRAPrograms.erase(program);
     g_vexa_prog_sources.erase(program);
     g_vexa_prog_direct_source.erase(program);
     g_vexa_linked_programs.erase(program);
@@ -7091,6 +7272,11 @@ void fexfn_impl_libGL_glCompileShader(GLuint a_0) {
   ::glCompileShader(a_0);
   GLint compiled = GL_FALSE;
   ::glGetShaderiv(a_0, GL_COMPILE_STATUS, &compiled);
+  if (VexaShaderAuditEnabled()) {
+    GLint type = 0;
+    ::glGetShaderiv(a_0, GL_SHADER_TYPE, &type);
+    fprintf(stderr, "[VEXA][SHADER-AUDIT] compile context=%p shader=%u type=%x compiled=%d\n", eglGetCurrentContext(), a_0, type, compiled);
+  }
   if (compiled == GL_TRUE) VexaSnapshotCompiledShader(a_0);
   if (compiled != GL_TRUE) {
     static std::atomic<int> logs {0};
@@ -7123,8 +7309,22 @@ void fexfn_impl_libGL_glLinkProgram(GLuint a_0) {
   ::glLinkProgram(a_0);
   GLint failed_status = 0;
   ::glGetProgramiv(a_0, GL_LINK_STATUS, &failed_status);
+  if (VexaShaderAuditEnabled()) {
+    fprintf(stderr, "[VEXA][SHADER-AUDIT] link context=%p program=%u linked=%d\n", eglGetCurrentContext(), a_0, failed_status);
+    if (!failed_status) {
+      GLint length = 0;
+      ::glGetProgramiv(a_0, GL_INFO_LOG_LENGTH, &length);
+      std::string info(static_cast<size_t>(std::clamp(length, 1, 65536)), '\0');
+      ::glGetProgramInfoLog(a_0, info.size(), nullptr, info.data());
+      fprintf(stderr, "[VEXA][SHADER-AUDIT] link-error program=%u %s\n", a_0, info.c_str());
+    }
+  }
 #ifdef BUILD_ANDROID
   if (failed_status) {
+    VexaProgramContext().Shared->AlphaPrograms.erase(a_0);
+
+    VexaProgramContext().Shared->ClipPrograms.erase(a_0);
+    VexaProgramContext().Shared->BGRAPrograms.erase(a_0);
     VexaSnapshotProgramSources(a_0);
     VexaRefreshProgramGeneration();
     VexaLinkGrassBuffer(a_0);
@@ -7168,6 +7368,16 @@ void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1) {
   if (!a_1) {
     return;
   }
+  GLfloat legacy_value;
+  if(VexaLegacyQuery(a_0,&legacy_value)){*a_1=static_cast<GLint>(legacy_value);return;}
+  GLfloat clip_values[16];
+  if(const int count=VexaClipQuery(a_0,clip_values);count){for(int i=0;i<count;++i)a_1[i]=static_cast<GLint>(std::round(clip_values[i]));return;}
+  GLfloat alpha;
+  if (VexaAssemblyQuery(a_0, &alpha)) {*a_1=static_cast<GLint>(alpha);return;}
+  if (VexaAlphaQuery(a_0, &alpha)) {
+    *a_1 = a_0 == 0x0BC2 ? static_cast<GLint>(static_cast<double>(alpha) * 2147483647.0 + 0.5) : static_cast<GLint>(alpha);
+    return;
+  }
 
   // VEXA_FIXES: GLES drivers often report GL_DOUBLEBUFFER as 0 even when the
   // EGL window surface is presented via eglSwapBuffers. Many desktop clients
@@ -7194,7 +7404,7 @@ void fexfn_impl_libGL_glGetIntegerv(GLenum a_0, GLint* a_1) {
     if (real_count < 0) {
       real_count = 0;
     }
-    *a_1 = real_count + static_cast<GLint>(kVexaDesktopSpoofExtCount);
+    *a_1 = real_count + static_cast<GLint>(VexaDesktopExtensionCount());
     return;
   }
 
@@ -7238,8 +7448,24 @@ GLuint fexfn_impl_libGL_glCreateShaderProgramv(GLuint a_0, GLsizei count, guest_
 #endif
   VEXA_PROGRAM_LOCK();
   VexaCollectProgramState();
+#ifdef BUILD_ANDROID
+  std::string alpha_source;
+  const GLchar* alpha_text = nullptr;
+  if (sources && count > 0 && ((VexaAlphaTestAvailable() && a_0 == GL_FRAGMENT_SHADER) || (VexaClipAvailable() && (a_0 == GL_VERTEX_SHADER || a_0 == GL_FRAGMENT_SHADER)))) {
+    for (GLsizei i = 0; i < count; ++i) if (sources[i]) alpha_source += sources[i];
+    if(VexaAlphaTestAvailable() && a_0==GL_FRAGMENT_SHADER)alpha_source = VexaAlphaInstrument(std::move(alpha_source));
+    alpha_source=VexaClipInstrument(std::move(alpha_source),a_0);
+    alpha_text = alpha_source.c_str();
+    sources = &alpha_text;
+    count = 1;
+  }
+#endif
   const GLuint prog = fexldr_ptr_libGL_glCreateShaderProgramv(a_0, count, sources);
   if (prog != 0 && sources != nullptr) {
+    VexaProgramContext().Shared->AlphaPrograms.erase(prog);
+
+    VexaProgramContext().Shared->ClipPrograms.erase(prog);
+    VexaProgramContext().Shared->BGRAPrograms.erase(prog);
     g_vexa_prog_sources.erase(prog);
     g_vexa_linked_programs.erase(prog);
     std::string joined;
@@ -7772,6 +7998,13 @@ void Vexa_ReleaseGlxWindowApi(ANativeWindow* window) {
 }
 #endif
 
+#ifdef BUILD_ANDROID
+#include "arb_shader_objects_host.inc"
+#include "arb_assembly_host.inc"
+#include "legacy_clip_host.inc"
+#include "legacy_client_host.inc"
+#endif
+
 #if defined(BUILD_ANDROID)
 extern "C" ExportEntry* fexthunks_exports_libGL() {
   if (!fexldr_init_libGL()) return nullptr;
@@ -7786,6 +8019,12 @@ extern "C" ExportEntry* fexthunks_exports_libGL() {
   VEXA_BIND_HOST_WRAPPER(glGetString)
   VEXA_BIND_HOST_WRAPPER(glGetStringi)
   VEXA_BIND_HOST_WRAPPER(glGetIntegerv)
+  VEXA_BIND_HOST_WRAPPER(glBufferSubData)
+  VEXA_BIND_HOST_WRAPPER(glAlphaFunc)
+  VEXA_BIND_HOST_WRAPPER(glGetFloatv)
+  VEXA_BIND_HOST_WRAPPER(glGetBooleanv)
+  VEXA_BIND_HOST_WRAPPER(glIsEnabled)
+  VEXA_BIND_HOST_WRAPPER(glGetError)
   VEXA_BIND_HOST_WRAPPER(glGetProgramInterfaceiv)
   VEXA_BIND_HOST_WRAPPER(glGetProgramResourceName)
   VEXA_BIND_HOST_WRAPPER(glGetProgramResourceiv)

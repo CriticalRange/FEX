@@ -1,6 +1,10 @@
 // Program objects are shared by EGL share groups; pipelines and current
 // bindings belong to a context. Select this state only on context switches,
 // never with an eglGetCurrentContext query for every uniform/draw.
+struct VexaAlphaProgramState {
+  GLint Function = -1, Reference = -1;
+};
+
 struct VexaProgramShareState {
   std::recursive_mutex Mutex;
   std::unordered_map<GLuint, std::vector<std::pair<GLenum, std::string>>> Sources;
@@ -14,6 +18,14 @@ struct VexaProgramShareState {
   std::unordered_set<GLuint> DeletedShaders;
   std::vector<GLuint> Retired;
   uint64_t Generation = 1;
+  std::unordered_map<GLuint, VexaAlphaProgramState> AlphaPrograms;
+  std::unordered_map<GLuint,VexaClipLocations> ClipPrograms;
+  std::unordered_map<GLuint,VexaBGRAProgramState> BGRAPrograms;
+  std::unordered_map<GLuint, VexaAssemblyObject> AssemblyNames;
+  GLuint NextAssemblyName = 1;
+  uint64_t AssemblyRevision = 1;
+  std::vector<GLuint> AssemblyRetiredShaders;
+  std::vector<GLuint> LegacyRetiredBuffers;
 };
 
 struct VexaPipelineClone {
@@ -27,6 +39,12 @@ struct VexaProgramContextState {
   std::unordered_map<GLuint, VexaPipelineClone> OwnedClones;
   GLuint IntendedPipeline = 0, StageProgram = 0, CurrentProgram = 0;
   uint64_t SeenGeneration = 0;
+  bool AlphaTest = false;
+  GLenum AlphaFunction = GL_ALWAYS, CompatError = GL_NO_ERROR;
+  GLfloat AlphaReference = 0.0f;
+  VexaAssemblyContext Assembly;
+  VexaClipState Clip;
+  VexaLegacyClient LegacyClient;
 };
 
 static std::mutex g_vexa_program_context_mutex;
@@ -72,10 +90,15 @@ static void VexaForgetClone(VexaProgramShareState& state, GLuint original, GLuin
     if (list.empty()) state.Clones.erase(it);
   }
   state.Locations.erase(clone);
+  state.BGRAPrograms.erase(clone);
 }
 
 VexaProgramContextState::~VexaProgramContextState() {
   std::lock_guard lock(Shared->Mutex);
+  for (auto& [key, linked] : Assembly.Linked) Shared->Retired.push_back(linked.Program);
+  for (auto& object : Assembly.Default) if (object.Shader) Shared->AssemblyRetiredShaders.push_back(object.Shader);
+  for(auto buffer:LegacyClient.Staging)if(buffer)Shared->LegacyRetiredBuffers.push_back(buffer);
+  if(LegacyClient.IndexStaging)Shared->LegacyRetiredBuffers.push_back(LegacyClient.IndexStaging);
   for (const auto& [pipe, clone] : OwnedClones) {
     VexaForgetClone(*Shared, clone.Original, clone.Clone);
     Shared->Retired.push_back(clone.Clone);
@@ -100,6 +123,10 @@ static void VexaUnregisterProgramContext(EGLContext context) {
 
 static void VexaCollectProgramState() {
   auto& state = *VexaProgramContext().Shared;
+  if(!state.LegacyRetiredBuffers.empty())::glDeleteBuffers(state.LegacyRetiredBuffers.size(),state.LegacyRetiredBuffers.data());
+  state.LegacyRetiredBuffers.clear();
+  for (GLuint shader : state.AssemblyRetiredShaders) ::glDeleteShader(shader);
+  state.AssemblyRetiredShaders.clear();
   for (GLuint clone : state.Retired) ::glDeleteProgram(clone);
   state.Retired.clear();
   for (auto it = state.DeletedShaders.begin(); it != state.DeletedShaders.end();) {
@@ -119,6 +146,9 @@ static void VexaCollectProgramState() {
     state.Sources.erase(*it);
     state.DirectSources.erase(*it);
     state.Linked.erase(*it);
+    state.AlphaPrograms.erase(*it);
+    state.ClipPrograms.erase(*it);
+    state.BGRAPrograms.erase(*it);
     it = state.Deleted.erase(it);
   }
 }

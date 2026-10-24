@@ -8,12 +8,17 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <cstdlib>
 
 extern "C" {
 unsigned fexfn_pack_VEXA_FFUpload(const float* vertices, int float_count);
 void fexfn_pack_VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp);
 void fexfn_pack_VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color);
 void fexfn_pack_VEXA_FFDelete(unsigned buffer);
+void fexfn_pack_VEXA_SetClipMatrices(const float* model, const float* projection, unsigned mode);
 void fexfn_pack_VEXA_MultiDrawIndirect(unsigned mode, unsigned type, uintptr_t indirect, int drawcount, int stride);
 void fexfn_pack_VEXA_MultiDrawElementsBV(unsigned mode, unsigned type, const int* counts, const unsigned* offsets,
                                          const int* basevertex, int drawcount);
@@ -80,8 +85,8 @@ struct DisplayList {
 };
 
 struct State {
-  float model[16] {};
-  float projection[16] {};
+  float model[16] {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+  float projection[16] {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
   float model_stack[32][16] {};
   float projection_stack[32][16] {};
   int model_depth = 0;
@@ -101,10 +106,20 @@ struct State {
   std::vector<float> scratch_colors;
 };
 
-inline State& S() {
-  static State state;
-  return state;
+inline bool clip_enabled() {static const bool enabled=[] {const auto v=getenv("VEXA_GL_CLIP_PLANES");return v && !strcmp(v,"1");}();return enabled;}
+inline std::unordered_map<uintptr_t,std::shared_ptr<State>>& context_states() {static std::unordered_map<uintptr_t,std::shared_ptr<State>> states;return states;}
+inline std::mutex& context_mutex() {static std::mutex mutex;return mutex;}
+inline std::shared_ptr<State>& active_state() {static thread_local std::shared_ptr<State> state;return state;}
+inline State& S() {static State fallback;return active_state()?*active_state():fallback;}
+inline void select_context(uintptr_t context) {
+  if(!clip_enabled())return;
+  std::lock_guard lock(context_mutex());auto& slot=context_states()[context];if(!slot)slot=std::make_shared<State>();active_state()=slot;
 }
+inline void forget_context(uintptr_t context) {
+  if(!clip_enabled())return;
+  std::lock_guard lock(context_mutex());context_states().erase(context);
+}
+inline void sync_clip_matrices() {if(clip_enabled())fexfn_pack_VEXA_SetClipMatrices(S().model,S().projection,S().matrix_mode);}
 
 inline void identity(float* m) {
   std::memset(m, 0, sizeof(float) * 16);
@@ -619,13 +634,6 @@ inline void material(unsigned pname, const float* params) {
   run_or_record(cmd);
 }
 
-inline void init_matrices() {
-  static bool ready = false;
-  if (!ready) {
-    identity(S().model);
-    identity(S().projection);
-    ready = true;
-  }
-}
+inline void init_matrices() { sync_clip_matrices(); }
 
 } // namespace vexa_ff

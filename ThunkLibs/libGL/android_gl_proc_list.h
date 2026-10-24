@@ -16,6 +16,8 @@
   OP(glViewport) \
   OP(glEnable) \
   OP(glDisable) \
+  OP(glAlphaFunc) \
+  OP(glIsEnabled) \
   OP(glBlendFunc) \
   OP(glBlendFuncSeparate) \
   OP(glBlendEquation) \
@@ -285,6 +287,9 @@
 // VEXA_FIXES: Thunkgen list intentionally excludes custom-bridged entries (for example
 // glShaderSource) that are handled via dedicated host implementations.
 #define FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN(OP) \
+  OP(glIsEnabledi) \
+  OP(glGetBooleani_v) \
+  OP(glIsEnabled) \
   OP(glGetString) \
   OP(glGetStringi) \
   OP(glClearStencil) \
@@ -346,21 +351,16 @@
   OP(glIsSync) \
   OP(glUnmapBuffer) \
   OP(glGenVertexArrays) \
-  OP(glDeleteVertexArrays) \
   OP(glGenVertexArraysAPPLE) \
   OP(glDeleteVertexArraysAPPLE) \
   OP(glBindVertexArray) \
   OP(glBindVertexArrayAPPLE) \
   OP(glVertexAttribBinding) \
   OP(glVertexAttribFormat) \
-  OP(glVertexAttribPointer) \
   OP(glVertexAttribIPointer) \
   OP(glVertexAttrib2f) \
   OP(glVertexAttrib4f) \
   OP(glVertexAttrib4fv) \
-  OP(glEnableVertexAttribArray) \
-  OP(glDisableVertexAttribArray) \
-  OP(glGetVertexAttribiv) \
   OP(glGenTextures) \
   OP(glDeleteTextures) \
   OP(glBindTexture) \
@@ -459,7 +459,6 @@
   OP(glUniform3i) \
   OP(glUniform4i) \
   OP(glPixelStorei) \
-  OP(glDisableClientState) \
   OP(glBlendColor) \
   OP(glGetBufferParameteriv) \
   OP(glIsQuery) \
@@ -501,6 +500,30 @@
 // VEXA_FIXES: Declare EXT/APPLE alias entrypoints used by Android fallback lookups and
 // guest expectations even when the underlying GLES driver only exposes core variants.
 extern "C" {
+#include "legacy_state.h"
+#define VEXA_LEGACY_DECLARE(name, result, params) result name params;
+VEXA_LEGACY_STATE_HOST_PROCS(VEXA_LEGACY_DECLARE)
+VEXA_LEGACY_STATE_GUEST_PROCS(VEXA_LEGACY_DECLARE)
+#undef VEXA_LEGACY_DECLARE
+#include "arb_shader_objects.h"
+#include "arb_assembly.h"
+#define VEXA_ASM_DECLARE(name, result, params) result name params;
+VEXA_ARB_ASSEMBLY_PROCS(VEXA_ASM_DECLARE)
+#undef VEXA_ASM_DECLARE
+#define VEXA_ARB_DECLARE(name, core, result, params, args) result name params;
+VEXA_ARB_SHADER_CORE_ALIASES(VEXA_ARB_DECLARE)
+#undef VEXA_ARB_DECLARE
+#define VEXA_ARB_DECLARE(name, result, params) result name params;
+VEXA_ARB_SHADER_GENERIC(VEXA_ARB_DECLARE)
+#undef VEXA_ARB_DECLARE
+GLboolean glIsEnabledi(GLenum cap, GLuint index);
+void glGetBooleani_v(GLenum pname, GLuint index, GLboolean* value);
+void glClipPlane(GLenum plane, const GLdouble* equation);
+void glGetClipPlane(GLenum plane, GLdouble* equation);
+uintptr_t VEXA_GetLegacyPointer(GLenum pname);
+void VEXA_CompatError(GLenum error);
+void VEXA_SetClipMatrices(const GLfloat* model, const GLfloat* projection, GLenum mode);
+void glAlphaFunc(GLenum func, GLfloat ref);
 void glBindVertexArrayAPPLE(GLuint array);
 void glDeleteVertexArraysAPPLE(GLsizei n, const GLuint* arrays);
 void glGenVertexArraysAPPLE(GLsizei n, GLuint* arrays);
