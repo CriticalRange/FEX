@@ -244,6 +244,10 @@ struct VexaVkWallTime {
     }
   }
 };
+static bool VexaRotProfileEnabled() {
+  static const bool enabled = access("/data/data/com.critical.vexaemulator/files/vk_rotation_profile.flag", F_OK) == 0;
+  return enabled;
+}
 static bool VexaVkProfileEnabled() {
   static const bool enabled = [] {
     const char* value = std::getenv("VEXA_VK_PROFILE");
@@ -309,7 +313,13 @@ static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfo
   };
   VexaAdpfOnPresent();
   if (!VexaVkProfileEnabled()) {
-    return present();
+    if (!VexaRotProfileEnabled()) return present();
+    const auto start = std::chrono::steady_clock::now();
+    const auto cpuStart = VexaVkWallTime::ThreadCpuNs();
+    const auto result = present();
+    static thread_local VexaVkWallTime stats;
+    stats.Add("rotation-native-present", start, result, cpuStart);
+    return result;
   }
   const auto start = std::chrono::steady_clock::now();
   const auto cpuStart = VexaVkWallTime::ThreadCpuNs();
@@ -885,11 +895,45 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
   VkDeviceCreateInfo patched=*a_1;std::vector<const char*> extensions;if(a_1->enabledExtensionCount)extensions.assign(a_1->ppEnabledExtensionNames,a_1->ppEnabledExtensionNames+a_1->enabledExtensionCount);
   if(VexaRealX11()){for(const char *name:{"VK_ANDROID_external_memory_android_hardware_buffer","VK_EXT_queue_family_foreign","VK_KHR_external_memory","VK_KHR_dedicated_allocation","VK_KHR_get_memory_requirements2"}){if(std::none_of(extensions.begin(),extensions.end(),[&](const char *e){return strcmp(e,name)==0;}))extensions.push_back(name);}patched.enabledExtensionCount=extensions.size();patched.ppEnabledExtensionNames=extensions.data();effective=&patched;}
 #endif
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  bool rotationTimeline = false;
+  VkPhysicalDeviceTimelineSemaphoreFeatures rotationFeature {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+  if (!VexaRealX11() && access("/data/data/com.critical.vexaemulator/files/vk_rotation_timeline.flag", F_OK) == 0) {
+    // Do not rewrite caller-owned feature chains or override an explicitly
+    // disabled feature. Add a private node only when no equivalent is present.
+    bool existing = false, enabled = false;
+    for (auto next = static_cast<const VkBaseInStructure*>(effective->pNext); next; next = next->pNext) {
+      if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) {
+        existing = true; enabled = reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>(next)->timelineSemaphore;
+      } else if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+        existing = true; enabled = reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(next)->timelineSemaphore;
+      }
+    }
+    uint32_t count {};
+    if (LDR_PTR(vkEnumerateDeviceExtensionProperties)(a_0, nullptr, &count, nullptr) == VK_SUCCESS) {
+      std::vector<VkExtensionProperties> supported(count);
+      if (LDR_PTR(vkEnumerateDeviceExtensionProperties)(a_0, nullptr, &count, supported.data()) == VK_SUCCESS &&
+          std::any_of(supported.begin(), supported.end(), [](const auto& e) { return strcmp(e.extensionName, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) == 0; })) {
+        auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(LDR_PTR(vkGetInstanceProcAddr)(VK_NULL_HANDLE, "vkGetPhysicalDeviceFeatures2"));
+        // The loader exposes the core physical-device function for Vulkan 1.1.
+        if (!query) query = LDR_PTR(vkGetPhysicalDeviceFeatures2);
+        VkPhysicalDeviceFeatures2 features {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &rotationFeature};
+        if (query) query(a_0, &features);
+        if (rotationFeature.timelineSemaphore && (!existing || enabled)) {
+          if (std::none_of(extensions.begin(), extensions.end(), [](const char* e) { return strcmp(e, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) == 0; })) extensions.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+          if (!existing) { rotationFeature.pNext = const_cast<void*>(patched.pNext); patched.pNext = &rotationFeature; }
+          patched.enabledExtensionCount = extensions.size(); patched.ppEnabledExtensionNames = extensions.data();
+          effective = &patched; rotationTimeline = true;
+        }
+      }
+    }
+  }
+#endif
   auto ret = LDR_PTR(vkCreateDevice)(a_0, effective, nullptr, &out);
 #if defined(BUILD_ANDROID)
   if(ret==VK_SUCCESS){using Register=void(*)(VkPhysicalDevice,VkDevice,const VkDeviceCreateInfo*);if(auto f=reinterpret_cast<Register>(VexaX11Proc("VexaRegisterX11Device")))f(a_0,out,effective);}
 #ifndef IS_32BIT_THUNK
-  if (ret == VK_SUCCESS) VexaRotRecordDevice(out, effective);
+  if (ret == VK_SUCCESS) VexaRotRecordDevice(out, effective, rotationTimeline);
 #endif
 #endif
   *a_3.get_pointer() = to_guest(to_host_layout(out));
@@ -908,6 +952,24 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
   // No functions affected on 64-bit
 #endif
 
+#if defined(BUILD_ANDROID)
+  // WSI Acquire submits ownership work on queues also used by the guest.
+  // Route the generated entry points as well as custom wrappers through the
+  // bridge's queue gates; protecting only vkQueuePresentKHR is insufficient.
+  if (ret == VK_SUCCESS && VexaRealX11()) {
+#define VEXA_X11_QUEUE_GATE(name) \
+    if (void *bridge = VexaX11Proc(#name)) \
+      LDR_PTR(name) = reinterpret_cast<PFN_##name>(bridge)
+    VEXA_X11_QUEUE_GATE(vkQueueSubmit);
+    VEXA_X11_QUEUE_GATE(vkQueueSubmit2);
+    VEXA_X11_QUEUE_GATE(vkQueueSubmit2KHR);
+    VEXA_X11_QUEUE_GATE(vkQueueBindSparse);
+    VEXA_X11_QUEUE_GATE(vkQueueWaitIdle);
+    VEXA_X11_QUEUE_GATE(vkDeviceWaitIdle);
+    VEXA_X11_QUEUE_GATE(vkDestroyDevice);
+#undef VEXA_X11_QUEUE_GATE
+  }
+#endif
   return ret;
 }
 

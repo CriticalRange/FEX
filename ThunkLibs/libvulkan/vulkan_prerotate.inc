@@ -176,7 +176,7 @@ static const uint32_t kVexaRotFrag[] = {
   X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkCreateCommandPool) X(vkDestroyCommandPool)       \
   X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdBeginRenderPass)   \
   X(vkCmdEndRenderPass) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDraw) X(vkQueueSubmit)  \
-  X(vkGetDeviceQueue)
+  X(vkGetDeviceQueue) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 struct VexaRotFns {
 #define VEXA_ROT_DECL(n) PFN_##n n {};
@@ -198,7 +198,9 @@ static std::mutex VexaRotMutex;
 // to its family without hooking every queue getter.
 static std::unordered_map<VkDevice, std::vector<std::pair<uint32_t, uint32_t>>> VexaRotDeviceQueues;
 
-static void VexaRotRecordDevice(VkDevice device, const VkDeviceCreateInfo* info) {
+static std::unordered_map<VkDevice, bool> VexaRotTimelineDevices;
+
+static void VexaRotRecordDevice(VkDevice device, const VkDeviceCreateInfo* info, bool timeline) {
   std::vector<std::pair<uint32_t, uint32_t>> families;
   for (uint32_t i = 0; i < info->queueCreateInfoCount; ++i) {
     const auto& queue = info->pQueueCreateInfos[i];
@@ -206,7 +208,33 @@ static void VexaRotRecordDevice(VkDevice device, const VkDeviceCreateInfo* info)
   }
   std::lock_guard lock {VexaRotMutex};
   VexaRotDeviceQueues[device] = std::move(families);
+  VexaRotTimelineDevices[device] = timeline;
 }
+
+// Opt-in diagnostic only; raw rotation calls bypass the guest GL/Vulkan profiler.
+struct VexaRotSamples {
+  std::vector<double> Wait, WaitCpu, Submit, Gpu, Interval;
+  std::chrono::steady_clock::time_point Last {};
+  static double Percentile(std::vector<double> v, double q) {
+    if (v.empty()) return -1;
+    std::sort(v.begin(), v.end());
+    return v[static_cast<size_t>((v.size() - 1) * q)];
+  }
+  void Add(double wait, double waitCpu, double submit, double gpu) {
+    auto now = std::chrono::steady_clock::now();
+    if (Last.time_since_epoch().count()) Interval.push_back(std::chrono::duration<double, std::milli>(now - Last).count());
+    Last = now;
+    Wait.push_back(wait); WaitCpu.push_back(waitCpu); Submit.push_back(submit);
+    if (gpu >= 0) Gpu.push_back(gpu);
+    if (Wait.size() < 300) return;
+    fprintf(stderr, "[VEXA][ROT-PERF] n=%zu gpu_n=%zu wait_ms=%.4f/%.4f/%.4f submit_ms=%.4f/%.4f/%.4f gpu_ms=%.4f/%.4f/%.4f interval_ms=%.4f/%.4f/%.4f wait_cpu_ms=%.4f/%.4f/%.4f (p50/p95/p99)\n",
+      Wait.size(), Gpu.size(), Percentile(Wait,.5), Percentile(Wait,.95), Percentile(Wait,.99),
+      Percentile(Submit,.5), Percentile(Submit,.95), Percentile(Submit,.99),
+      Percentile(Gpu,.5), Percentile(Gpu,.95), Percentile(Gpu,.99),
+      Percentile(Interval,.5), Percentile(Interval,.95), Percentile(Interval,.99), Percentile(WaitCpu,.5), Percentile(WaitCpu,.95), Percentile(WaitCpu,.99));
+    Wait.clear(); WaitCpu.clear(); Submit.clear(); Gpu.clear(); Interval.clear();
+  }
+};
 
 struct VexaRotSwapchain {
   VexaRotFns Fns;
@@ -229,14 +257,36 @@ struct VexaRotSwapchain {
   VkPipelineLayout Layout {};
   VkPipeline Pipeline {};
   VkCommandPool CommandPool {};
+  bool Profile {VexaRotProfileEnabled()};
+  bool Async {};
+  uint32_t ModeCheck {};
+  std::vector<bool> FencePending;
+  VkSemaphore Timeline {};
+  PFN_vkWaitSemaphores WaitTimeline {};
+  PFN_vkGetSemaphoreCounterValue GetTimeline {};
+  uint64_t TimelineValue {};
+  VkQueue RecordedQueue {};
+  std::vector<uint64_t> ImageValues;
+  VkQueryPool Queries {};
+  double TimestampMs {};
+  uint32_t TimestampBits {};
+  std::vector<bool> ProfileSubmitted;
+  VexaRotSamples Samples;
 
   ~VexaRotSwapchain() {
     if (!Fns.vkDestroyFence) return;
     std::vector<VkFence> live;
-    for (auto fence : Fences) if (fence) live.push_back(fence);
+    for (size_t i = 0; i < Fences.size(); ++i) if (Fences[i] && FencePending[i]) live.push_back(Fences[i]);
+    if (!Lost && Timeline && TimelineValue) {
+      VkSemaphoreWaitInfo wait {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+      wait.semaphoreCount = 1; wait.pSemaphores = &Timeline; wait.pValues = &TimelineValue;
+      WaitTimeline(Device, &wait, UINT64_MAX);
+    }
+    if (Timeline) Fns.vkDestroySemaphore(Device, Timeline, nullptr);
     if (!Lost && !live.empty()) Fns.vkWaitForFences(Device, live.size(), live.data(), VK_TRUE, UINT64_MAX);
+    if (Queries) Fns.vkDestroyQueryPool(Device, Queries, nullptr);
     if (CommandPool) Fns.vkDestroyCommandPool(Device, CommandPool, nullptr);
-    for (auto fence : live) Fns.vkDestroyFence(Device, fence, nullptr);
+    for (auto fence : Fences) if (fence) Fns.vkDestroyFence(Device, fence, nullptr);
     for (auto semaphore : Done) if (semaphore) Fns.vkDestroySemaphore(Device, semaphore, nullptr);
     if (Pipeline) Fns.vkDestroyPipeline(Device, Pipeline, nullptr);
     if (Layout) Fns.vkDestroyPipelineLayout(Device, Layout, nullptr);
@@ -265,6 +315,20 @@ struct VexaRotSwapchain {
     Sets.resize(count);
     Done.resize(count);
     Fences.resize(count);
+    FencePending.resize(count);
+    bool timelineEnabled {};
+    { std::lock_guard lock {VexaRotMutex}; timelineEnabled = VexaRotTimelineDevices[Device]; }
+    if (timelineEnabled) {
+      WaitTimeline = reinterpret_cast<PFN_vkWaitSemaphores>(LDR_PTR(vkGetDeviceProcAddr)(Device, "vkWaitSemaphoresKHR"));
+      GetTimeline = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(LDR_PTR(vkGetDeviceProcAddr)(Device, "vkGetSemaphoreCounterValueKHR"));
+      VkSemaphoreTypeCreateInfo type {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+      type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+      VkSemaphoreCreateInfo semaphore {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+      if (WaitTimeline && GetTimeline && Fns.vkCreateSemaphore(Device, &semaphore, nullptr, &Timeline) != VK_SUCCESS) Timeline = VK_NULL_HANDLE;
+      ImageValues.resize(count);
+    }
+    Async = Timeline && access("/data/data/com.critical.vexaemulator/files/vk_rotation_fence.flag", F_OK) != 0;
+    fprintf(stderr, "[VEXA][VK] pre-rotation completion=%s\n", Timeline ? "timeline-experiment" : "fence");
 
     VkPhysicalDeviceMemoryProperties memory {};
     LDR_PTR(vkGetPhysicalDeviceMemoryProperties)(g_vexa_physical_device, &memory);
@@ -444,6 +508,23 @@ struct VexaRotSwapchain {
       }
     }
     if (family == UINT32_MAX) return false;
+    if (Profile) {
+      VkPhysicalDeviceProperties props {};
+      LDR_PTR(vkGetPhysicalDeviceProperties)(g_vexa_physical_device, &props);
+      uint32_t count {};
+      LDR_PTR(vkGetPhysicalDeviceQueueFamilyProperties)(g_vexa_physical_device, &count, nullptr);
+      std::vector<VkQueueFamilyProperties> properties(count);
+      LDR_PTR(vkGetPhysicalDeviceQueueFamilyProperties)(g_vexa_physical_device, &count, properties.data());
+      TimestampBits = family < count ? properties[family].timestampValidBits : 0;
+      TimestampMs = props.limits.timestampPeriod / 1000000.0;
+      if (access("/data/data/com.critical.vexaemulator/files/vk_rotation_cpu_only.flag", F_OK) == 0) TimestampBits = 0;
+      VkQueryPoolCreateInfo queries {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      queries.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      queries.queryCount = Images.size() * 2;
+      if (TimestampBits && Fns.vkCreateQueryPool(Device, &queries, nullptr, &Queries) != VK_SUCCESS) Queries = VK_NULL_HANDLE;
+      ProfileSubmitted.resize(Images.size());
+      fprintf(stderr, "[VEXA][ROT-PERF] enabled timestamps=%u period_ms=%.9f\n", TimestampBits, TimestampMs);
+    }
     VkCommandPoolCreateInfo pool {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, 0, family};
     if (Fns.vkCreateCommandPool(Device, &pool, nullptr, &CommandPool) != VK_SUCCESS) return false;
     Commands.resize(Images.size());
@@ -454,7 +535,12 @@ struct VexaRotSwapchain {
     for (size_t i = 0; i < Commands.size(); ++i) {
       const auto cmd = Commands[i];
       VkCommandBufferBeginInfo begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      if (Timeline) begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
       if (Fns.vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return false;
+      if (Queries) {
+        Fns.vkCmdResetQueryPool(cmd, Queries, i * 2, 2);
+        Fns.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, Queries, i * 2);
+      }
       // The guest left its image in PRESENT_SRC; restore that afterwards so
       // its next frame can transition from either PRESENT_SRC or UNDEFINED.
       VkImageMemoryBarrier barrier {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -481,8 +567,10 @@ struct VexaRotSwapchain {
       barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
       Fns.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+      if (Queries) Fns.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, Queries, i * 2 + 1);
       if (Fns.vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
     }
+    RecordedQueue = queue;
     Recorded = true;
     fprintf(stderr, "[VEXA][VK] pre-rotation recorded family=%u images=%zu\n", family, Commands.size());
     return true;
@@ -578,9 +666,42 @@ static VkResult VexaRotSubmit(VkQueue queue, const VkPresentInfoKHR& info, std::
       return VK_ERROR_OUT_OF_DATE_KHR;
     }
     if (index >= rot->Commands.size()) return VK_ERROR_OUT_OF_DATE_KHR;
+    // Static commands belong to the first present queue's family. Keep the
+    // experimental timeline scoped to that queue; never signal it unordered
+    // from another queue, or submit these commands on another family.
+    if (queue != rot->RecordedQueue) { VexaRotFailed = true; return VK_ERROR_OUT_OF_DATE_KHR; }
+    if (rot->Timeline && rot->ModeCheck++ % 300 == 0) {
+      bool async = access("/data/data/com.critical.vexaemulator/files/vk_rotation_fence.flag", F_OK) != 0;
+      if (async != rot->Async) {
+        rot->Async = async; rot->Samples = {};
+        fprintf(stderr, "[VEXA][ROT-PERF] switch async=%d\n", async);
+      }
+    }
     auto& fns = rot->Fns;
-    fns.vkWaitForFences(rot->Device, 1, &rot->Fences[index], VK_TRUE, UINT64_MAX);
-    fns.vkResetFences(rot->Device, 1, &rot->Fences[index]);
+    const auto waitStart = rot->Profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    const auto waitCpuStart = rot->Profile ? VexaVkWallTime::ThreadCpuNs() : 0;
+    VkResult completion = VK_SUCCESS;
+    if (!rot->Async) completion = fns.vkWaitForFences(rot->Device, 1, &rot->Fences[index], VK_TRUE, UINT64_MAX);
+    if (completion != VK_SUCCESS) { rot->Lost = completion == VK_ERROR_DEVICE_LOST; return completion; }
+    if (!rot->Async) rot->FencePending[index] = false;
+    const auto waitEnd = rot->Profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    const auto waitCpuNs = rot->Profile ? VexaVkWallTime::ThreadCpuNs() - waitCpuStart : 0;
+    double gpuMs = -1;
+    bool profileReady = true;
+    if (rot->Timeline && rot->Queries && rot->ProfileSubmitted[index]) {
+      uint64_t completed {};
+      profileReady = rot->GetTimeline(rot->Device, rot->Timeline, &completed) == VK_SUCCESS && completed >= rot->ImageValues[index];
+    }
+    if (rot->Queries && rot->ProfileSubmitted[index] && profileReady) {
+      uint64_t ticks[2] {};
+      if (fns.vkGetQueryPoolResults(rot->Device, rot->Queries, index * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        uint64_t mask = rot->TimestampBits == 64 ? UINT64_MAX : (uint64_t(1) << rot->TimestampBits) - 1;
+        gpuMs = ((ticks[1] - ticks[0]) & mask) * rot->TimestampMs;
+      }
+    }
+    if (!rot->Async) completion = fns.vkResetFences(rot->Device, 1, &rot->Fences[index]);
+    if (completion != VK_SUCCESS) { rot->Lost = completion == VK_ERROR_DEVICE_LOST; return completion; }
+    const auto submitStart = rot->Profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
     VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     if (first) {
       submit.waitSemaphoreCount = info.waitSemaphoreCount;
@@ -591,10 +712,28 @@ static VkResult VexaRotSubmit(VkQueue queue, const VkPresentInfoKHR& info, std::
     submit.pCommandBuffers = &rot->Commands[index];
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &rot->Done[index];
-    const VkResult result = fns.vkQueueSubmit(queue, 1, &submit, rot->Fences[index]);
+    // WSI continues to consume a BINARY Done semaphore. The private timeline
+    // is only a retirement marker, never passed to vkQueuePresentKHR.
+    VkSemaphore signals[2] {rot->Done[index], rot->Timeline};
+    uint64_t values[2] {0, rot->TimelineValue + 1};
+    std::vector<uint64_t> waitValues(submit.waitSemaphoreCount, 0);
+    VkTimelineSemaphoreSubmitInfo timeline {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    if (rot->Timeline) {
+      timeline.waitSemaphoreValueCount = waitValues.size(); timeline.pWaitSemaphoreValues = waitValues.data();
+      timeline.signalSemaphoreValueCount = 2; timeline.pSignalSemaphoreValues = values;
+      submit.pNext = &timeline; submit.signalSemaphoreCount = 2; submit.pSignalSemaphores = signals;
+    }
+    const VkResult result = fns.vkQueueSubmit(queue, 1, &submit, rot->Async ? VK_NULL_HANDLE : rot->Fences[index]);
     if (result != VK_SUCCESS) {
-      rot->Lost = true;
+      rot->Lost = result == VK_ERROR_DEVICE_LOST;
       return result;
+    }
+    if (!rot->Async) rot->FencePending[index] = true;
+    if (rot->Timeline) rot->ImageValues[index] = ++rot->TimelineValue;
+    if (rot->Profile) {
+      rot->ProfileSubmitted[index] = true;
+      rot->Samples.Add(std::chrono::duration<double, std::milli>(waitEnd - waitStart).count(), waitCpuNs / 1.0e6,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submitStart).count(), gpuMs);
     }
     first = false;
     waits.push_back(rot->Done[index]);
