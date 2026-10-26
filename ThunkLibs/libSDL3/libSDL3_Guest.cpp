@@ -3060,6 +3060,10 @@ extern "C" Uint64 SDL_GetTicks() {
   return fexfn_pack_FEX_SDL_GetTicks();
 }
 
+extern "C" Uint64 SDL_GetTicksNS() {
+  return fexfn_pack_FEX_SDL_GetTicksNS();
+}
+
 extern "C" Uint64 SDL_GetTicks64() {
   return SDL_GetTicks();
 }

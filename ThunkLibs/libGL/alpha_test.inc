@@ -171,8 +171,14 @@ static void VexaApplyAlphaTest() {
   auto& programs = context.Shared->AlphaPrograms;
   auto it = programs.find(program);
   if (it == programs.end()) it = programs.emplace(program, VexaAlphaProgram(program)).first;
-  const auto& uniforms = it->second;
+  auto& uniforms = it->second;
   if (uniforms.Function < 0) return;
-  ::glProgramUniform1i(program, uniforms.Function, context.AlphaTest ? context.AlphaFunction - GL_NEVER + 1 : 0);
-  ::glProgramUniform1f(program, uniforms.Reference, context.AlphaReference);
+  const GLint function = context.AlphaTest ? context.AlphaFunction - GL_NEVER + 1 : 0;
+  if (!uniforms.Applied || uniforms.LastFunction != function)
+    ::glProgramUniform1i(program, uniforms.Function, function);
+  if (!uniforms.Applied || memcmp(&uniforms.LastReference, &context.AlphaReference, sizeof(GLfloat)))
+    ::glProgramUniform1f(program, uniforms.Reference, context.AlphaReference);
+  uniforms.LastFunction = function;
+  uniforms.LastReference = context.AlphaReference;
+  uniforms.Applied = true;
 }

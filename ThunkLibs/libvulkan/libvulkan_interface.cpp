@@ -2040,10 +2040,18 @@ template<>
 struct fex_gen_config<vkEnumeratePhysicalDeviceGroups> {};
 #endif
 template<>
-struct fex_gen_config<vkGetImageMemoryRequirements2> {};
+struct fex_gen_config<vkGetImageMemoryRequirements2>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkGetBufferMemoryRequirements2> {};
+struct fex_gen_config<vkGetBufferMemoryRequirements2>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkGetImageSparseMemoryRequirements2> {};
 #endif
@@ -2195,9 +2203,17 @@ template<>
 struct fex_gen_config<vkCmdSetPrimitiveRestartEnable> {};
 #ifndef IS_32BIT_THUNK
 template<>
-struct fex_gen_config<vkGetDeviceBufferMemoryRequirements> {};
+struct fex_gen_config<vkGetDeviceBufferMemoryRequirements>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkGetDeviceImageMemoryRequirements> {};
+struct fex_gen_config<vkGetDeviceImageMemoryRequirements>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkGetDeviceImageSparseMemoryRequirements> {};
 #endif
@@ -2481,9 +2497,17 @@ struct fex_gen_config<vkGetDisplayModeProperties2KHR> {};
 template<>
 struct fex_gen_config<vkGetDisplayPlaneCapabilities2KHR> {};
 template<>
-struct fex_gen_config<vkGetImageMemoryRequirements2KHR> {};
+struct fex_gen_config<vkGetImageMemoryRequirements2KHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkGetBufferMemoryRequirements2KHR> {};
+struct fex_gen_config<vkGetBufferMemoryRequirements2KHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkGetImageSparseMemoryRequirements2KHR> {};
 template<>
@@ -2575,9 +2599,17 @@ struct fex_gen_config<vkCmdResolveImage2KHR> {};
 template<>
 struct fex_gen_config<vkCmdTraceRaysIndirect2KHR> {};
 template<>
-struct fex_gen_config<vkGetDeviceBufferMemoryRequirementsKHR> {};
+struct fex_gen_config<vkGetDeviceBufferMemoryRequirementsKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkGetDeviceImageMemoryRequirementsKHR> {};
+struct fex_gen_config<vkGetDeviceImageMemoryRequirementsKHR>
+#if defined(BUILD_ANDROID)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkGetDeviceImageSparseMemoryRequirementsKHR> {};
 template<>

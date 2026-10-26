@@ -77,13 +77,22 @@ public:
       }
       found=state.Linked.emplace(key,std::move(linked)).first;
     }
-    const auto& linked=found->second;::glUseProgram(linked.Program);Bound=true;
-    for(const auto& uniform:linked.Uniforms) {
-      if(uniform.Kind==2)::glUniform1i(uniform.Location,uniform.Stage);
+    auto& linked=found->second;::glUseProgram(linked.Program);Bound=true;
+    for(auto& uniform:linked.Uniforms) {
+      if(uniform.Kind==2) {
+        if(!uniform.Applied)::glUniform1i(uniform.Location,uniform.Stage);
+      }
       else {
         const auto& data=uniform.Kind==1?state.Env[uniform.Stage]:(uniform.Stage?fragment.Local:vertex.Local);
-        ::glUniform4fv(uniform.Location,std::min(uniform.Count,128),data[0].data());
+        const auto count=std::min(uniform.Count,128);
+        const size_t bytes=static_cast<size_t>(count)*4*sizeof(GLfloat);
+        if(!uniform.Applied || uniform.Values.size()!=static_cast<size_t>(count)*4 || memcmp(uniform.Values.data(),data[0].data(),bytes)) {
+          ::glUniform4fv(uniform.Location,count,data[0].data());
+          uniform.Values.resize(static_cast<size_t>(count)*4);
+          memcpy(uniform.Values.data(),data.data(),bytes);
+        }
       }
+      uniform.Applied=true;
     }
   }
   ~VexaAssemblyDrawScope() {if(Bound)::glUseProgram(0);}

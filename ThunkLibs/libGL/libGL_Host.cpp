@@ -190,17 +190,28 @@ uint64_t GLHostNowNs() {
 }
 
 
-// Temporary A/B upload experiment.
-static std::atomic<bool> VexaOrphanExperiment{false};
+// Opt-in diagnostics/experiment, sampled once at process start. The default
+// upload path must not query capacity, read clocks, or search a sample table.
+static bool VexaUploadOption(const char* env, const char* flag) {
+  const char* value = getenv(env);
+  return (value && !strcmp(value, "1")) || access(flag, F_OK) == 0;
+}
+static bool VexaUploadProfileEnabled() {
+  static const bool enabled = VexaUploadOption("VEXA_GL_UPLOAD_PROFILE", "/data/data/com.critical.vexaemulator/files/vexa_upload_profile.flag");
+  return enabled;
+}
+static std::atomic<bool> VexaOrphanExperiment{VexaUploadOption("VEXA_GL_BUFFER_ORPHAN", "/data/data/com.critical.vexaemulator/files/vexa_buffer_orphan.flag")};
 struct VexaUploadSample { GLenum target; GLintptr offset; GLsizeiptr size; GLint64 capacity; uint64_t count=0, ns=0; };
 static thread_local std::vector<VexaUploadSample> VexaUploadSamples;
+static thread_local uint64_t VexaUploadDropped {};
 static void VexaUploadReport() {
+ if (!VexaUploadProfileEnabled()) return;
  uint64_t total=0,full=0;for(const auto& x:VexaUploadSamples){total+=x.count;if(x.offset==0&&x.size==x.capacity)full+=x.count;}
- fprintf(stderr,"[UPLOAD] enabled=%d total=%llu full=%llu\n",VexaOrphanExperiment.load(),(unsigned long long)total,(unsigned long long)full);
+ fprintf(stderr,"[UPLOAD] enabled=%d total=%llu full=%llu dropped=%llu\n",VexaOrphanExperiment.load(),(unsigned long long)total,(unsigned long long)full,(unsigned long long)VexaUploadDropped);
  std::sort(VexaUploadSamples.begin(),VexaUploadSamples.end(),[](const auto&a,const auto&b){return a.ns>b.ns;});
  for(size_t i=0;i<std::min(size_t(12),VexaUploadSamples.size());++i){const auto &x=VexaUploadSamples[i];fprintf(stderr,"[UPLOAD] target=%x offset=%lld size=%lld capacity=%lld count=%llu ms=%.4f\n",x.target,(long long)x.offset,(long long)x.size,(long long)x.capacity,(unsigned long long)x.count,x.ns/1e6);}
  VexaUploadSamples.clear();
- VexaOrphanExperiment.store(access("/data/data/com.critical.vexaemulator/files/vexa_buffer_orphan.flag",F_OK)==0);
+ VexaUploadDropped = 0;
 }
 
 void GLHostMarkProgress(const char* call) {
@@ -3500,6 +3511,10 @@ static GLuint VexaBuildStrippedVertexProgram(GLuint pipe) {
 // Validates each bound pipeline once. On failure, tries to repair it with a
 // stripped-output vertex clone (see VexaBuildStrippedVertexProgram).
 static void VexaPreDraw() {
+  // No native compatibility uniforms or pipeline clone can be used here.
+  // Generation cleanup can wait until the next pipeline draw, which refreshes
+  // it under the share-group lock before using a clone again.
+  if (!g_vexa_intended_pipe && !VexaAlphaTestAvailable() && !VexaClipAvailable()) return;
   VEXA_PROGRAM_LOCK();
   VexaRefreshProgramGeneration();
   VexaApplyAlphaTest();
@@ -4027,7 +4042,13 @@ static void fexfn_impl_libGL_glBufferSubData(GLenum target, GLintptr offset, GLs
   if (VexaTboWriteLog() && VexaTboBoundTarget(target, nullptr))
     fprintf(stderr, "[libGL-host] tbosub target=%x buf=%d off=%lld size=%lld tid=%ld\n",
             target, VexaHostBoundBuffer(target), (long long)offset, (long long)size, (long)syscall(SYS_gettid));
-  const auto begin=GLHostNowNs();
+  const bool profile = VexaUploadProfileEnabled();
+  const bool experiment = VexaOrphanExperiment.load(std::memory_order_relaxed);
+  if (!profile && !experiment) {
+    ::glBufferSubData(target, offset, size, data);
+    return;
+  }
+  const auto begin=profile ? GLHostNowNs() : 0;
   GLint64 capacity=0;::glGetBufferParameteri64v(target,GL_BUFFER_SIZE,&capacity);
   bool orphan=false;
   if(VexaOrphanExperiment.load()&&offset==0&&size>0&&size==capacity&&data) {
@@ -4038,9 +4059,13 @@ static void fexfn_impl_libGL_glBufferSubData(GLenum target, GLintptr offset, GLs
     if(!mapped&&!immutable){::glGetBufferParameteriv(target,GL_BUFFER_USAGE,&usage);::glBufferData(target,size,data,usage);orphan=true;}
   }
   if(!orphan)::glBufferSubData(target, offset, size, data);
+  if (!profile) return;
   const auto elapsed=GLHostNowNs()-begin;
   auto it=std::find_if(VexaUploadSamples.begin(),VexaUploadSamples.end(),[&](const auto& x){return x.target==target&&x.offset==offset&&x.size==size&&x.capacity==capacity;});
-  if(it==VexaUploadSamples.end()){VexaUploadSamples.push_back({target,offset,size,capacity});it=VexaUploadSamples.end()-1;}
+  if(it==VexaUploadSamples.end()){
+    if (VexaUploadSamples.size() >= 256) { ++VexaUploadDropped; return; }
+    VexaUploadSamples.push_back({target,offset,size,capacity});it=VexaUploadSamples.end()-1;
+  }
   ++it->count;it->ns+=elapsed;
 }
 static void fexfn_impl_libGL_glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
@@ -4492,28 +4517,32 @@ struct VexaUnpackScope {
     ::glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &img_h);
     ::glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_img);
     ::glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
-    ::glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    ::glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    ::glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-    ::glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-    ::glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
-    ::glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
+    if (align != 1) ::glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (row) ::glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    if (skip_px) ::glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    if (skip_rows) ::glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    if (img_h) ::glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+    if (skip_img) ::glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
     if (pbo) {
       ::glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     }
   }
   ~VexaUnpackScope() {
-    ::glPixelStorei(GL_UNPACK_ALIGNMENT, align);
-    ::glPixelStorei(GL_UNPACK_ROW_LENGTH, row);
-    ::glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_px);
-    ::glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
-    ::glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, img_h);
-    ::glPixelStorei(GL_UNPACK_SKIP_IMAGES, skip_img);
+    if (align != 1) ::glPixelStorei(GL_UNPACK_ALIGNMENT, align);
+    if (row) ::glPixelStorei(GL_UNPACK_ROW_LENGTH, row);
+    if (skip_px) ::glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_px);
+    if (skip_rows) ::glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+    if (img_h) ::glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, img_h);
+    if (skip_img) ::glPixelStorei(GL_UNPACK_SKIP_IMAGES, skip_img);
     if (pbo) {
       ::glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
     }
   }
 };
+
+#if defined(BUILD_ANDROID)
+#include "bcn_gpu_decode.inc"
+#endif
 
 void VexaBCLogOnce(const char* where, GLenum fmt) {
   if (!VexaGLVerbose()) return;
@@ -4631,6 +4660,12 @@ static void VexaGL_glCompressedTexImage2D(GLenum target, GLint level, GLenum int
     return;
   }
   VexaBCLogOnce("glCompressedTexImage2D", internalformat);
+#if defined(BUILD_ANDROID)
+  if (VexaBcnGpuUploadImage(target, level, false, 0, 0, 0, bc, width, height, 1, imageSize, data)) {
+    VexaDumpTexture(target, level, "cimg");
+    return;
+  }
+#endif
   static thread_local std::vector<uint8_t> px;
   bool ok = false;
   {
@@ -4670,6 +4705,12 @@ static void VexaGL_glCompressedTexSubImage2D(GLenum target, GLint level, GLint x
   }
   static thread_local std::vector<uint8_t> px;
   bool ok = false;
+#if defined(BUILD_ANDROID)
+  if (VexaBcnGpuUploadImage(target, level, true, xoffset, yoffset, 0, bc, width, height, 1, imageSize, data)) {
+    VexaDumpTexture(target, level, "csub");
+    return;
+  }
+#endif
   {
     const GLsizei fetch = VexaBCFetchSize(bc, width, height, imageSize);
     VexaBCSource src(data, fetch);
@@ -4692,6 +4733,11 @@ static void VexaGL_glCompressedTexImage3D(GLenum target, GLint level, GLenum int
     return;
   }
   VexaBCLogOnce("glCompressedTexImage3D", internalformat);
+#if defined(BUILD_ANDROID)
+  if (VexaBcnGpuUploadImage(target, level, false, 0, 0, 0, bc, width, height, depth, imageSize, data)) {
+    return;
+  }
+#endif
   static thread_local std::vector<uint8_t> all;
   all.clear();
   bool ok = depth > 0;
@@ -4720,6 +4766,11 @@ static void VexaGL_glCompressedTexSubImage3D(GLenum target, GLint level, GLint x
     return;
   }
   VexaBCLogOnce("glCompressedTexSubImage3D", format);
+#if defined(BUILD_ANDROID)
+  if (VexaBcnGpuUploadImage(target, level, true, xoffset, yoffset, zoffset, bc, width, height, depth, imageSize, data)) {
+    return;
+  }
+#endif
   static thread_local std::vector<uint8_t> all;
   all.clear();
   bool ok = depth > 0;

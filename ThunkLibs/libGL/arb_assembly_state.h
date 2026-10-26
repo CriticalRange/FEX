@@ -12,6 +12,8 @@ struct VexaAssemblyUniform {
   GLint Location;
   GLsizei Count;
   int Stage, Kind; // 0 local, 1 environment, 2 sampler
+  bool Applied = false;
+  std::vector<GLfloat> Values;
 };
 struct VexaAssemblyLinked {
   GLuint Program = 0;

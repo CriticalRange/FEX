@@ -1743,6 +1743,12 @@ static Uint64 fexfn_impl_libSDL3_FEX_SDL_GetTicks() {
   return GetTimestampNS() / 1000000ULL;
 }
 
+static Uint64 fexfn_impl_libSDL3_FEX_SDL_GetTicksNS() {
+  // Keep event timestamps and millisecond ticks on the same monotonic clock,
+  // without losing sub-millisecond precision by scaling SDL_GetTicks().
+  return GetTimestampNS();
+}
+
 static void fexfn_impl_libSDL3_FEX_SDL_Delay(Uint32 ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
@@ -1949,6 +1955,7 @@ FEX_SDL_EXPORT_RET(int, GL_SwapWindow, (SDL_Window* window), (window));
 
 FEX_SDL_EXPORT_RET(int, PollEvent, (void* event), (event));
 FEX_SDL_EXPORT_RET(Uint64, GetTicks, (), ());
+FEX_SDL_EXPORT_RET(Uint64, GetTicksNS, (), ());
 FEX_SDL_EXPORT_VOID(Delay, (Uint32 ms), (ms));
 FEX_SDL_EXPORT_RET(int, StartTextInput, (SDL_Window* window), (window));
 FEX_SDL_EXPORT_RET(int, StopTextInput, (SDL_Window* window), (window));

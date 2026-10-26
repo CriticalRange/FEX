@@ -106,6 +106,9 @@ public:
   const void* Indices=nullptr;
   VexaLegacyArrayScope(GLint first=-1,GLsizei count=-1,GLenum indexType=0,const void* indices=nullptr,GLint baseVertex=0):Indices(indices) {
     auto& client=VexaProgramContext().LegacyClient;
+    // GLSL uniforms start at zero. A share group which never used a BGRA
+    // compatibility array has no selector to reset and no arrays to stage.
+    if (!client.Used && !VexaProgramContext().Shared->BGRATouched.load(std::memory_order_relaxed)) return;
     auto it=client.Arrays.find(VexaLegacyVAO());
     static const std::array<VexaLegacyArray,16> empty{};
     const uint32_t gpuBGRA=VexaPrepareBGRAVertexInputs(it==client.Arrays.end()?empty:it->second);

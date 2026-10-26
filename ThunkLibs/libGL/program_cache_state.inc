@@ -3,10 +3,16 @@
 // never with an eglGetCurrentContext query for every uniform/draw.
 struct VexaAlphaProgramState {
   GLint Function = -1, Reference = -1;
+  bool Applied = false;
+  GLint LastFunction = 0;
+  GLfloat LastReference = 0;
 };
 
 struct VexaProgramShareState {
   std::recursive_mutex Mutex;
+  // Monotonic: once a shared program could have a nonzero BGRA selector,
+  // other contexts must keep clearing it even when they have no client arrays.
+  std::atomic<bool> BGRATouched {false};
   std::unordered_map<GLuint, std::vector<std::pair<GLenum, std::string>>> Sources;
   std::unordered_map<GLuint, std::pair<GLenum, std::string>> DirectSources;
   std::unordered_map<GLuint, std::vector<GLuint>> Clones;

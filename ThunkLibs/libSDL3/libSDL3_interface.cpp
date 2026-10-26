@@ -46,6 +46,7 @@ int FEX_SDL_GL_SetSwapInterval(int interval);
 int FEX_SDL_GL_SwapWindow(SDL_Window* window);
 int FEX_SDL_PollEvent(void* event);
 Uint64 FEX_SDL_GetTicks();
+Uint64 FEX_SDL_GetTicksNS();
 void FEX_SDL_Delay(Uint32 ms);
 int FEX_SDL_StartTextInput(SDL_Window* window);
 int FEX_SDL_StopTextInput(SDL_Window* window);
@@ -92,6 +93,8 @@ template<>
 struct fex_gen_config<FEX_SDL_PollEvent> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<FEX_SDL_GetTicks> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<FEX_SDL_GetTicksNS> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<FEX_SDL_Delay> : fexgen::custom_host_impl {};
 template<>

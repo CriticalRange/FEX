@@ -63,11 +63,24 @@ static void VexaApplyClipPlanes() {
     ::glGetProgramPipelineiv(ctx.IntendedPipeline,GL_VERTEX_SHADER,programs);
     ::glGetProgramPipelineiv(ctx.IntendedPipeline,GL_FRAGMENT_SHADER,programs+1);
   }
-  GLfloat eye[24]{},projected[24]{};GLdouble inverse[16]{};const bool valid=VexaInverse4(ctx.Clip.Projection,inverse);
-  for(int p=0;p<6;++p)for(int i=0;i<4;++i) {
-    eye[p*4+i]=ctx.Clip.Equation[p][i];
-    if(valid)for(int j=0;j<4;++j)projected[p*4+i]+=inverse[i*4+j]*ctx.Clip.Equation[p][j];
+  auto& state=ctx.Clip;
+  const bool projectionChanged=!state.Derived || memcmp(state.SavedProjection,state.Projection,sizeof(state.Projection));
+  if(projectionChanged || memcmp(state.SavedEquation,state.Equation,sizeof(state.Equation))) {
+    GLdouble inverse[16]{};const bool valid=VexaInverse4(state.Projection,inverse);
+    std::fill_n(state.Projected,24,0.f);
+    for(int p=0;p<6;++p)for(int i=0;i<4;++i) {
+      state.Eye[p*4+i]=state.Equation[p][i];
+      if(valid)for(int j=0;j<4;++j)state.Projected[p*4+i]+=inverse[i*4+j]*state.Equation[p][j];
+    }
+    memcpy(state.SavedEquation,state.Equation,sizeof(state.Equation));
   }
+  if(projectionChanged || memcmp(state.SavedModel,state.Model,sizeof(state.Model))) {
+    std::fill_n(state.MVP,16,0.f);
+    for(int c=0;c<4;++c)for(int r=0;r<4;++r)for(int k=0;k<4;++k)state.MVP[c*4+r]+=state.Projection[k*4+r]*state.Model[c*4+k];
+    memcpy(state.SavedModel,state.Model,sizeof(state.Model));
+  }
+  memcpy(state.SavedProjection,state.Projection,sizeof(state.Projection));
+  state.Derived=true;
   for(int n=0;n<2;++n) {
     const GLuint program=programs[n];if(!program||(n&&program==static_cast<GLuint>(programs[0])))continue;
     auto [it,added]=ctx.Shared->ClipPrograms.try_emplace(program);
@@ -78,9 +91,18 @@ static void VexaApplyClipPlanes() {
       loc.Enabled=::glGetUniformLocation(program,"vexa_clip_enabled[0]");
       loc.MVP=::glGetUniformLocation(program,"vexa_compat_MVP");
     }
-    if(loc.Eye>=0)::glProgramUniform4fv(program,loc.Eye,6,eye);
-    if(loc.Projected>=0)::glProgramUniform4fv(program,loc.Projected,6,projected);
-    if(loc.Enabled>=0)::glProgramUniform1iv(program,loc.Enabled,6,ctx.Clip.Enabled);
-    if(loc.MVP>=0){GLfloat mvp[16]{};for(int c=0;c<4;++c)for(int r=0;r<4;++r)for(int k=0;k<4;++k)mvp[c*4+r]+=ctx.Clip.Projection[k*4+r]*ctx.Clip.Model[c*4+k];::glProgramUniformMatrix4fv(program,loc.MVP,1,GL_FALSE,mvp);}
+    if(loc.Eye>=0 && (!loc.Applied || memcmp(loc.LastEye,state.Eye,sizeof(state.Eye))))
+      ::glProgramUniform4fv(program,loc.Eye,6,state.Eye);
+    if(loc.Projected>=0 && (!loc.Applied || memcmp(loc.LastProjected,state.Projected,sizeof(state.Projected))))
+      ::glProgramUniform4fv(program,loc.Projected,6,state.Projected);
+    if(loc.Enabled>=0 && (!loc.Applied || memcmp(loc.LastEnabled,state.Enabled,sizeof(state.Enabled))))
+      ::glProgramUniform1iv(program,loc.Enabled,6,state.Enabled);
+    if(loc.MVP>=0 && (!loc.Applied || memcmp(loc.LastMVP,state.MVP,sizeof(state.MVP))))
+      ::glProgramUniformMatrix4fv(program,loc.MVP,1,GL_FALSE,state.MVP);
+    memcpy(loc.LastEye,state.Eye,sizeof(state.Eye));
+    memcpy(loc.LastProjected,state.Projected,sizeof(state.Projected));
+    memcpy(loc.LastEnabled,state.Enabled,sizeof(state.Enabled));
+    memcpy(loc.LastMVP,state.MVP,sizeof(state.MVP));
+    loc.Applied=true;
   }
 }

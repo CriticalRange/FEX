@@ -19,6 +19,7 @@ static void fexfn_impl_libGL_glVertexAttribPointer(GLuint index,GLint size,GLenu
   if(!normalized||(type!=GL_UNSIGNED_BYTE&&type!=GL_INT_2_10_10_10_REV&&type!=GL_UNSIGNED_INT_2_10_10_10_REV)){VexaAssemblyError(GL_INVALID_OPERATION);return;}
   GLint enabled=0;::glGetVertexAttribiv(index,GL_VERTEX_ATTRIB_ARRAY_ENABLED,&enabled);
   VexaLegacyPointer(index,4,type,stride,pointer,true);
+  VexaProgramContext().Shared->BGRATouched.store(true, std::memory_order_relaxed);
   auto& a=VexaLegacyArrays()[index];a.BGRA=true;a.Enabled=enabled!=0;
 }
 static void fexfn_impl_libGL_glVertexAttribPointerARB(GLuint index,GLint size,GLenum type,GLboolean normalized,GLsizei stride,const void* pointer){fexfn_impl_libGL_glVertexAttribPointer(index,size,type,normalized,stride,pointer);}

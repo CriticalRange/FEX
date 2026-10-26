@@ -19,6 +19,7 @@ $end_info$
 #include "common/Host.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
@@ -623,6 +624,7 @@ static void VexaDestroyPassProfiles(VkDevice device);
 #include "vulkan_pass_profile.inc"
 #include "vulkan_shader_opt.inc"
 #endif
+#include "vulkan_spirv_fixes.inc"
 
 static VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice a_0, VkSurfaceKHR a_1, VkSurfaceCapabilitiesKHR* a_2) {
   if(auto f=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(VexaX11Proc("vkGetPhysicalDeviceSurfaceCapabilitiesKHR")))return f(a_0,a_1,a_2);
@@ -814,10 +816,36 @@ FEXFN_IMPL(vkCreateShaderModule)(VkDevice a_0, const VkShaderModuleCreateInfo* a
   VkShaderModuleCreateInfo copy {};
   if (!optimized.empty()) { copy = *a_1; copy.pCode = optimized.data(); copy.codeSize = optimized.size() * sizeof(uint32_t); effective = &copy; }
 #endif
+#if defined(BUILD_ANDROID)
+  // VEXA_FIXES: rewrite invalid OpConstantComposite-with-spec-consts shaders.
+  // Applies to the already-effective code (optimized or original). Opt-out:
+  // VEXA_VK_NO_SPEC_COMPOSITE_FIX=1.
+  static const bool vexaNoSpecFix = [] {
+    const char* e = std::getenv("VEXA_VK_NO_SPEC_COMPOSITE_FIX");
+    return e && std::strcmp(e, "1") == 0;
+  }();
+  std::vector<uint32_t> specFixed;
+  VkShaderModuleCreateInfo specCopy {};
+  if (!vexaNoSpecFix && effective && effective->pCode && effective->codeSize >= 20 && (effective->codeSize % 4) == 0 &&
+      VexaNeedsSpecCompositeFix(static_cast<const uint32_t*>(effective->pCode), effective->codeSize / 4)) {
+    const uint32_t* words = static_cast<const uint32_t*>(effective->pCode);
+    specFixed.assign(words, words + effective->codeSize / 4);
+    if (const uint32_t patched = VexaFixSpecConstantComposites(specFixed)) {
+      static std::atomic<uint32_t> logged {0};
+      if (logged.fetch_add(1) < 32) {
+        fprintf(stderr, "[VEXA][VK-SPIRV] spec-composite fix: %u\n", patched);
+      }
+      specCopy = *effective;
+      specCopy.pCode = specFixed.data();
+      specCopy.codeSize = specFixed.size() * sizeof(uint32_t);
+      effective = &specCopy;
+    }
+  }
+#endif
   auto result = LDR_PTR(vkCreateShaderModule)(a_0, effective, nullptr, a_3);
-#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+#if defined(BUILD_ANDROID)
   if (result != VK_SUCCESS && effective != a_1) {
-    fprintf(stderr, "[VEXA][VK-OPT] optimized module rejected (%d); using original\n", static_cast<int>(result));
+    fprintf(stderr, "[VEXA][VK-OPT] modified module rejected (%d); using original\n", static_cast<int>(result));
     effective = a_1;
     result = LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);
   }
@@ -975,8 +1003,143 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
 
 static VkResult FEXFN_IMPL(vkAllocateMemory)(VkDevice a_0, const VkMemoryAllocateInfo* a_1, const VkAllocationCallbacks* a_2, VkDeviceMemory* a_3) {
   (void*&)LDR_PTR(vkAllocateMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkAllocateMemory");
+#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+  static const bool allocCount = VexaVkProfileEnabled() ||
+    access("/data/data/com.critical.vexaemulator/files/vexa_vk_alloc_count.flag", F_OK) == 0;
+  if (allocCount) {
+    static std::atomic<uint64_t> allocations {0};
+    const uint64_t total = allocations.fetch_add(1) + 1;
+    if (total % 32 == 0 || total < 8) {
+      fprintf(stderr, "[VEXA][VK-PERF] vkAllocateMemory total=%llu\n", static_cast<unsigned long long>(total));
+    }
+  }
+#endif
   return LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);
 }
+
+#if defined(BUILD_ANDROID)
+// VEXA_FIXES: Mali reports prefersDedicatedAllocation for most images, so
+// engines/VMA create one VkDeviceMemory (one kbase allocation) per texture.
+// Clear only the preference; requiresDedicatedAllocation stays authoritative.
+// Opt-out: VEXA_VK_KEEP_DEDICATED_PREF=1.
+static bool VexaVkKeepDedicatedPref() {
+  static const bool keep = [] {
+    const char* e = std::getenv("VEXA_VK_KEEP_DEDICATED_PREF");
+    return (e && std::strcmp(e, "1") == 0) ||
+           access("/data/data/com.critical.vexaemulator/files/vexa_vk_keep_ded_pref.flag", F_OK) == 0;
+  }();
+  return keep;
+}
+
+// Diagnostic counters for the dedicated-preference clear, enabled with the
+// same flag as the allocation counter.
+static std::atomic<uint32_t> vexaDedCalls {0}, vexaDedChained {0}, vexaDedPrefers {0}, vexaDedRequires {0},
+  vexaDedCleared {0};
+
+static void VexaClearDedicatedPreference(VkMemoryRequirements2* req) {
+  static const bool count = VexaVkProfileEnabled() ||
+    access("/data/data/com.critical.vexaemulator/files/vexa_vk_alloc_count.flag", F_OK) == 0;
+  const uint32_t calls = vexaDedCalls.fetch_add(1) + 1;
+  if (req) {
+    const bool keep = VexaVkKeepDedicatedPref();
+    for (auto* s = static_cast<VkBaseOutStructure*>(req->pNext); s; s = s->pNext) {
+      if (s->sType != VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+        continue;
+      }
+      auto* ded = reinterpret_cast<VkMemoryDedicatedRequirements*>(s);
+      vexaDedChained.fetch_add(1);
+      if (ded->prefersDedicatedAllocation) vexaDedPrefers.fetch_add(1);
+      if (ded->requiresDedicatedAllocation) vexaDedRequires.fetch_add(1);
+      if (!keep && !ded->requiresDedicatedAllocation && ded->prefersDedicatedAllocation) {
+        ded->prefersDedicatedAllocation = VK_FALSE;
+        vexaDedCleared.fetch_add(1);
+      }
+    }
+  }
+  if (count && (calls < 4 || calls % 32 == 0)) {
+    fprintf(stderr, "[VEXA][VK-DED] calls=%u chained=%u prefers=%u requires=%u cleared=%u\n", calls,
+            vexaDedChained.load(), vexaDedPrefers.load(), vexaDedRequires.load(), vexaDedCleared.load());
+  }
+}
+
+static void FEXFN_IMPL(vkGetImageMemoryRequirements2)(VkDevice a_0, const VkImageMemoryRequirementsInfo2* a_1,
+                                                     VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetImageMemoryRequirements2) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetImageMemoryRequirements2");
+  if (LDR_PTR(vkGetImageMemoryRequirements2)) {
+    LDR_PTR(vkGetImageMemoryRequirements2)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+
+static void FEXFN_IMPL(vkGetImageMemoryRequirements2KHR)(VkDevice a_0, const VkImageMemoryRequirementsInfo2* a_1,
+                                                        VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetImageMemoryRequirements2KHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetImageMemoryRequirements2KHR");
+  if (LDR_PTR(vkGetImageMemoryRequirements2KHR)) {
+    LDR_PTR(vkGetImageMemoryRequirements2KHR)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+
+static void FEXFN_IMPL(vkGetBufferMemoryRequirements2KHR)(VkDevice a_0, const VkBufferMemoryRequirementsInfo2* a_1,
+                                                         VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetBufferMemoryRequirements2KHR) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetBufferMemoryRequirements2KHR");
+  if (LDR_PTR(vkGetBufferMemoryRequirements2KHR)) {
+    LDR_PTR(vkGetBufferMemoryRequirements2KHR)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+
+static void FEXFN_IMPL(vkGetDeviceBufferMemoryRequirementsKHR)(VkDevice a_0, const VkDeviceBufferMemoryRequirements* a_1,
+                                                              VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetDeviceBufferMemoryRequirementsKHR) =
+    (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetDeviceBufferMemoryRequirementsKHR");
+  if (LDR_PTR(vkGetDeviceBufferMemoryRequirementsKHR)) {
+    LDR_PTR(vkGetDeviceBufferMemoryRequirementsKHR)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+
+static void FEXFN_IMPL(vkGetDeviceImageMemoryRequirementsKHR)(VkDevice a_0, const VkDeviceImageMemoryRequirements* a_1,
+                                                             VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetDeviceImageMemoryRequirementsKHR) =
+    (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetDeviceImageMemoryRequirementsKHR");
+  if (LDR_PTR(vkGetDeviceImageMemoryRequirementsKHR)) {
+    LDR_PTR(vkGetDeviceImageMemoryRequirementsKHR)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+
+#ifndef IS_32BIT_THUNK
+static void FEXFN_IMPL(vkGetBufferMemoryRequirements2)(VkDevice a_0, const VkBufferMemoryRequirementsInfo2* a_1,
+                                                        VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetBufferMemoryRequirements2) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetBufferMemoryRequirements2");
+  if (LDR_PTR(vkGetBufferMemoryRequirements2)) {
+    LDR_PTR(vkGetBufferMemoryRequirements2)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+
+static void FEXFN_IMPL(vkGetDeviceBufferMemoryRequirements)(VkDevice a_0, const VkDeviceBufferMemoryRequirements* a_1,
+                                                             VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetDeviceBufferMemoryRequirements) =
+    (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetDeviceBufferMemoryRequirements");
+  if (LDR_PTR(vkGetDeviceBufferMemoryRequirements)) {
+    LDR_PTR(vkGetDeviceBufferMemoryRequirements)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+
+static void FEXFN_IMPL(vkGetDeviceImageMemoryRequirements)(VkDevice a_0, const VkDeviceImageMemoryRequirements* a_1,
+                                                            VkMemoryRequirements2* a_2) {
+  (void*&)LDR_PTR(vkGetDeviceImageMemoryRequirements) =
+    (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetDeviceImageMemoryRequirements");
+  if (LDR_PTR(vkGetDeviceImageMemoryRequirements)) {
+    LDR_PTR(vkGetDeviceImageMemoryRequirements)(a_0, a_1, a_2);
+    VexaClearDedicatedPreference(a_2);
+  }
+}
+#endif
+#endif
 
 static void FEXFN_IMPL(vkFreeMemory)(VkDevice a_0, VkDeviceMemory a_1, const VkAllocationCallbacks* a_2) {
   (void*&)LDR_PTR(vkFreeMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkFreeMemory");
@@ -1187,6 +1350,16 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkEnumerateInstanceExtensionProperties;
   } else if (a_1 == "vkCreateDisplayPlaneSurfaceKHR"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDisplayPlaneSurfaceKHR;
+  } else if (a_1 == "vkGetImageMemoryRequirements2"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetImageMemoryRequirements2;
+  } else if (a_1 == "vkGetImageMemoryRequirements2KHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetImageMemoryRequirements2KHR;
+  } else if (a_1 == "vkGetBufferMemoryRequirements2KHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetBufferMemoryRequirements2KHR;
+  } else if (a_1 == "vkGetDeviceBufferMemoryRequirementsKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceBufferMemoryRequirementsKHR;
+  } else if (a_1 == "vkGetDeviceImageMemoryRequirementsKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceImageMemoryRequirementsKHR;
 #ifndef IS_32BIT_THUNK
   } else if (a_1 == "vkCmdBindPipeline"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdBindPipeline;
@@ -1222,6 +1395,12 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkQueuePresentKHR;
   } else if (a_1 == "vkWaitForFences"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkWaitForFences;
+  } else if (a_1 == "vkGetBufferMemoryRequirements2"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetBufferMemoryRequirements2;
+  } else if (a_1 == "vkGetDeviceBufferMemoryRequirements"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceBufferMemoryRequirements;
+  } else if (a_1 == "vkGetDeviceImageMemoryRequirements"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceImageMemoryRequirements;
 #endif
 #endif
 #ifdef IS_32BIT_THUNK
