@@ -68,13 +68,12 @@ static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFuncti
 }
 
 PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
-#if defined(BUILD_ANDROID)
-  // VEXA_FIXES: These two are custom_guest_entrypoint, so HostPtrInvokers has no
-  // entry and MakeGuestCallable would return null. vulkan.hpp queries them by
-  // name through GDPA. Return the guest entry points, matching GIPA's GDPA case.
+  // Upstream handles self-lookup for all platforms.
   if (a_1 && a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
     return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
   }
+#if defined(BUILD_ANDROID)
+  // Android guests also request the instance resolver through GDPA.
   if (a_1 && a_1 == std::string_view {"vkGetInstanceProcAddr"}) {
     return reinterpret_cast<PFN_vkVoidFunction>(vkGetInstanceProcAddr);
   }
@@ -89,6 +88,8 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
 PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
   if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
     return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+  } else if (a_1 == std::string_view {"vkGetInstanceProcAddr"}) {
+    return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
   } else {
     auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
     if (!Ret) {

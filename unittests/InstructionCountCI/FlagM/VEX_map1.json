@@ -11,7 +11,8 @@
       "FCMA",
       "RPRES",
       "AFP"
-    ]
+    ],
+    "BinaryCacheVersion": 30
   },
   "Instructions": {
     "vucomiss xmm0, xmm1": {
@@ -68,7 +69,7 @@
         "Map 1 0b01 0xd7 256-bit"
       ],
       "ExpectedArm64ASM": [
-        "ldr q2, [x28, #3248]",
+        "ldr q2, [x28, #3456]",
         "cmlt v3.16b, v16.16b, #0",
         "and v2.16b, v3.16b, v2.16b",
         "addp v2.16b, v2.16b, v2.16b",
@@ -78,12 +79,12 @@
       ]
     },
     "vpmovmskb rax, ymm0": {
-      "ExpectedInstructionCount": 18,
+      "ExpectedInstructionCount": 17,
       "Comment": [
         "Map 1 0b01 0xd7 256-bit"
       ],
       "ExpectedArm64ASM": [
-        "ldr x0, [x28, #2480]",
+        "ldr x0, [x28, #2552]",
         "ld1b {z2.b}, p7/z, [x0]",
         "mrs x0, nzcv",
         "mov z0.d, #0",
@@ -93,10 +94,9 @@
         "mov z3.d, z0.d",
         "msr nzcv, x0",
         "and z2.d, z3.d, z2.d",
-        "movprfx z0, z2",
-        "addp z0.b, p7/m, z0.b, z2.b",
-        "uzp1 z2.b, z0.b, z0.b",
-        "uzp2 z1.b, z0.b, z0.b",
+        "addp z2.b, p7/m, z2.b, z2.b",
+        "uzp2 z1.b, z2.b, z2.b",
+        "uzp1 z2.b, z2.b, z2.b",
         "splice z2.d, p6, z2.d, z1.d",
         "addp v2.16b, v2.16b, v2.16b",
         "addp v2.8b, v2.8b, v2.8b",

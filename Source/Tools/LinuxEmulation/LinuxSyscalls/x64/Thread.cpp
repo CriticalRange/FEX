@@ -12,7 +12,6 @@ $end_info$
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Debug/InternalThreadState.h>
-#include <FEXCore/IR/IR.h>
 #include <FEXCore/fextl/vector.h>
 
 #include <sched.h>
@@ -33,7 +32,7 @@ uint64_t SyscallHandler::read_ldt(FEXCore::Core::CpuStateFrame* Frame, void* ptr
   bytecount = std::min(bytecount, MAX_LDT_ENTRIES * LDT_ENTRY_SIZE);
   const auto EntriesToCopySize = std::min(bytecount, Thread->ldt_entry_count * LDT_ENTRY_SIZE);
 
-  if (FaultSafeUserMemAccess::CopyToUser(ptr, Thread->ldt_entries, EntriesToCopySize) != EntriesToCopySize) {
+  if (FaultSafeUserMemAccess::CopyToUser(ptr, Thread->ldt_entries, EntriesToCopySize) != 0) {
     return -EFAULT;
   }
 
@@ -41,9 +40,10 @@ uint64_t SyscallHandler::read_ldt(FEXCore::Core::CpuStateFrame* Frame, void* ptr
   // This means the guest can't ever know the actual size of the LDT.
   size_t RemainingSize = bytecount - EntriesToCopySize;
   if (RemainingSize) {
-    void* remaining = alloca(RemainingSize);
-    memset(remaining, 0, RemainingSize);
-    if (FaultSafeUserMemAccess::CopyToUser(reinterpret_cast<uint8_t*>(ptr) + EntriesToCopySize, remaining, RemainingSize) != RemainingSize) {
+    auto* Remaining = alloca(RemainingSize);
+    auto* RemainDst = reinterpret_cast<uint8_t*>(ptr) + EntriesToCopySize;
+    memset(Remaining, 0, RemainingSize);
+    if (FaultSafeUserMemAccess::CopyToUser(RemainDst, Remaining, RemainingSize) != 0) {
       return -EFAULT;
     }
   }
@@ -58,7 +58,7 @@ static uint64_t read_default_ldt(FEXCore::Core::CpuStateFrame* Frame, void* ptr,
   uint8_t Data[128] {};
   bytecount = std::min<uint64_t>(bytecount, sizeof(Data));
 
-  if (FaultSafeUserMemAccess::CopyToUser(ptr, Data, bytecount) != bytecount) {
+  if (FaultSafeUserMemAccess::CopyToUser(ptr, Data, bytecount) != 0) {
     return -EFAULT;
   }
 
@@ -234,7 +234,6 @@ enum Modify_ldt_func : int32_t {
 };
 
 void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
-  using namespace FEXCore::IR;
   REGISTER_SYSCALL_IMPL_X64(modify_ldt, [](FEXCore::Core::CpuStateFrame* Frame, int func, void* ptr, unsigned long bytecount) -> uint64_t {
     switch (func) {
     case Modify_ldt_func::LDT_READ: return FEX::HLE::_SyscallHandler->read_ldt(Frame, ptr, bytecount);
@@ -286,7 +285,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   });
 
   // launch a new process under fex
-  // currently does not propagate argv[0] correctly
+  // the ELF self-reexec fallback preserves the caller-supplied argv[0]
   REGISTER_SYSCALL_IMPL_X64(execve, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, char* const argv[], char* const envp[]) -> uint64_t {
     fextl::vector<const char*> Args;
     fextl::vector<const char*> Envp;

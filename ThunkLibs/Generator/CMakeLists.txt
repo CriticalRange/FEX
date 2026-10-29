@@ -1,4 +1,5 @@
 find_package(Clang REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
 
 # The official Windows LLVM package ships clang as separate static libraries.
 if (NOT TARGET clang-cpp)
@@ -34,7 +35,7 @@ file(TO_CMAKE_PATH "${CLANG_RESOURCE_DIR}" CLANG_RESOURCE_DIR)
 
 add_library(thunkgenlib STATIC analysis.cpp data_layout.cpp gen.cpp)
 target_include_directories(thunkgenlib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(thunkgenlib SYSTEM PUBLIC ${CLANG_INCLUDE_DIRS})
+target_include_directories(thunkgenlib SYSTEM PUBLIC ${CLANG_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
 target_link_libraries(thunkgenlib PUBLIC clang-cpp LLVM)
 target_link_libraries(thunkgenlib PRIVATE fmt::fmt)
 target_compile_definitions(thunkgenlib INTERFACE -DCLANG_RESOURCE_DIR="${CLANG_RESOURCE_DIR}")

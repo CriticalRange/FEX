@@ -8,7 +8,8 @@
       "AFP",
       "FLAGM",
       "FLAGM2"
-    ]
+    ],
+    "BinaryCacheVersion": 30
   },
   "Comment": [
     "Instructions in this table that are marked optimal don't have their flag calculation part of this assumption",
@@ -2786,7 +2787,7 @@
         "mov x0, x5",
         "mov x1, x4",
         "mov x2, x6",
-        "ldr x3, [x28, #2944]",
+        "ldr x3, [x28, #3048]",
         "str x30, [sp, #-16]!",
         "blr x3",
         "ldr x30, [sp], #16",
@@ -2837,7 +2838,7 @@
         "mov x0, x5",
         "mov x1, x4",
         "mov x2, x6",
-        "ldr x3, [x28, #2952]",
+        "ldr x3, [x28, #3056]",
         "str x30, [sp, #-16]!",
         "blr x3",
         "ldr x30, [sp], #16",

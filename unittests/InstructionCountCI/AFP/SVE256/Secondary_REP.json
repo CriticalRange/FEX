@@ -8,7 +8,8 @@
     ],
     "DisabledHostFeatures": [
       "RPRES"
-    ]
+    ],
+    "BinaryCacheVersion": 30
   },
   "Instructions": {
     "cvtsi2ss xmm0, eax": {
@@ -195,25 +196,31 @@
       ]
     },
     "cmpss xmm0, xmm1, 5": {
-      "ExpectedInstructionCount": 3,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "0xf3 0x0f 0xc2"
       ],
       "ExpectedArm64ASM": [
         "fcmgt s2, s17, s16",
         "mvn v2.16b, v2.16b",
-        "mov v16.s[0], v2.s[0]"
+        "mov v0.16b, v16.16b",
+        "mov v0.s[0], v2.s[0]",
+        "mov v2.16b, v0.16b",
+        "mov z16.b, p6/m, z2.b"
       ]
     },
     "cmpss xmm0, xmm1, 6": {
-      "ExpectedInstructionCount": 3,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "0xf3 0x0f 0xc2"
       ],
       "ExpectedArm64ASM": [
         "fcmge s2, s17, s16",
         "mvn v2.16b, v2.16b",
-        "mov v16.s[0], v2.s[0]"
+        "mov v0.16b, v16.16b",
+        "mov v0.s[0], v2.s[0]",
+        "mov v2.16b, v0.16b",
+        "mov z16.b, p6/m, z2.b"
       ]
     },
     "cmpss xmm0, xmm1, 7": {

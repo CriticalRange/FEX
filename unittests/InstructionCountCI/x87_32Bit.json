@@ -9,7 +9,8 @@
       "AFP",
       "FLAGM",
       "FLAGM2"
-    ]
+    ],
+    "BinaryCacheVersion": 30
   },
   "Instructions": {
     "Multiple fld/fst": {

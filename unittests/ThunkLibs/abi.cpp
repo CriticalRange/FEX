@@ -116,7 +116,10 @@ public:
     Compiler.setInvocation(std::move(invocation));
 #endif
     Compiler.setFileManager(files);
-#if LLVM_VERSION_MAJOR >= 20
+#if LLVM_VERSION_MAJOR >= 22
+    auto Diags = clang::CompilerInstance::createDiagnostics(Compiler.getVirtualFileSystem(), Compiler.getDiagnosticOpts(), diag_consumer, false);
+    Compiler.setDiagnostics(std::move(Diags));
+#elif LLVM_VERSION_MAJOR >= 20
     Compiler.createDiagnostics(Compiler.getVirtualFileSystem(), diag_consumer, false);
 #else
     Compiler.createDiagnostics(diag_consumer, false);
@@ -124,7 +127,12 @@ public:
     if (!Compiler.hasDiagnostics()) {
       return false;
     }
+
+#if LLVM_VERSION_MAJOR >= 22
+    Compiler.createSourceManager();
+#else
     Compiler.createSourceManager(*files);
+#endif
 
     const bool Success = Compiler.ExecuteAction(ScopedToolAction);
 

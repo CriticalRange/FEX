@@ -56,7 +56,7 @@ __attribute__((naked)) static void sigrestore() {
 }
 #endif
 
-constexpr static uint32_t X86_MINSIGSTKSZ = 0x2000U;
+constexpr static uint32_t X86_MINSIGSTKSZ = 2048;
 
 static std::atomic<EarlyHostSignalHook> EarlyHostSignalHookPtr {nullptr};
 
@@ -190,16 +190,10 @@ static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
   ThreadObject->SignalInfo.Delegator->HandleSignal(ThreadObject, Signal, Info, UContext);
 }
 
-uint64_t SigIsMember(GuestSAMask* Set, int Signal) {
+static uint64_t SigIsMember(GuestSAMask* Set, int Signal) {
   // Signal 0 isn't real, so everything is offset by one inside the set
   Signal -= 1;
   return (Set->Val >> Signal) & 1;
-}
-
-uint64_t SetSignal(GuestSAMask* Set, int Signal) {
-  // Signal 0 isn't real, so everything is offset by one inside the set
-  Signal -= 1;
-  return Set->Val | (1ULL << Signal);
 }
 
 /**
@@ -231,7 +225,7 @@ void SignalDelegator::HandleSignal(FEX::HLE::ThreadStateObject* Thread, int Sign
 }
 
 void SignalDelegator::RegisterHostSignalHandler(int Signal, HostSignalDelegatorFunction Func, bool Required) {
-  SetHostSignalHandler(Signal, std::move(Func), Required);
+  SetHostSignalHandler(Signal, std::move(Func));
   FrontendRegisterHostSignalHandler(Signal, Required);
 }
 
@@ -248,7 +242,7 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
     Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmReg(ucontext, SRAIdxMap);
   }
 
-  if (SupportsAVX) {
+  if (SupportsAVX && SupportsSVE256) {
     // TODO: This doesn't save the upper 128-bits of the 256-bit registers.
     // This needs to be implemented still.
     for (size_t i = 0; i < Config.SRAFPRCount; i++) {
@@ -818,11 +812,9 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       .SigMask = SigSetToU64(_context->uc_sigmask),
     });
 
-    uint64_t NewMask = GetNewSigMask(Signal);
-
     // Update our host signal mask so we don't hit race conditions with signals
     // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
-    _context->uc_sigmask = U64ToSigSet(NewMask);
+    _context->uc_sigmask = U64ToSigSet(GetNewSigMask(Signal));
 
     // Now update the faulting page permissions so it will fault on write.
     mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
@@ -1043,10 +1035,11 @@ void SignalDelegator::QueueSignal(pid_t tgid, pid_t tid, int Signal, siginfo_t* 
   }
 }
 
-SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::string_view ApplicationName, bool SupportsAVX)
+SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::string_view ApplicationName, bool SupportsAVX, bool SupportsSVE256)
   : CTX {_CTX}
   , ApplicationName {ApplicationName}
-  , SupportsAVX {SupportsAVX} {
+  , SupportsAVX {SupportsAVX}
+  , SupportsSVE256 {SupportsSVE256} {
   // Signal zero isn't real
   HostHandlers[0].Installed = true;
 
@@ -1062,7 +1055,7 @@ SignalDelegator::SignalDelegator(FEXCore::Context::Context* _CTX, const std::str
 
   // Most signals default to termination
   // These ones are slightly different
-  static constexpr std::array<std::pair<int, SignalDelegator::DefaultBehaviour>, 14> SignalDefaultBehaviours = {{
+  static constexpr std::array<std::pair<int, SignalDelegator::DefaultBehaviourType>, 14> SignalDefaultBehaviours = {{
     {SIGQUIT, DEFAULT_COREDUMP},
     {SIGILL, DEFAULT_COREDUMP},
     {SIGTRAP, DEFAULT_COREDUMP},
@@ -1252,7 +1245,7 @@ void SignalDelegator::RegisterHostSignalHandlerForGuest(int Signal, FEX::HLE::Ho
 }
 
 void SignalDelegator::RegisterFrontendHostSignalHandler(int Signal, HostSignalDelegatorFunction Func, bool Required) {
-  SetFrontendHostSignalHandler(Signal, std::move(Func), Required);
+  SetFrontendHostSignalHandler(Signal, std::move(Func));
   FrontendRegisterFrontendHostSignalHandler(Signal, Required);
 }
 
@@ -1355,7 +1348,7 @@ uint64_t SignalDelegator::RegisterGuestSigAltStack(FEX::HLE::ThreadStateObject* 
       return 0;
     }
 
-    // stack size needs to be MINSIGSTKSZ (0x2000)
+    // stack size needs to be at least X86_MINSIGSTKSZ
     if (ss->ss_size < X86_MINSIGSTKSZ) {
       return -ENOMEM;
     }
@@ -1389,7 +1382,7 @@ uint64_t SignalDelegator::GuestSigProcMask(FEX::HLE::ThreadStateObject* Thread, 
   // 3) Give old mask back
   auto OldSet = Thread->SignalInfo.CurrentSignalMask.Val;
 
-  if (!!set) {
+  if (set) {
     uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     if (how == SIG_BLOCK) {
       Thread->SignalInfo.CurrentSignalMask.Val |= *set & IgnoredSignalsMask;
@@ -1414,7 +1407,7 @@ uint64_t SignalDelegator::GuestSigProcMask(FEX::HLE::ThreadStateObject* Thread, 
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &HostMask, nullptr, 8);
   }
 
-  if (!!oldset) {
+  if (oldset) {
     *oldset = OldSet;
   }
 
@@ -1487,11 +1480,7 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
 }
 
 uint64_t SignalDelegator::GuestSigTimedWait(uint64_t* set, siginfo_t* info, const struct timespec* timeout, size_t sigsetsize) {
-  if (sigsetsize > sizeof(uint64_t)) {
-    return -EINVAL;
-  }
-
-  uint64_t Result = ::syscall(SYS_rt_sigtimedwait, set, info, timeout);
+  uint64_t Result = ::syscall(SYS_rt_sigtimedwait, set, info, timeout, sigsetsize);
 
   return Result == -1 ? -errno : Result;
 }
@@ -1524,7 +1513,7 @@ uint64_t SignalDelegator::GuestSignalFD(int fd, const uint64_t* set, size_t sigs
 }
 
 fextl::unique_ptr<FEX::HLE::SignalDelegator>
-CreateSignalDelegator(FEXCore::Context::Context* CTX, const std::string_view ApplicationName, bool SupportsAVX) {
-  return fextl::make_unique<FEX::HLE::SignalDelegator>(CTX, ApplicationName, SupportsAVX);
+CreateSignalDelegator(FEXCore::Context::Context* CTX, const std::string_view ApplicationName, bool SupportsAVX, bool SupportsSVE256) {
+  return fextl::make_unique<FEX::HLE::SignalDelegator>(CTX, ApplicationName, SupportsAVX, SupportsSVE256);
 }
 } // namespace FEX::HLE

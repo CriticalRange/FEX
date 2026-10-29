@@ -18,6 +18,7 @@ $end_info$
 #include <dlfcn.h>
 
 #include <atomic>
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdarg>
@@ -357,6 +358,40 @@ Uint64 GetTimestampNS() {
            std::chrono::steady_clock::now().time_since_epoch())
     .count();
 }
+
+// Opt-in frame pacing measurement for SDL's managed EGL swap path.
+void RecordFrameInterval(uint64_t now, EGLSurface surface, bool success) {
+  static const bool enabled = [] {
+    const char* value = getenv("VEXA_FRAME_STATS");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  if (!enabled) return;
+  static thread_local uint64_t last = 0;
+  static thread_local EGLSurface last_surface = EGL_NO_SURFACE;
+  static thread_local std::array<uint64_t, 256> ring {};
+  static thread_local unsigned count = 0;
+  if (!success || surface != last_surface || now <= last) {
+    last = success ? now : 0;
+    last_surface = success ? surface : EGL_NO_SURFACE;
+    count = 0;
+    return;
+  }
+  if (last) {
+    ring[count++] = now - last;
+    if (count == ring.size()) {
+      auto sorted = ring;
+      std::sort(sorted.begin(), sorted.end());
+      double sum = 0;
+      for (unsigned i = 0; i < count; ++i) sum += sorted[i] / 1e6;
+      auto ms = [&](unsigned i) { return sorted[i] / 1e6; };
+      fprintf(stderr, "[VEXA][SDL2_FRAME] metric=successful_swap_completion_interval n=%u avg=%.2fms p50=%.2f p95=%.2f p99=%.2f max=%.2f\n",
+              count, sum / count, ms((count - 1) * 50 / 100), ms((count - 1) * 95 / 100), ms((count - 1) * 99 / 100), ms(count - 1));
+      count = 0;
+    }
+  }
+  last = now;
+}
+
 
 // VEXA_FIXES: SDL2 event timestamps are milliseconds (Uint32), not nanoseconds.
 Uint32 GetEventTimestampMS() {
@@ -2766,6 +2801,7 @@ static void fexfn_impl_libSDL2_FEX_SDL2_GL_SwapWindow(SDL_Window*) {
     }
   }
   const uint64_t swap_end_ns = GetTimestampNS();
+  RecordFrameInterval(swap_end_ns, CurrentEGL.Surface, result == 1);
   LogSlowCall("eglSwapBuffers", swap_end_ns - swap_begin_ns);
   MarkProgress("SDL_GL_SwapWindow", "post-eglSwapBuffers");
 

@@ -419,6 +419,14 @@ bool GLHostTraceEnabled() {
   return Enabled;
 }
 
+static bool VexaFrameStatsEnabled() {
+  static const bool enabled = [] {
+    const char* value = getenv("VEXA_FRAME_STATS");
+    return value && strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
 struct ScopedGLThunkTrace {
   explicit ScopedGLThunkTrace(const char* fn_)
     : fn {fn_ ? fn_ : "<null>"}
@@ -2253,24 +2261,26 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
     if ((diag_swaps & 127) == 0) {
       VexaUploadReport();
       VexaBGRAGPUEnabled.store(access("/data/data/com.critical.vexaemulator/files/vexa_bgra_cpu.flag",F_OK)!=0);
-      static uint64_t previous_draws = 0, previous_dispatches = 0;
-      fprintf(stderr,
-              "[VEXA][GLX] diag swaps=%d draws=%llu draws/frame=%.2f dispatches=%llu dispatches/frame=%.2f window=128 clears=%llu useprog=%llu bindfbo=%llu traced_calls_total=%llu\n",
-              diag_swaps, (unsigned long long)g_vexa_diag_draws,
-              (double)(g_vexa_diag_draws - previous_draws) / 128,
-              (unsigned long long)g_vexa_diag_dispatches,
-              (double)(g_vexa_diag_dispatches - previous_dispatches) / 128,
-              (unsigned long long)g_vexa_diag_clears,
-              (unsigned long long)g_vexa_diag_useprog, (unsigned long long)g_vexa_diag_bindfbo,
-              (unsigned long long)GLHostTraceSeq.load());
-      previous_draws = g_vexa_diag_draws;
-      previous_dispatches = g_vexa_diag_dispatches;
+      if (VexaFrameStatsEnabled()) {
+        static uint64_t previous_draws = 0, previous_dispatches = 0;
+        fprintf(stderr,
+                "[VEXA][GLX] diag swaps=%d draws=%llu draws/frame=%.2f dispatches=%llu dispatches/frame=%.2f window=128 clears=%llu useprog=%llu bindfbo=%llu traced_calls_total=%llu\n",
+                diag_swaps, (unsigned long long)g_vexa_diag_draws,
+                (double)(g_vexa_diag_draws - previous_draws) / 128,
+                (unsigned long long)g_vexa_diag_dispatches,
+                (double)(g_vexa_diag_dispatches - previous_dispatches) / 128,
+                (unsigned long long)g_vexa_diag_clears,
+                (unsigned long long)g_vexa_diag_useprog, (unsigned long long)g_vexa_diag_bindfbo,
+                (unsigned long long)GLHostTraceSeq.load());
+        previous_draws = g_vexa_diag_draws;
+        previous_dispatches = g_vexa_diag_dispatches;
+      }
     }
   }
   // Frame-time distribution. An average hides stutter completely: a run can
   // average 20 ms while every twentieth frame takes 200 ms, and that is what
   // the player feels. Report the tail, not just the mean.
-  {
+  if (VexaFrameStatsEnabled()) {
     static int frame_no = 0;
     static uint64_t last_ns = 0;
     static uint64_t previous_draws = 0, previous_useprog = 0, previous_bindfbo = 0;
@@ -2312,8 +2322,8 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
         const uint64_t gl_ns = g_vexa_glcall_ns.exchange(0, std::memory_order_relaxed);
         const unsigned elapsed_frames = static_cast<unsigned>(frame_no & 127) == 0 ? 128 : 0;
         fprintf(stderr,
-                "[VEXA][FRAME] n=%u avg=%.2fms p50=%.2f p90=%.2f p99=%.2f max=%.2f over33=%u (%.1f%%) glms/f=%.2f\n",
-                ring_n, ms(sum / ring_n), ms(sorted[ring_n / 2]), ms(sorted[(ring_n * 9) / 10]),
+                "[VEXA][FRAME] n=%u avg=%.2fms p50=%.2f p90=%.2f p95=%.2f p99=%.2f max=%.2f over33=%u (%.1f%%) glms/f=%.2f\n",
+                ring_n, ms(sum / ring_n), ms(sorted[ring_n / 2]), ms(sorted[(ring_n * 9) / 10]), ms(sorted[(ring_n * 95) / 100]),
                 ms(sorted[(ring_n * 99) / 100]), ms(sorted[ring_n - 1]), over_33,
                 100.0 * over_33 / ring_n,
                 elapsed_frames ? ms(gl_ns) / elapsed_frames : 0.0);

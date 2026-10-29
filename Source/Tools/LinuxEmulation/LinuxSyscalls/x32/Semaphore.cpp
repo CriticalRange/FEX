@@ -219,7 +219,6 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
         src->mtype = TmpMsg->mtype;
         memcpy(src->mtext, TmpMsg->mtext, Result);
       }
-
     } else {
       struct compat_ipc_kludge {
         compat_uptr_t msgp;
@@ -231,7 +230,7 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
         msgbuf_32* src = reinterpret_cast<msgbuf_32*>(ipck->msgp);
         FaultSafeUserMemAccess::VerifyIsWritable(src, sizeof(*src));
         FaultSafeUserMemAccess::VerifyIsWritable(src->mtext, Result);
-        ipck->msgtyp = TmpMsg->mtype;
+        src->mtype = TmpMsg->mtype;
         memcpy(src->mtext, TmpMsg->mtext, Result);
       }
     }

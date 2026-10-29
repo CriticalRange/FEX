@@ -6,7 +6,8 @@
       "SVE256",
       "AFP"
     ],
-    "DisabledHostFeatures": []
+    "DisabledHostFeatures": [],
+    "BinaryCacheVersion": 30
   },
   "Instructions": {
     "cvtsi2sd xmm0, eax": {
@@ -183,25 +184,31 @@
       ]
     },
     "cmpsd xmm0, xmm1, 5": {
-      "ExpectedInstructionCount": 3,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "0xf2 0x0f 0xc2"
       ],
       "ExpectedArm64ASM": [
         "fcmgt d2, d17, d16",
         "mvn v2.16b, v2.16b",
-        "mov v16.d[0], v2.d[0]"
+        "mov v0.16b, v16.16b",
+        "mov v0.d[0], v2.d[0]",
+        "mov v2.16b, v0.16b",
+        "mov z16.b, p6/m, z2.b"
       ]
     },
     "cmpsd xmm0, xmm1, 6": {
-      "ExpectedInstructionCount": 3,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "0xf2 0x0f 0xc2"
       ],
       "ExpectedArm64ASM": [
         "fcmge d2, d17, d16",
         "mvn v2.16b, v2.16b",
-        "mov v16.d[0], v2.d[0]"
+        "mov v0.16b, v16.16b",
+        "mov v0.d[0], v2.d[0]",
+        "mov v2.16b, v0.16b",
+        "mov z16.b, p6/m, z2.b"
       ]
     },
     "cmpsd xmm0, xmm1, 7": {

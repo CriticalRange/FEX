@@ -1,12 +1,3 @@
-# AES and vpclmul unsupported in 256-bit SVE currently
-Test_VEX/vaesdec.asm
-Test_VEX/vaesdeclast.asm
-Test_VEX/vaesdec256.asm
-Test_VEX/vaesdeclast256.asm
-Test_VEX/vaesenc256.asm
-Test_VEX/vaesenclast256.asm
-Test_VEX/vpclmulqdq_256.asm
-
 # Simulator can't handle self-modifying code
 Test_SelfModifyingCode/Delinking.asm
 Test_SelfModifyingCode/DifferentBlock.asm
@@ -101,6 +92,7 @@ Test_VEX/vcvtps2ph_rd_mxcsr.asm
 Test_VEX/vcvtps2ph_ru_mxcsr.asm
 Test_VEX/vcvtps2ph_trunc_mxcsr.asm
 Test_X87_F64/Rounding_F64.asm
+Test_FEX_bugs/vcvtps2ph_zeroing.asm
 
 # Simulator doesn't support cycle counter reading
 Test_TwoByte/0F_31.asm

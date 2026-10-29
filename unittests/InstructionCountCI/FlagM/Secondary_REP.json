@@ -11,7 +11,8 @@
       "RPRES",
       "AFP",
       "CSSC"
-    ]
+    ],
+    "BinaryCacheVersion": 30
   },
   "Instructions": {
     "popcnt ax, bx": {

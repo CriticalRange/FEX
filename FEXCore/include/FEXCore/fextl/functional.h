@@ -48,7 +48,7 @@ public:
 
       // Second, wrap the relocated argument in a single-capture lambda
       auto wrapped_lambda = [moved_lambda](Args... args) {
-        return (*moved_lambda)(std::forward<Args>(args)...);
+        return std::invoke(*moved_lambda, std::forward<Args>(args)...);
       };
 
   #if defined(__ANDROID__) // VEXA_FIXES noexcept in static assert isn't supported in bionic libc

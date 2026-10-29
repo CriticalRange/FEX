@@ -16,16 +16,16 @@ JITSymbols::~JITSymbols() {
   }
 }
 
-void JITSymbols::InitFile() {
+void JITSymbols::InitFile(uint32_t ProcessPID) {
   // We can't use FILE here since we must be robust against forking processes closing our FD from under us.
 #ifdef __ANDROID__
   // Android simpleperf looks in /data/local/tmp instead of /tmp
   // Sandboxed applications cannot write there. Allow their launcher to select
   // a private directory; the map can then be pulled for offline symbolization.
   const char* SymbolDir = std::getenv("FEX_JIT_SYMBOL_DIR");
-  const auto PerfMap = fextl::fmt::format("{}/perf-{}.map", SymbolDir && *SymbolDir ? SymbolDir : "/data/local/tmp", getpid());
+  const auto PerfMap = fextl::fmt::format("{}/perf-{}.map", SymbolDir && *SymbolDir ? SymbolDir : "/data/local/tmp", ProcessPID);
 #else
-  const auto PerfMap = fextl::fmt::format("/tmp/perf-{}.map", getpid());
+  const auto PerfMap = fextl::fmt::format("/tmp/perf-{}.map", ProcessPID);
 #endif
   fd = open(PerfMap.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_APPEND, 0644);
 }

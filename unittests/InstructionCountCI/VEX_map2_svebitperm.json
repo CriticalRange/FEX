@@ -10,7 +10,8 @@
       "AFP",
       "FLAGM",
       "FLAGM2"
-    ]
+    ],
+    "BinaryCacheVersion": 30
   },
   "Instructions": {
     "pext eax, ebx, ecx": {

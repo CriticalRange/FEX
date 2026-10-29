@@ -3,6 +3,7 @@
 #include "diagnostics.h"
 #include "interface.h"
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Basic/DiagnosticOptions.h>
 
 #include <fstream>
 #include <numeric>
@@ -835,11 +836,21 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     // Load the host library in the global symbol namespace.
     // This follows how these libraries get loaded in a non-emulated environment,
     // Either by directly linking to the library or a loader (In OpenGL or Vulkan) putting everything in the global namespace.
-    file << "  fexldr_ptr_" << libname << "_so = dlopen(\"" << library_filename << "\", RTLD_GLOBAL | RTLD_LAZY);\n";
+    if (libname == "libGL") {
+      file << "#if defined(__ANDROID__)\n";
+      file << "  fexldr_ptr_libGL_so = dlopen(\"libGLESv3.so\", RTLD_GLOBAL | RTLD_LAZY);\n";
+      file << "  if (!fexldr_ptr_libGL_so) fexldr_ptr_libGL_so = dlopen(\"libGLESv2.so\", RTLD_GLOBAL | RTLD_LAZY);\n";
+      file << "#else\n";
+      file << "  fexldr_ptr_libGL_so = dlopen(\"" << library_filename << "\", RTLD_GLOBAL | RTLD_LAZY);\n";
+      file << "#endif\n";
+    } else {
+      file << "  fexldr_ptr_" << libname << "_so = dlopen(\"" << library_filename << "\", RTLD_GLOBAL | RTLD_LAZY);\n";
+    }
     file << "#if defined(__ANDROID__)\n";
     file << "  // VEXA_FIXES: Android linker namespaces often don't resolve app-private\n";
     file << "  // dependency SONAMEs via plain dlopen(\"libX.so\"). Fallback to an\n";
     file << "  // absolute path beside this host thunk library.\n";
+    if (libname != "libGL") {
     file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
     file << "    Dl_info self_info{};\n";
     file << "    if (dladdr((void*)&fexldr_init_" << libname << ", &self_info) && self_info.dli_fname) {\n";
@@ -857,6 +868,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     file << "      }\n";
     file << "    }\n";
     file << "  }\n";
+    }
     file << "  if (!fexldr_ptr_" << libname << "_so) {\n";
     file << "    const char* android_sonames[] = {\n";
     std::string unversioned = library_filename;
@@ -873,7 +885,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         unversioned.resize(ver_dot);
       }
     }
-    file << "      \"" << unversioned << "\",\n";
+    if (libname != "libGL") file << "      \"" << unversioned << "\",\n";
     if (libname == "libGL" || libname == "libGLESv2") {
       file << "      \"libGLESv3.so\",\n";
       file << "      \"libGLESv2.so\",\n";
@@ -980,11 +992,17 @@ bool GenerateThunkLibsActionFactory::runInvocation(std::shared_ptr<clang::Compil
   clang::CompilerInstance Compiler(std::move(PCHContainerOps));
   Compiler.setInvocation(std::move(Invocation));
 #endif
+#if LLVM_VERSION_MAJOR >= 22
+  Compiler.setVirtualFileSystem(Files->getVirtualFileSystemPtr());
+#endif
   Compiler.setFileManager(Files);
 
   GenerateThunkLibsAction Action(libname, output_filenames, abi);
 
-#if LLVM_VERSION_MAJOR >= 20
+#if LLVM_VERSION_MAJOR >= 22
+  auto Diags = clang::CompilerInstance::createDiagnostics(Compiler.getVirtualFileSystem(), Compiler.getDiagnosticOpts(), DiagConsumer, false);
+  Compiler.setDiagnostics(std::move(Diags));
+#elif LLVM_VERSION_MAJOR >= 20
   Compiler.createDiagnostics(Compiler.getVirtualFileSystem(), DiagConsumer, false);
 #else
   Compiler.createDiagnostics(DiagConsumer, false);
@@ -993,7 +1011,11 @@ bool GenerateThunkLibsActionFactory::runInvocation(std::shared_ptr<clang::Compil
     return false;
   }
 
+#if LLVM_VERSION_MAJOR >= 22
+  Compiler.createSourceManager();
+#else
   Compiler.createSourceManager(*Files);
+#endif
 
   const bool Success = Compiler.ExecuteAction(Action);
 

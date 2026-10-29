@@ -11,6 +11,20 @@ set(VEXA_SDL3_PREFIX "" CACHE PATH "SDL3 Android prefix")
 set(VEXA_SDL3_IMAGE_PREFIX "" CACHE PATH "SDL3_image Android prefix")
 set(VEXA_OPENAL_PREFIX "" CACHE PATH "OpenAL Android prefix")
 
+find_package(PkgConfig REQUIRED)
+
+# Use include directories from pkg-config and fall back to global defaults if not available.
+# /usr/include is dropped to avoid mixing foreign-architecture standard library headers.
+function(target_include_directories_from_pkgconfig target pkg)
+  pkg_check_modules(PKG QUIET ${pkg})
+  if (PKG_FOUND)
+    list(REMOVE_ITEM PKG_INCLUDE_DIRS /usr/include)
+    target_include_directories(${target} INTERFACE ${PKG_INCLUDE_DIRS})
+  elseif (ARGN)
+    target_include_directories(${target} INTERFACE ${ARGN})
+  endif()
+endfunction()
+
 if (ENABLE_CLANG_THUNKS)
   set(LD_OVERRIDE "-fuse-ld=lld")
   add_link_options(${LD_OVERRIDE})
@@ -21,7 +35,7 @@ if (NOT X86_DEV_ROOTFS)
 endif()
 
 find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
+if (CCACHE_PROGRAM)
   message(STATUS "CCache enabled for guest thunks")
   set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
 endif()
@@ -89,11 +103,12 @@ function(generate NAME SOURCE_FILE)
 
   if (BITNESS EQUAL 32)
     set(BITNESS_FLAGS "-for-32bit-guest")
-    set(BITNESS_FLAGS2 "-m32" "--target=i686-linux-gnu" "-isystem" "/usr/i686-linux-gnu/include/")
+    set(BITNESS_FLAGS2 "-m32" "--target=i686-linux-gnu")
   else()
     set(BITNESS_FLAGS "")
-    set(BITNESS_FLAGS2 "--target=x86_64-linux-gnu" "-isystem" "/usr/x86_64-linux-gnu/include/")
+    set(BITNESS_FLAGS2 "--target=x86_64-linux-gnu")
   endif()
+  list(APPEND BITNESS_FLAGS2 "--sysroot" "${X86_DEV_ROOTFS}")
 
   # VEXA_FIXES: Keep Android GL proc allowlist header in thunkgen dependencies
   # so edits in android_gl_proc_list.h always regenerate libGL guest stubs.
@@ -207,6 +222,7 @@ if (BITNESS EQUAL 64)
   # VEXA_FIXES: Disable ALSA guest thunk for Android bring-up. We will replace it with openal-soft thunk.
   if (NOT ANDROID AND NOT BUILD_ANDROID)
     generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp)
+    target_include_directories_from_pkgconfig(libasound-guest-deps alsa)
     add_guest_lib(asound "libasound.so.2")
   endif()
 
@@ -345,3 +361,8 @@ if (ENABLE_DESKTOP_GL_THUNKS)
     message(STATUS "Desktop GLX guest thunks
   disabled")
   endif()
+
+if (NOT ANDROID AND NOT BUILD_ANDROID)
+  generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)
+  add_guest_lib(cuda "libcuda.so.1")
+endif()

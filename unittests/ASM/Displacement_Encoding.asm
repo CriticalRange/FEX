@@ -25,15 +25,15 @@
 ; If we were accidentally using RIP relative, then it would be 2GB + <low test base address>, which won't be mapped.
 
 ; Test disp32 load.
-mov rax, [0x7FFF_F000]
+mov rax, [abs 0x7FFF_F000]
 
 mov rbx, 0x5152535455565758
 
 ; LEA with disp32.
-lea rcx, [0x7FFF_FFF8]
+lea rcx, [abs 0x7FFF_FFF8]
 
 ; Test store with disp32 store.
-mov [0x7FFF_FFF8], rbx
+mov [abs 0x7FFF_FFF8], rbx
 
 ; Load back with the LEA to ensure it's correct.
 mov rcx, [rcx]

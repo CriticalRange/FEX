@@ -11,7 +11,8 @@
       "AFP",
       "FLAGM",
       "FLAGM2"
-    ]
+    ],
+    "BinaryCacheVersion": 30
   },
   "Comment": [
     "MMX instructions are defined as optimal without SRA being used for these instructions.",
@@ -651,7 +652,7 @@
       "Comment": "0x0f 0x50",
       "ExpectedArm64ASM": [
         "ushr v2.4s, v16.4s, #31",
-        "ldr q3, [x28, #3120]",
+        "ldr q3, [x28, #3328]",
         "ushl v2.4s, v2.4s, v3.4s",
         "addv s2, v2.4s",
         "mov w4, v2.s[0]"
@@ -662,7 +663,7 @@
       "Comment": "0x0f 0x50",
       "ExpectedArm64ASM": [
         "ushr v2.4s, v16.4s, #31",
-        "ldr q3, [x28, #3120]",
+        "ldr q3, [x28, #3328]",
         "ushl v2.4s, v2.4s, v3.4s",
         "addv s2, v2.4s",
         "mov w4, v2.s[0]"
@@ -793,8 +794,8 @@
       "ExpectedInstructionCount": 2,
       "Comment": "0x0f 0x5f",
       "ExpectedArm64ASM": [
-        "fcmgt v0.4s, v17.4s, v16.4s",
-        "bit v16.16b, v17.16b, v0.16b"
+        "fcmgt v0.4s, v16.4s, v17.4s",
+        "bif v16.16b, v17.16b, v0.16b"
       ]
     },
     "punpcklbw mm0, mm1": {
@@ -1153,32 +1154,30 @@
       ]
     },
     "pshufw mm0, mm1, 1": {
-      "ExpectedInstructionCount": 9,
+      "ExpectedInstructionCount": 8,
       "Comment": "0x0f 0x70",
       "ExpectedArm64ASM": [
         "strb wzr, [x28, #1051]",
         "mov w20, #0xffff",
         "strb w20, [x28, #1202]",
         "ldr d2, [x28, #1072]",
-        "ldr x0, [x28, #2648]",
-        "ldr d3, [x0, #16]",
-        "tbl v2.8b, {v2.16b}, v3.8b",
-        "str d2, [x28, #1056]",
+        "dup v3.4h, v2.h[0]",
+        "mov v3.h[0], v2.h[1]",
+        "str d3, [x28, #1056]",
         "strh w20, [x28, #1064]"
       ]
     },
     "pshufw mm0, [rax], 1": {
-      "ExpectedInstructionCount": 9,
+      "ExpectedInstructionCount": 8,
       "Comment": "0x0f 0x70",
       "ExpectedArm64ASM": [
         "ldr d2, [x4]",
-        "ldr x0, [x28, #2648]",
-        "ldr d3, [x0, #16]",
-        "tbl v2.8b, {v2.16b}, v3.8b",
+        "dup v3.4h, v2.h[0]",
+        "mov v3.h[0], v2.h[1]",
         "strb wzr, [x28, #1051]",
         "mov w20, #0xffff",
         "strb w20, [x28, #1202]",
-        "str d2, [x28, #1056]",
+        "str d3, [x28, #1056]",
         "strh w20, [x28, #1064]"
       ]
     },
@@ -1593,18 +1592,20 @@
       ]
     },
     "shld ax, bx, 16": {
-      "ExpectedInstructionCount": 9,
+      "ExpectedInstructionCount": 11,
       "Comment": "0x0f 0xac",
       "ExpectedArm64ASM": [
         "uxth w20, w6",
         "uxth w21, w4",
-        "lsl x21, x21, #16",
-        "orr x26, x21, x20",
+        "lsl x22, x21, #16",
+        "orr x26, x22, x20",
         "cmn wzr, w26, lsl #16",
-        "bfxil x4, x26, #0, #16",
-        "mrs x20, nzcv",
-        "eor w20, w20, #0x20000000",
-        "msr nzcv, x20"
+        "eor x20, x21, #0x1",
+        "ubfx x20, x20, #0, #1",
+        "mrs x21, nzcv",
+        "bfi w21, w20, #29, #1",
+        "msr nzcv, x21",
+        "bfxil x4, x26, #0, #16"
       ]
     },
     "shld ax, bx, 31": {
@@ -2122,7 +2123,7 @@
       "ExpectedArm64ASM": [
         "mov w27, #0x0",
         "subs w26, w4, w4",
-        "mov x4, x6"
+        "mov w4, w6"
       ]
     },
     "cmpxchg [rcx], ebx": {
@@ -3548,7 +3549,7 @@
       "ExpectedInstructionCount": 3,
       "Comment": "0x0f 0xc6",
       "ExpectedArm64ASM": [
-        "ldr x0, [x28, #2672]",
+        "ldr x0, [x28, #2760]",
         "ldr q2, [x0, #16]",
         "tbl v16.16b, {v16.16b, v17.16b}, v2.16b"
       ]
@@ -3557,7 +3558,7 @@
       "ExpectedInstructionCount": 5,
       "Comment": "0x0f 0xc6",
       "ExpectedArm64ASM": [
-        "ldr x0, [x28, #2672]",
+        "ldr x0, [x28, #2760]",
         "ldr q2, [x0, #16]",
         "mov v0.16b, v17.16b",
         "mov v1.16b, v16.16b",
@@ -3569,7 +3570,7 @@
       "Comment": "0x0f 0xc6",
       "ExpectedArm64ASM": [
         "ldr q2, [x4]",
-        "ldr x0, [x28, #2672]",
+        "ldr x0, [x28, #2760]",
         "ldr q3, [x0, #16]",
         "mov v0.16b, v16.16b",
         "mov v1.16b, v2.16b",
@@ -3584,6 +3585,13 @@
         "dup v3.4s, v16.s[3]",
         "dup v2.4s, v2.s[3]",
         "zip1 v16.2d, v3.2d, v2.2d"
+      ]
+    },
+    "shufps xmm11, xmm11, 0x0": {
+      "ExpectedInstructionCount": 1,
+      "Comment": "Seen in Death Stranding 2",
+      "ExpectedArm64ASM": [
+        "dup v27.4s, v27.s[0]"
       ]
     },
     "bswap eax": {
@@ -3690,7 +3698,7 @@
         "mov w20, #0xffff",
         "strb w20, [x28, #1202]",
         "ldr d2, [x28, #1056]",
-        "ldr d3, [x28, #3248]",
+        "ldr d3, [x28, #3456]",
         "cmlt v2.16b, v2.16b, #0",
         "and v2.8b, v2.8b, v3.8b",
         "addp v2.16b, v2.16b, v2.16b",

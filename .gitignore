@@ -13,3 +13,5 @@ out/
 *.pyc
 .cache
 /.hosttools/
+.idea/
+CMakeLists.txt.user

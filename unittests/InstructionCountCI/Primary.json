@@ -7,8 +7,10 @@
       "SVE256",
       "AFP",
       "FLAGM",
-      "FLAGM2"
-    ]
+      "FLAGM2",
+      "MOPS"
+    ],
+    "BinaryCacheVersion": 30
   },
   "Instructions": {
     "add bl, cl": {
@@ -1825,14 +1827,6 @@
         "strh w20, [x8, #-2]!"
       ]
     },
-    "push dword -1": {
-      "ExpectedInstructionCount": 2,
-      "Comment": "0x6a",
-      "ExpectedArm64ASM": [
-        "mov x20, #0xffffffffffffffff",
-        "str x20, [x8, #-8]!"
-      ]
-    },
     "push qword -1": {
       "ExpectedInstructionCount": 2,
       "Comment": "0x6a",
@@ -2468,6 +2462,51 @@
         "mov w4, w20"
       ]
     },
+    "db 0x66, 0x8D, 0xC0": {
+      "ExpectedInstructionCount": 6,
+      "Comment": [
+        "0x8d",
+        "LEA ax, ax illegal register to register encoding"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x10000",
+        "str x20, [x28, #24]",
+        "mov w0, #0x401",
+        "str x0, [x28, #1496]",
+        "ldr x0, [x28, #3000]",
+        "br x0"
+      ]
+    },
+    "db 0x8D, 0xC0": {
+      "ExpectedInstructionCount": 6,
+      "Comment": [
+        "0x8d",
+        "LEA eax, eax illegal register to register encoding"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x10000",
+        "str x20, [x28, #24]",
+        "mov w0, #0x401",
+        "str x0, [x28, #1496]",
+        "ldr x0, [x28, #3000]",
+        "br x0"
+      ]
+    },
+    "db 0x48, 0x8D, 0xC0": {
+      "ExpectedInstructionCount": 6,
+      "Comment": [
+        "0x8d",
+        "LEA rax, rax illegal register to register encoding"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x10000",
+        "str x20, [x28, #24]",
+        "mov w0, #0x401",
+        "str x0, [x28, #1496]",
+        "ldr x0, [x28, #3000]",
+        "br x0"
+      ]
+    },
     "mov cs, ax": {
       "ExpectedInstructionCount": 4,
       "Skip": "Yes",
@@ -2833,6 +2872,18 @@
         "ldr x4, [x20]"
       ]
     },
+    "mov rax, [qword 0x8888e0000008]": {
+      "ExpectedInstructionCount": 4,
+      "Comment": [
+        "0xa3"
+      ],
+      "ExpectedArm64ASM": [
+        "mov x20, #0x8",
+        "movk x20, #0xe000, lsl #16",
+        "movk x20, #0x8888, lsl #32",
+        "ldr x4, [x20]"
+      ]
+    },
     "mov eax, [qword 0xe0000000]": {
       "ExpectedInstructionCount": 2,
       "Comment": [
@@ -2851,6 +2902,18 @@
       "ExpectedArm64ASM": [
         "mov w20, #0x8",
         "movk w20, #0xe000, lsl #16",
+        "str x4, [x20]"
+      ]
+    },
+    "mov [qword 0x8888e0000008], rax": {
+      "ExpectedInstructionCount": 4,
+      "Comment": [
+        "0xa3"
+      ],
+      "ExpectedArm64ASM": [
+        "mov x20, #0x8",
+        "movk x20, #0xe000, lsl #16",
+        "movk x20, #0x8888, lsl #32",
         "str x4, [x20]"
       ]
     },
