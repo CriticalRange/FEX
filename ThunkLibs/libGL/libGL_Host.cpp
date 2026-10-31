@@ -2199,7 +2199,42 @@ static void VexaPresentFallback() {
   }
 }
 
+// Opt in before starting the runtime; Android tracing must also be enabled.
+// Per-draw sections add significant overhead during capture.
+static bool VexaATraceEnabled() {
+  static const bool enabled = VexaUploadOption("VEXA_GL_ATRACE", "/data/data/com.critical.vexaemulator/files/vexa_gl_atrace.flag");
+  return enabled;
+}
+
+struct VexaATraceScope {
+  using Enabled = bool (*)();
+  using Begin = void (*)(const char*);
+  using End = void (*)();
+  struct Api { Enabled enabled; Begin begin; End end; };
+  static const Api& GetApi() {
+    static const Api api = [] {
+      void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+      return Api {lib ? reinterpret_cast<Enabled>(dlsym(lib, "ATrace_isEnabled")) : nullptr,
+                  lib ? reinterpret_cast<Begin>(dlsym(lib, "ATrace_beginSection")) : nullptr,
+                  lib ? reinterpret_cast<End>(dlsym(lib, "ATrace_endSection")) : nullptr};
+    }();
+    return api;
+  }
+  explicit VexaATraceScope(const char* name) {
+    if (VexaATraceEnabled()) {
+      const auto& api = GetApi();
+      if (api.enabled && api.begin && api.end && api.enabled()) {
+        end = api.end;
+        api.begin(name);
+      }
+    }
+  }
+  ~VexaATraceScope() { if (end) end(); }
+  End end {};
+};
+
 static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
+  VexaATraceScope trace {"VEXA GL present"};
   std::lock_guard lock(g_vexa_context_mutex);
   if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
     return;
@@ -2352,7 +2387,38 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
       g_vexa_env_interval_serial = g_vexa_glx.window_serial;
     }
   }
-  if (eglSwapBuffers(g_vexa_glx.display, g_vexa_glx.surface) != EGL_TRUE) {
+  static const bool timing = access("/data/data/com.critical.vexaemulator/files/vexa_swap_timing.flag", F_OK) == 0;
+  static thread_local uint64_t last_wall = 0, last_cpu = 0, last_swap = 0, sum_wall = 0, sum_cpu = 0, sum_swap = 0;
+  static thread_local unsigned count = 0;
+  static thread_local uint64_t wall_samples[256], cpu_samples[256], swap_samples[256];
+  auto cpu_now = []() -> uint64_t { timespec ts{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return uint64_t(ts.tv_sec) * 1000000000ull + ts.tv_nsec; };
+  const uint64_t before = timing ? GLHostNowNs() : 0;
+  const uint64_t cpu = timing ? cpu_now() : 0;
+  EGLBoolean swap_ok;
+  { VexaATraceScope trace {"VEXA eglSwapBuffers"}; swap_ok = eglSwapBuffers(g_vexa_glx.display, g_vexa_glx.surface); }
+  const uint64_t after = timing ? GLHostNowNs() : 0;
+  if (timing) {
+    if (last_wall && before > last_wall && cpu >= last_cpu) {
+      sum_wall += before - last_wall; sum_cpu += cpu - last_cpu; sum_swap += last_swap;
+      wall_samples[count] = before - last_wall; cpu_samples[count] = cpu - last_cpu; swap_samples[count] = last_swap;
+      if (++count == 256) {
+        uint64_t wall_ordered[256]; std::memcpy(wall_ordered, wall_samples, sizeof(wall_ordered));
+        std::sort(wall_ordered, wall_ordered + 256);
+        const uint64_t slow_threshold = wall_ordered[243];
+        uint64_t slow_wall = 0, slow_cpu = 0, slow_swap = 0; unsigned slow_count = 0;
+        for (unsigned i = 0; i < 256; ++i) if (wall_samples[i] >= slow_threshold) {
+          slow_wall += wall_samples[i]; slow_cpu += cpu_samples[i]; slow_swap += swap_samples[i]; ++slow_count;
+        }
+        fprintf(stderr, "[VEXA][SLOW_FRAMES] n=%u wall_ms=%.3f cpu_ms=%.3f swap_ms=%.3f offcpu_ms=%.3f\n", slow_count, double(slow_wall)/slow_count/1e6, double(slow_cpu)/slow_count/1e6, double(slow_swap)/slow_count/1e6, (double(slow_wall)-double(slow_cpu))/slow_count/1e6);
+        std::sort(wall_samples, wall_samples + 256); std::sort(cpu_samples, cpu_samples + 256); std::sort(swap_samples, swap_samples + 256);
+        fprintf(stderr, "[VEXA][SWAP_DISTRIBUTION] n=256 interval_p50=%.3f p95=%.3f p99=%.3f cpu_p50=%.3f p95=%.3f p99=%.3f swap_p50=%.3f p95=%.3f p99=%.3f\n", double(wall_samples[128])/1e6, double(wall_samples[243])/1e6, double(wall_samples[253])/1e6, double(cpu_samples[128])/1e6, double(cpu_samples[243])/1e6, double(cpu_samples[253])/1e6, double(swap_samples[128])/1e6, double(swap_samples[243])/1e6, double(swap_samples[253])/1e6);
+        fprintf(stderr, "[VEXA][SWAP_TIMING] n=256 interval_ms=%.3f thread_cpu_ms=%.3f swap_wall_ms=%.3f\n", double(sum_wall)/256e6, double(sum_cpu)/256e6, double(sum_swap)/256e6);
+        count = 0; sum_wall = sum_cpu = sum_swap = 0;
+      }
+    }
+    last_wall = before; last_cpu = cpu; last_swap = after - before;
+  }
+  if (swap_ok != EGL_TRUE) {
     fprintf(stderr, "[VEXA][GLX] eglSwapBuffers failed 0x%x\n", eglGetError());
   }
 }
@@ -4134,6 +4200,7 @@ static void fexfn_impl_libGL_glTexBufferRange(GLenum target, GLenum internalform
 }
 
 static void fexfn_impl_libGL_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+  VexaATraceScope trace {"VEXA glDrawArrays"};
   VexaDiagDraw("arrays", mode, count);
   VexaLegacyArrayScope client_scope(first,count); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawArrays(mode, first, count);
@@ -4141,6 +4208,7 @@ static void fexfn_impl_libGL_glDrawArrays(GLenum mode, GLint first, GLsizei coun
 }
 
 static void fexfn_impl_libGL_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+  VexaATraceScope trace {"VEXA glDrawElements"};
   VexaDiagDraw("elements", mode, count);
   VexaLegacyArrayScope client_scope(0,count,type,indices); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawElements(mode, count, type, client_scope.Indices);
@@ -4148,6 +4216,7 @@ static void fexfn_impl_libGL_glDrawElements(GLenum mode, GLsizei count, GLenum t
 }
 
 static void fexfn_impl_libGL_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
+  VexaATraceScope trace {"VEXA glDrawArraysInstanced"};
   VexaDiagDraw("arrays_inst", mode, count * primcount);
   VexaLegacyArrayScope client_scope(first,count); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawArraysInstanced(mode, first, count, primcount);
@@ -4156,6 +4225,7 @@ static void fexfn_impl_libGL_glDrawArraysInstanced(GLenum mode, GLint first, GLs
 
 static void fexfn_impl_libGL_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                      GLsizei primcount) {
+  VexaATraceScope trace {"VEXA glDrawElementsInstanced"};
   VexaDiagDraw("elements_inst", mode, count * primcount);
   VexaLegacyArrayScope client_scope(0,count,type,indices); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawElementsInstanced(mode, count, type, client_scope.Indices, primcount);
@@ -4198,6 +4268,7 @@ static void fexfn_impl_libGL_glDrawArraysIndirect(GLenum mode, const void* indir
 
 static void fexfn_impl_libGL_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                       GLint basevertex) {
+  VexaATraceScope trace {"VEXA glDrawElementsBaseVertex"};
   VexaDiagDraw("elements_basev", mode, count);
   VexaLegacyArrayScope client_scope(0,count,type,indices,basevertex); if(!client_scope.Ready)return; VexaAssemblyDrawScope assembly_scope; if(!assembly_scope.Ready)return; VexaPreDraw();
   ::glDrawElementsBaseVertex(mode, count, type, client_scope.Indices, basevertex);
