@@ -1423,6 +1423,9 @@ static int g_vexa_frame_event_n = 0;
 static char g_vexa_frame_binds[160];
 static int g_vexa_frame_binds_len = 0;
 static VexaGlxState g_vexa_glx;
+// Stand-in drawable used only while a rotation retry has dropped the window
+// surface and the replacement is not connectable yet. Never a window surface.
+static EGLSurface g_vexa_glx_park = EGL_NO_SURFACE;
 static void VexaTrackFrameFbo(GLuint fbo) {
   if (fbo == 0) {
     // Guest contexts that fail to bind the window surface fall back to a
@@ -1480,21 +1483,103 @@ static bool VexaGlShadowForVulkan() {
 // eglDestroySurface defers destruction while another thread holds the
 // surface current; call Surface::disconnect(api) directly as a fallback so
 // the producer frees now. NATIVE_WINDOW_API_EGL == 1, DisconnectModeNormal == 0.
-static void VexaDisconnectWindowApi(ANativeWindow* window) {
+// Returns 1 when the symbol was resolved and called, 0 when dlsym failed.
+// *status is the callee's return value, or -1 when the symbol is missing.
+static int VexaDisconnectWindowApi(ANativeWindow* window, int* status) {
   using SurfaceDisconnect = int (*)(void*, int, int);
-  static auto* surface_disconnect = reinterpret_cast<SurfaceDisconnect>(
-      dlsym(RTLD_DEFAULT, "_ZN7android7Surface10disconnectEiNS_22IGraphicBufferProducer14DisconnectModeE"));
-  if (surface_disconnect) {
-    surface_disconnect(window, 1, 0);
+  static auto* surface_disconnect = []() -> SurfaceDisconnect {
+    const char* const symbol =
+        "_ZN7android7Surface10disconnectEiNS_22IGraphicBufferProducer14DisconnectModeE";
+    if (auto* sym = reinterpret_cast<SurfaceDisconnect>(dlsym(RTLD_DEFAULT, symbol))) return sym;
+    // The app namespace often cannot see libgui through RTLD_DEFAULT. A NOLOAD
+    // lookup still fails closed when the library is not already mapped.
+    void* gui = dlopen("libgui.so", RTLD_NOW | RTLD_NOLOAD);
+    return gui ? reinterpret_cast<SurfaceDisconnect>(dlsym(gui, symbol)) : nullptr;
+  }();
+  if (!surface_disconnect) {
+    if (status) *status = -1;
+    return 0;
   }
+  const int rc = surface_disconnect(window, 1, 0);
+  if (status) *status = rc;
+  return 1;
 }
+
+// Unity's render thread keeps the old window surface current across a
+// landscape flip. eglDestroySurface is then deferred, the producer stays
+// connected, and eglCreateWindowSurface on the replacement returns
+// EGL_BAD_ALLOC. Park this thread's context so the destroy is not deferred.
+// The park is not adopted as the guest drawable. Returns false without
+// destroying the old surface when this thread cannot leave it.
+static bool VexaReleaseOwnedWindowSurface(EGLContext ctx, EGLSurface previous, int width, int height) {
+  if (ctx == EGL_NO_CONTEXT || previous == EGL_NO_SURFACE || previous == g_vexa_glx_park) return false;
+  if (width < 1) width = 1;
+  if (height < 1) height = 1;
+  const EGLint sized[] = {EGL_WIDTH, width, EGL_HEIGHT, height, EGL_NONE};
+  EGLSurface park = eglCreatePbufferSurface(g_vexa_glx.display, g_vexa_glx.config, sized);
+  if (park == EGL_NO_SURFACE && (width != 1 || height != 1)) {
+    const EGLint tiny[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    park = eglCreatePbufferSurface(g_vexa_glx.display, g_vexa_glx.config, tiny);
+  }
+  if (park == EGL_NO_SURFACE) return false;
+  if (eglMakeCurrent(g_vexa_glx.display, park, park, ctx) != EGL_TRUE) {
+    eglDestroySurface(g_vexa_glx.display, park);
+    return false;
+  }
+  if (eglDestroySurface(g_vexa_glx.display, previous) != EGL_TRUE) {
+    eglMakeCurrent(g_vexa_glx.display, previous, previous, ctx);
+    eglDestroySurface(g_vexa_glx.display, park);
+    return false;
+  }
+  if (g_vexa_glx_park != EGL_NO_SURFACE && g_vexa_glx_park != park) {
+    eglDestroySurface(g_vexa_glx.display, g_vexa_glx_park);
+  }
+  g_vexa_glx_park = park;
+  g_vexa_glx.surface = park;
+  return true;
+}
+
+// One line per interesting refresh attempt. create1/create2 use the EGL error
+// captured at that call; 0x3000 means the surface was created. -1 means that
+// call was not made. This does not change which EGL calls run.
+static void VexaLogRefresh(const char* phase, unsigned streak, uint64_t old_serial, uint64_t new_serial,
+                           ANativeWindow* old_win, ANativeWindow* new_win, EGLSurface old_egl, EGLContext ctx,
+                           EGLSurface draw, EGLSurface read, EGLint create1, int disc_sym, int disc_rc, EGLint create2) {
+  const int draw_is_old = old_egl != EGL_NO_SURFACE && draw == old_egl;
+  const int read_is_old = old_egl != EGL_NO_SURFACE && read == old_egl;
+  fprintf(stderr,
+          "[VEXA][GLX] refresh phase=%s tid=%ld streak=%u old_serial=%llu new_serial=%llu "
+          "old_win=%p new_win=%p old_egl=%p ctx=%p draw=%p read=%p draw_is_old=%d read_is_old=%d "
+          "create1=0x%x disc_sym=%d disc_rc=%d create2=0x%x\n",
+          phase, static_cast<long>(syscall(SYS_gettid)), streak, static_cast<unsigned long long>(old_serial),
+          static_cast<unsigned long long>(new_serial), old_win, new_win, old_egl, ctx, draw, read, draw_is_old,
+          read_is_old, create1, disc_sym, disc_rc, create2);
+}
+
 static bool VexaRefreshGlxSurface() {
   if (VexaHeadlessMode() || g_vexa_glx.shadow) return g_vexa_glx.surface != EGL_NO_SURFACE;
   const uint64_t serial = VexaRuntimeSurfaceSerial();
   if (!serial || serial == g_vexa_glx.window_serial) return true;
   ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
   if (!window) return false;
+  const EGLContext ctx = eglGetCurrentContext();
+  const EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
+  const EGLSurface read = eglGetCurrentSurface(EGL_READ);
+  static uint64_t logged_serial = 0;
+  static ANativeWindow* logged_window = nullptr;
+  static unsigned streak = 0;
+  if (serial != logged_serial || window != logged_window) {
+    logged_serial = serial;
+    logged_window = window;
+    streak = 0;
+  }
+  ++streak;
+  const bool log_attempt = streak <= 3 || (streak & 255) == 0;
   if (window == g_vexa_glx.window) {
+    if (log_attempt) {
+      VexaLogRefresh("same-window", streak, g_vexa_glx.window_serial, serial, g_vexa_glx.window, window,
+                     g_vexa_glx.surface, ctx, draw, read, -1, -1, 0, -1);
+    }
     g_vexa_glx.window_serial = serial;
     ANativeWindow_release(window);
     return true;
@@ -1502,28 +1587,65 @@ static bool VexaRefreshGlxSurface() {
   if (g_vexa_glx.buffer_format)
     ANativeWindow_setBuffersGeometry(window, 0, 0, g_vexa_glx.buffer_format);
   const EGLint colors[] = {EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_SRGB_KHR, EGL_NONE};
-  EGLSurface surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, VexaSrgbSurface() ? colors : nullptr);
-  if (surface == EGL_NO_SURFACE && eglGetError() == EGL_BAD_ALLOC) {
-    // The producer can still carry our previous surface's api connect when
-    // the runtime hands us a replacement window (idle doze, rotation): the
-    // old EGLSurface stays alive as long as another thread holds it current,
-    // so its deferred destroy never releases the slot. Force the stale
-    // connect off this producer and retry once.
-    VexaDisconnectWindowApi(window);
-    surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, VexaSrgbSurface() ? colors : nullptr);
+  const EGLint* surface_attribs = VexaSrgbSurface() ? colors : nullptr;
+  const EGLSurface previous = g_vexa_glx.surface;
+  EGLSurface surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, surface_attribs);
+  const EGLint create1 = surface == EGL_NO_SURFACE ? eglGetError() : EGL_SUCCESS;
+  int disc_sym = -1;
+  int disc_rc = 0;
+  EGLint create2 = -1;
+  if (surface == EGL_NO_SURFACE && create1 == EGL_BAD_ALLOC) {
+    // Measured on Unity landscape flips: this thread already has the old
+    // window surface current, the first create returns EGL_BAD_ALLOC, and
+    // Surface::disconnect is not visible in the app namespace. Release the
+    // old surface here, then retry. Disconnect is attempted and logged; a
+    // missing symbol does not decide success. The serial stays unchanged
+    // unless the saved context is bound to the new surface below.
+    const bool owner = ctx != EGL_NO_CONTEXT && previous != EGL_NO_SURFACE && previous != g_vexa_glx_park &&
+                       (draw == previous || read == previous);
+    const int released = owner && VexaReleaseOwnedWindowSurface(ctx, previous, ANativeWindow_getWidth(window),
+                                                                ANativeWindow_getHeight(window));
+    if (log_attempt) {
+      fprintf(stderr, "[VEXA][GLX] release old owner=%d released=%d park=%p tid=%ld\n", owner ? 1 : 0, released ? 1 : 0,
+              g_vexa_glx_park, static_cast<long>(syscall(SYS_gettid)));
+    }
+    disc_sym = VexaDisconnectWindowApi(window, &disc_rc);
+    surface = eglCreateWindowSurface(g_vexa_glx.display, g_vexa_glx.config, window, surface_attribs);
+    create2 = surface == EGL_NO_SURFACE ? eglGetError() : EGL_SUCCESS;
+  }
+  if (surface != EGL_NO_SURFACE && ctx != EGL_NO_CONTEXT &&
+      eglGetCurrentSurface(EGL_DRAW) != surface) {
+    // Swap reads the current context after refresh. Bind the context that
+    // was already current on this thread, not a resource-thread stand-in.
+    if (eglMakeCurrent(g_vexa_glx.display, surface, surface, ctx) != EGL_TRUE) {
+      const EGLint bind_error = eglGetError();
+      eglDestroySurface(g_vexa_glx.display, surface);
+      surface = EGL_NO_SURFACE;
+      create2 = bind_error;
+    }
   }
   if (surface == EGL_NO_SURFACE) {
-    static unsigned rebuild_failures = 0;
-    if ((rebuild_failures++ & 255) == 0) {
-      fprintf(stderr, "[VEXA][GLX] surface rebuild failed 0x%x (x%u)\n", eglGetError(), rebuild_failures);
+    if (log_attempt) {
+      VexaLogRefresh("failed", streak, g_vexa_glx.window_serial, serial, g_vexa_glx.window, window, previous, ctx,
+                     draw, read, create1, disc_sym, disc_rc, create2);
     }
     ANativeWindow_release(window);
     return false;
   }
-  // EGL defers destruction while the old surface is current on any thread.
-  // Bind/swap below move the caller's existing context to the replacement.
-  eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
-  ANativeWindow_release(g_vexa_glx.window);
+  if (log_attempt || streak == 1) {
+    VexaLogRefresh(create2 == -1 ? "created" : "retry-ok", streak, g_vexa_glx.window_serial, serial, g_vexa_glx.window,
+                   window, previous, ctx, draw, read, create1, disc_sym, disc_rc, create2);
+  }
+  if (g_vexa_glx.surface != EGL_NO_SURFACE && g_vexa_glx.surface != surface) {
+    eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
+  }
+  if (g_vexa_glx_park != EGL_NO_SURFACE) {
+    if (g_vexa_glx_park != g_vexa_glx.surface && g_vexa_glx_park != surface) {
+      eglDestroySurface(g_vexa_glx.display, g_vexa_glx_park);
+    }
+    g_vexa_glx_park = EGL_NO_SURFACE;
+  }
+  if (g_vexa_glx.window && g_vexa_glx.window != window) ANativeWindow_release(g_vexa_glx.window);
   g_vexa_glx.surface = surface;
   g_vexa_glx.window = window;
   g_vexa_glx.window_serial = serial;
@@ -8124,7 +8246,7 @@ void Vexa_ReleaseGlxWindowApi(ANativeWindow* window) {
     eglDestroySurface(g_vexa_glx.display, g_vexa_glx.surface);
     g_vexa_glx.surface = EGL_NO_SURFACE;
   }
-  VexaDisconnectWindowApi(window);
+  VexaDisconnectWindowApi(window, nullptr);
   g_vexa_glx.ready = false;
   fprintf(stderr, "[VEXA][GLX] released window api for Vulkan takeover\n");
 }

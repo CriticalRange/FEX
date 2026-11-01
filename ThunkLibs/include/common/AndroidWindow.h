@@ -33,7 +33,16 @@ inline ANativeWindow* VexaAcquireRuntimeWindow(int timeout_ms) {
       const int width = ANativeWindow_getWidth(window);
       const int height = ANativeWindow_getHeight(window);
       if (width > 1 && height > 1) {
-        std::fprintf(stderr, "[VEXA][WINDOW] native window %p %dx%d\n", window, width, height);
+        static ANativeWindow* logged = nullptr;
+        static unsigned logged_n = 0;
+        if (window != logged) {
+          logged = window;
+          logged_n = 0;
+        }
+        ++logged_n;
+        if (logged_n <= 2 || (logged_n & 255) == 0) {
+          std::fprintf(stderr, "[VEXA][WINDOW] native window %p %dx%d n=%u\n", window, width, height, logged_n);
+        }
         return window;
       }
       std::fprintf(stderr, "[VEXA][WINDOW] window %p not ready %dx%d\n", window, width, height);
