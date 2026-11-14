@@ -35,6 +35,7 @@ $end_info$
 
 // VEXA_FIXES: Android host path uses EGL/GLES headers and a GLX-compat shim layer.
 #ifdef BUILD_ANDROID
+#include <android/hardware_buffer.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
@@ -69,6 +70,7 @@ $end_info$
 #include "arb_assembly_state.h"
 #include "legacy_clip_state.h"
 #include "legacy_client_state.h"
+#include "legacy_interleaved_layout.h"
 #include "program_cache_state.inc"
 static int VexaGLHostFprintf(FILE* stream, const char* fmt, ...) {
   va_list args;
@@ -1333,6 +1335,8 @@ static bool VexaHeadlessMode() {
   return headless;
 }
 
+static bool VexaRealX11() { const char* v = getenv("VEXA_REAL_X11"); return v && !strcmp(v, "1"); }
+
 static int VexaHeadlessEnvInt(const char* name, int fallback) {
   const char* v = getenv(name);
   if (!v || !v[0]) return fallback;
@@ -1557,7 +1561,7 @@ static void VexaLogRefresh(const char* phase, unsigned streak, uint64_t old_seri
 }
 
 static bool VexaRefreshGlxSurface() {
-  if (VexaHeadlessMode() || g_vexa_glx.shadow) return g_vexa_glx.surface != EGL_NO_SURFACE;
+  if (VexaHeadlessMode() || g_vexa_glx.shadow || VexaRealX11()) return g_vexa_glx.surface != EGL_NO_SURFACE;
   const uint64_t serial = VexaRuntimeSurfaceSerial();
   if (!serial || serial == g_vexa_glx.window_serial) return true;
   ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
@@ -1614,9 +1618,9 @@ static bool VexaRefreshGlxSurface() {
     create2 = surface == EGL_NO_SURFACE ? eglGetError() : EGL_SUCCESS;
   }
   if (surface != EGL_NO_SURFACE && ctx != EGL_NO_CONTEXT &&
-      eglGetCurrentSurface(EGL_DRAW) != surface) {
-    // Swap reads the current context after refresh. Bind the context that
-    // was already current on this thread, not a resource-thread stand-in.
+      (draw == previous || read == previous) && eglGetCurrentSurface(EGL_DRAW) != surface) {
+    // Only move a context that owned the replaced drawable. A resource
+    // context current on its own pbuffer must retain that binding.
     if (eglMakeCurrent(g_vexa_glx.display, surface, surface, ctx) != EGL_TRUE) {
       const EGLint bind_error = eglGetError();
       eglDestroySurface(g_vexa_glx.display, surface);
@@ -1664,7 +1668,7 @@ static bool VexaEnsureGlx() {
     return false;
   }
   const bool headless = VexaHeadlessMode();
-  const bool shadow = !headless && VexaGlShadowForVulkan();
+  const bool shadow = !headless && (VexaRealX11() || VexaGlShadowForVulkan());
   ANativeWindow* window = (headless || shadow) ? nullptr : VexaAcquireRuntimeWindow(2000);
   if (!window && !headless && !shadow) {
     return false;
@@ -1685,7 +1689,8 @@ static bool VexaEnsureGlx() {
     EGL_GREEN_SIZE, 8,
     EGL_BLUE_SIZE, 8,
     EGL_ALPHA_SIZE, 8,
-    EGL_DEPTH_SIZE, 16,
+    EGL_DEPTH_SIZE, 24,
+    EGL_STENCIL_SIZE, 8,
     EGL_NONE
   };
   EGLConfig config = nullptr;
@@ -1703,8 +1708,8 @@ static bool VexaEnsureGlx() {
   EGLSurface surface = EGL_NO_SURFACE;
   int headless_w = 0, headless_h = 0;
   if (headless || shadow) {
-    headless_w = VexaHeadlessEnvInt("VEXA_HEADLESS_W", 1280);
-    headless_h = VexaHeadlessEnvInt("VEXA_HEADLESS_H", 720);
+    headless_w = VexaRealX11() ? 1 : VexaHeadlessEnvInt("VEXA_HEADLESS_W", 1280);
+    headless_h = VexaRealX11() ? 1 : VexaHeadlessEnvInt("VEXA_HEADLESS_H", 720);
     const EGLint pbattrs[] = {EGL_WIDTH, headless_w, EGL_HEIGHT, headless_h,
       EGL_GL_COLORSPACE_KHR, VexaSrgbSurface() ? EGL_GL_COLORSPACE_SRGB_KHR : EGL_GL_COLORSPACE_LINEAR_KHR, EGL_NONE};
     surface = eglCreatePbufferSurface(display, config, pbattrs);
@@ -1775,7 +1780,30 @@ struct VexaGuestGlxContext {
   EGLContext context = EGL_NO_CONTEXT;
   EGLSurface pbuffer = EGL_NO_SURFACE;
   bool window = false;
+  void* x11 = nullptr;
+  uint32_t drawable = 0, width = 0, height = 0;
 };
+
+struct VexaX11GlBridge {
+  void* (*create)();
+  void (*destroy)(void*);
+  int (*size)(void*, uint32_t, uint32_t*, uint32_t*);
+  AHardwareBuffer* (*acquire)(void*, uint32_t, uint32_t, uint32_t);
+  int (*present)(void*, uint32_t);
+};
+static VexaX11GlBridge VexaX11Gl() {
+  static VexaX11GlBridge api = [] {
+    VexaX11GlBridge a{}; void* lib = dlopen("libvexa.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!lib) return a;
+    a.create = reinterpret_cast<decltype(a.create)>(dlsym(lib, "Vexa_X11GlCreate"));
+    a.destroy = reinterpret_cast<decltype(a.destroy)>(dlsym(lib, "Vexa_X11GlDestroy"));
+    a.size = reinterpret_cast<decltype(a.size)>(dlsym(lib, "Vexa_X11GlSize"));
+    a.acquire = reinterpret_cast<decltype(a.acquire)>(dlsym(lib, "Vexa_X11GlAcquire"));
+    a.present = reinterpret_cast<decltype(a.present)>(dlsym(lib, "Vexa_X11GlPresent"));
+    return a;
+  }();
+  return api;
+}
 static std::mutex g_vexa_context_mutex;
 static std::unordered_map<uintptr_t, VexaGuestGlxContext> g_vexa_contexts;
 
@@ -1830,16 +1858,38 @@ static auto fexfn_impl_libGL_VEXA_DestroyGlxContext(uintptr_t id) -> void {
   if (it == g_vexa_contexts.end()) return;
   if (eglGetCurrentContext() == it->second.context)
     eglMakeCurrent(g_vexa_glx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (it->second.x11) { auto api = VexaX11Gl(); if (api.destroy) api.destroy(it->second.x11); }
   VexaUnregisterProgramContext(it->second.context);
   eglDestroyContext(g_vexa_glx.display, it->second.context);
   if (it->second.pbuffer != EGL_NO_SURFACE) eglDestroySurface(g_vexa_glx.display, it->second.pbuffer);
   g_vexa_contexts.erase(it);
 }
 
-static auto fexfn_impl_libGL_VEXA_BindGlxSurface(uintptr_t id) -> int {
+static auto fexfn_impl_libGL_VEXA_BindGlxSurface(uintptr_t id, uint32_t drawable) -> int {
   std::lock_guard lock(g_vexa_context_mutex);
   auto it = g_vexa_contexts.find(id);
   if (it == g_vexa_contexts.end()) return 0;
+  if (VexaRealX11()) {
+    auto api = VexaX11Gl(); auto& c = it->second;
+    if (!api.create || !api.destroy || !api.size || !api.acquire || !api.present || !drawable) return 0;
+    if (!c.x11) c.x11 = api.create();
+    uint32_t w = 0, h = 0;
+    if (!c.x11 || !api.size(c.x11, drawable, &w, &h)) return 0;
+    EGLSurface surface = c.pbuffer;
+    if (c.width != w || c.height != h) {
+      const EGLint attrs[] = {EGL_WIDTH, static_cast<EGLint>(w), EGL_HEIGHT, static_cast<EGLint>(h), EGL_NONE};
+      surface = eglCreatePbufferSurface(g_vexa_glx.display, g_vexa_glx.config, attrs);
+      if (surface == EGL_NO_SURFACE) return 0;
+    }
+    if (eglMakeCurrent(g_vexa_glx.display, surface, surface, c.context) != EGL_TRUE) {
+      if (surface != c.pbuffer) eglDestroySurface(g_vexa_glx.display, surface);
+      return 0;
+    }
+    if (surface != c.pbuffer) { eglDestroySurface(g_vexa_glx.display, c.pbuffer); c.pbuffer = surface; }
+    c.width = w; c.height = h; c.drawable = drawable;
+    VexaSelectProgramContext(c.context);
+    return 1;
+  }
   if (!VexaRefreshGlxSurface()) return 0;
   const auto& c = it->second;
   if (eglMakeCurrent(g_vexa_glx.display, g_vexa_glx.surface, g_vexa_glx.surface, c.context) == EGL_TRUE) {
@@ -2355,9 +2405,55 @@ struct VexaATraceScope {
   End end {};
 };
 
-static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
+static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers(uint32_t drawable) -> void {
   VexaATraceScope trace {"VEXA GL present"};
   std::lock_guard lock(g_vexa_context_mutex);
+  if (VexaRealX11()) {
+    VexaGuestGlxContext* c = nullptr;
+    for (auto& [id, candidate] : g_vexa_contexts)
+      if (candidate.context == eglGetCurrentContext()) { c = &candidate; break; }
+    if (!c || !c->x11 || c->drawable != drawable || !c->width || !c->height) return;
+    auto api = VexaX11Gl();
+    AHardwareBuffer* buffer = api.acquire(c->x11, drawable, c->width, c->height);
+    if (!buffer) return;
+    auto getClient = reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(eglGetProcAddress("eglGetNativeClientBufferANDROID"));
+    auto createImage = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+    auto destroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+    auto imageStorage = reinterpret_cast<void (*)(GLenum, void*)>(eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES"));
+    if (!getClient || !createImage || !destroyImage || !imageStorage) return;
+    const EGLint attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+    EGLImageKHR image = createImage(g_vexa_glx.display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, getClient(buffer), attrs);
+    if (image == EGL_NO_IMAGE_KHR) { fprintf(stderr, "[VEXA][GLX] EGL image failed 0x%x\n", eglGetError()); return; }
+    GLint oldRead = 0, oldDraw = 0, oldRb = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead); glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &oldRb);
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST); glDisable(GL_SCISSOR_TEST);
+    GLuint rb = 0, fb = 0; glGenRenderbuffers(1, &rb); glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    imageStorage(GL_RENDERBUFFER, image); glGenFramebuffers(1, &fb); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+    const bool complete = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (complete) {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+      glBlitFramebuffer(0, 0, c->width, c->height, 0, c->height, c->width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+      glFinish();
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldRead); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDraw);
+    glBindRenderbuffer(GL_RENDERBUFFER, oldRb); if (scissor) glEnable(GL_SCISSOR_TEST);
+    glDeleteFramebuffers(1, &fb); glDeleteRenderbuffers(1, &rb); destroyImage(g_vexa_glx.display, image);
+    if (complete) api.present(c->x11, drawable);
+    else fprintf(stderr, "[VEXA][GLX] imported framebuffer incomplete\n");
+    uint32_t w = 0, h = 0;
+    if (api.size(c->x11, drawable, &w, &h) && (w != c->width || h != c->height)) {
+      const EGLint sizeAttrs[] = {EGL_WIDTH, static_cast<EGLint>(w), EGL_HEIGHT, static_cast<EGLint>(h), EGL_NONE};
+      EGLSurface replacement = eglCreatePbufferSurface(g_vexa_glx.display, g_vexa_glx.config, sizeAttrs);
+      if (replacement != EGL_NO_SURFACE) {
+        if (eglMakeCurrent(g_vexa_glx.display, replacement, replacement, c->context) == EGL_TRUE) {
+          eglDestroySurface(g_vexa_glx.display, c->pbuffer); c->pbuffer = replacement; c->width = w; c->height = h;
+        } else eglDestroySurface(g_vexa_glx.display, replacement);
+      }
+    }
+    return;
+  }
   if (!g_vexa_glx.ready && !VexaEnsureGlx()) {
     return;
   }
@@ -2479,11 +2575,13 @@ static auto fexfn_impl_libGL_VEXA_SwapGlxBuffers() -> void {
         const uint64_t gl_ns = g_vexa_glcall_ns.exchange(0, std::memory_order_relaxed);
         const unsigned elapsed_frames = static_cast<unsigned>(frame_no & 127) == 0 ? 128 : 0;
         fprintf(stderr,
-                "[VEXA][FRAME] n=%u avg=%.2fms p50=%.2f p90=%.2f p95=%.2f p99=%.2f max=%.2f over33=%u (%.1f%%) glms/f=%.2f\n",
+                "[VEXA][FRAME] n=%u avg=%.2fms p50=%.2f p90=%.2f p95=%.2f p99=%.2f max=%.2f over33=%u (%.1f%%) glms/f=%.2f t=%llums\n",
                 ring_n, ms(sum / ring_n), ms(sorted[ring_n / 2]), ms(sorted[(ring_n * 9) / 10]), ms(sorted[(ring_n * 95) / 100]),
                 ms(sorted[(ring_n * 99) / 100]), ms(sorted[ring_n - 1]), over_33,
                 100.0 * over_33 / ring_n,
-                elapsed_frames ? ms(gl_ns) / elapsed_frames : 0.0);
+                elapsed_frames ? ms(gl_ns) / elapsed_frames : 0.0,
+                // Same steady clock as the [VEXA][JIT] code buffer lines, for correlating stutters.
+                static_cast<unsigned long long>(now_ns / 1000000ULL));
       }
     }
     last_ns = now_ns;
@@ -2573,6 +2671,7 @@ struct VexaVisibleRect {
 // at 0,0. A smaller one is scaled up and centered; a negative origin lets GL clip
 // the overflow so the picture still fills the screen.
 static VexaVisibleRect VexaVisibleRectFor(GLsizei width, GLsizei height) {
+  if (VexaRealX11()) { VexaVisibleRect rect{}; rect.surface_w = width; rect.surface_h = height; return rect; }
   static int surface_w = 0;
   static int surface_h = 0;
   if (surface_w <= 0 || surface_h <= 0 || surface_h > surface_w) {
@@ -2721,6 +2820,7 @@ static void VexaPublishPresentMap(int x0, int y0, int cw, int ch, int sx, int sy
                                   int sh);
 
 static void fexfn_impl_libGL_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+  if (VexaRealX11()) { ::glViewport(x, y, width, height); return; }
   static bool logged = false;
   static bool logged_fbo = false;
   VexaNoteGuestViewport(x, y, width, height);
@@ -5513,37 +5613,58 @@ static void fexfn_impl_libGL_glDrawTransformFeedbackStreamInstanced(GLenum mode,
 struct VexaFFMesh {
   GLuint vbo = 0;
   GLsizei vertex_count = 0;
+  GLenum mode = GL_TRIANGLES;
 };
 
-static GLuint g_vexa_ff_program = 0;
-static GLint g_vexa_ff_mvp = -1;
-static GLint g_vexa_ff_color = -1;
-static GLuint g_vexa_ff_next = 1;
-static GLuint g_vexa_ff_immediate_vbo = 0;
-static std::unordered_map<GLuint, VexaFFMesh> g_vexa_ff_meshes;
+// GL names belong to the current context/share group, never to the process.
+struct VexaFFState {
+  GLuint program=0, next=1, immediate_vbo=0;
+  GLint mvp=-1, color=-1;
+  std::unordered_map<GLuint,VexaFFMesh> meshes;
+};
+static VexaFFState& VexaFF() {
+  auto& state=VexaProgramContext().FixedFunction;
+  if(!state)state=std::make_shared<VexaFFState>();
+  return *state;
+}
+static void VexaRetireFixedFunction(VexaProgramContextState& context) {
+  if(!context.FixedFunction)return;
+  const auto& state=*context.FixedFunction;
+  if(state.program)context.Shared->Retired.push_back(state.program);
+  if(state.immediate_vbo)context.Shared->LegacyRetiredBuffers.push_back(state.immediate_vbo);
+  for(const auto& [id,mesh]:state.meshes)if(mesh.vbo)context.Shared->LegacyRetiredBuffers.push_back(mesh.vbo);
+}
 
+#include "legacy_lighting_shader.h"
+#include "legacy_lighting_uniforms.h"
+#include "pixel_draw_host.h"
+static auto fexfn_impl_libGL_VEXA_DrawPixels(const float* pixels, int width, int height, const float* raster, const float* bitmapColor) -> int {
+  return raster && vexa_pixel::draw_rgba_float(pixels, width, height, raster[0], raster[1], raster[2], raster[3], raster[4], bitmapColor);
+}
+static thread_local vexa_legacy_lighting::Wire g_vexa_ff_lighting{};
+static auto fexfn_impl_libGL_VEXA_FFSetLighting(const void* packet, unsigned bytes) -> void {
+  if (!packet || bytes != sizeof(g_vexa_ff_lighting)) return;
+  vexa_legacy_lighting::Wire wire;
+  std::memcpy(&wire, packet, sizeof(wire));
+  if (vexa_legacy_lighting::valid_wire(wire)) g_vexa_ff_lighting = wire;
+}
+
+static thread_local float g_vexa_stipple_mask[128]{};
+static thread_local int g_vexa_stipple_enabled=0;
+static auto fexfn_impl_libGL_VEXA_FFSetStipple(const float* mask,int enabled) -> void {
+  if(mask)std::copy_n(mask,128,g_vexa_stipple_mask);
+  g_vexa_stipple_enabled=enabled;
+}
+static void VexaFFStippleUniforms() {
+  glUniform1i(glGetUniformLocation(VexaFF().program,"uStipple"),g_vexa_stipple_enabled);
+  if(g_vexa_stipple_enabled)glUniform4fv(glGetUniformLocation(VexaFF().program,"uStippleRows[0]"),32,g_vexa_stipple_mask);
+}
 static bool VexaFFEnsureProgram() {
-  if (g_vexa_ff_program != 0) {
+  if (VexaFF().program != 0) {
     return true;
   }
-  const char* vertex =
-    "attribute vec3 aPos;\n"
-    "attribute vec3 aNrm;\n"
-    "uniform mat4 uMvp;\n"
-    "varying vec3 vNrm;\n"
-    "void main() {\n"
-    "  gl_Position = uMvp * vec4(aPos, 1.0);\n"
-    "  vNrm = aNrm;\n"
-    "}\n";
-  const char* fragment =
-    "precision mediump float;\n"
-    "varying vec3 vNrm;\n"
-    "uniform vec4 uColor;\n"
-    "void main() {\n"
-    "  vec3 n = normalize(vNrm);\n"
-    "  float light = max(dot(n, normalize(vec3(0.25, 0.45, 0.85))), 0.18);\n"
-    "  gl_FragColor = vec4(uColor.rgb * light, uColor.a);\n"
-    "}\n";
+  const char* vertex = vexa_legacy_lighting::untextured_vertex_shader;
+  const char* fragment = vexa_legacy_lighting::untextured_fragment_shader;
   const GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   const GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
   const std::string clip_vertex=VexaClipInstrument(vertex,GL_VERTEX_SHADER);vertex=clip_vertex.c_str();
@@ -5554,51 +5675,79 @@ static bool VexaFFEnsureProgram() {
   glShaderSource(fs, 1, &fragment, nullptr);
   glCompileShader(vs);
   glCompileShader(fs);
-  g_vexa_ff_program = glCreateProgram();
-  glAttachShader(g_vexa_ff_program, vs);
-  glAttachShader(g_vexa_ff_program, fs);
-  glBindAttribLocation(g_vexa_ff_program, 0, "aPos");
-  glBindAttribLocation(g_vexa_ff_program, 1, "aNrm");
-  glLinkProgram(g_vexa_ff_program);
+  VexaFF().program = glCreateProgram();
+  glAttachShader(VexaFF().program, vs);
+  glAttachShader(VexaFF().program, fs);
+  glBindAttribLocation(VexaFF().program, 0, "aPos");
+  glBindAttribLocation(VexaFF().program, 1, "aNrm");
+  glBindAttribLocation(VexaFF().program, 2, "aColor");
+  glBindAttribLocation(VexaFF().program, 3, "aTexCoord");
+  glLinkProgram(VexaFF().program);
   glDeleteShader(vs);
   glDeleteShader(fs);
   GLint linked = 0;
-  glGetProgramiv(g_vexa_ff_program, GL_LINK_STATUS, &linked);
-  if (g_vexa_ff_program == 0 || linked != GL_TRUE) {
+  glGetProgramiv(VexaFF().program, GL_LINK_STATUS, &linked);
+  if (VexaFF().program == 0 || linked != GL_TRUE) {
     char log[512] {};
-    if (g_vexa_ff_program != 0) {
-      glGetProgramInfoLog(g_vexa_ff_program, sizeof(log), nullptr, log);
+    if (VexaFF().program != 0) {
+      glGetProgramInfoLog(VexaFF().program, sizeof(log), nullptr, log);
     }
     fprintf(stderr, "[VEXA][FF] program link failed %s\n", log);
-    g_vexa_ff_program = 0;
+    if(VexaFF().program)glDeleteProgram(VexaFF().program);
+    VexaFF().program = 0;
     return false;
   }
-  g_vexa_ff_mvp = glGetUniformLocation(g_vexa_ff_program, "uMvp");
-  g_vexa_ff_color = glGetUniformLocation(g_vexa_ff_program, "uColor");
-  glGenBuffers(1, &g_vexa_ff_immediate_vbo);
-  fprintf(stderr, "[VEXA][FF] program %u mvp %d color %d\n", g_vexa_ff_program, g_vexa_ff_mvp, g_vexa_ff_color);
+  VexaFF().mvp = glGetUniformLocation(VexaFF().program, "uMvp");
+  VexaFF().color = glGetUniformLocation(VexaFF().program, "uColor");
+  glGenBuffers(1, &VexaFF().immediate_vbo);
+  fprintf(stderr, "[VEXA][FF] program %u mvp %d color %d\n", VexaFF().program, VexaFF().mvp, VexaFF().color);
   return true;
 }
 
 static void VexaFFBindMeshAttribs() {
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
-  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void*>(0));
-  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+  glEnableVertexAttribArray(2);
+  glEnableVertexAttribArray(3);
+  glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, 15 * sizeof(float), reinterpret_cast<void*>(11 * sizeof(float)));
+  glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 15 * sizeof(float), reinterpret_cast<void*>(0));
+  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 15 * sizeof(float), reinterpret_cast<void*>(4 * sizeof(float)));
+  glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 15 * sizeof(float), reinterpret_cast<void*>(7 * sizeof(float)));
 }
 
-static auto fexfn_impl_libGL_VEXA_FFUpload(const float* vertices, int float_count) -> unsigned {
-  if (!vertices || float_count < 18 || (float_count % 6) != 0 || !VexaFFEnsureProgram()) {
+struct VexaFFDrawScope {
+  GLint program = 0, vao = 0, array = 0;
+  GLuint temporary = 0;
+  VexaFFDrawScope() {
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array);
+    glGenVertexArrays(1, &temporary);
+    glBindVertexArray(temporary);
+  }
+  ~VexaFFDrawScope() {
+    glUseProgram(program);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, array);
+    glDeleteVertexArrays(1, &temporary);
+  }
+};
+
+static auto fexfn_impl_libGL_VEXA_FFUpload(const float* vertices, int float_count, unsigned mode) -> unsigned {
+  if (!vertices || float_count < 15 || (float_count % 15) != 0 || mode > GL_TRIANGLES || !VexaFFEnsureProgram()) {
     return 0;
   }
-  const GLuint id = g_vexa_ff_next++;
+  const GLuint id = VexaFF().next++;
   VexaFFMesh mesh;
-  mesh.vertex_count = float_count / 6;
+  mesh.vertex_count = float_count / 15;
+  mesh.mode = mode;
+  GLint previous_buffer = 0;
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previous_buffer);
   glGenBuffers(1, &mesh.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
   glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(float_count) * static_cast<GLsizeiptr>(sizeof(float)), vertices, GL_STATIC_DRAW);
-  glBindBuffer(GL_ARRAY_BUFFER, 0);
-  g_vexa_ff_meshes.emplace(id, mesh);
+  glBindBuffer(GL_ARRAY_BUFFER, previous_buffer);
+  VexaFF().meshes.emplace(id, mesh);
   fprintf(stderr, "[VEXA][FF] mesh %u verts %d\n", id, mesh.vertex_count);
   return id;
 }
@@ -5607,55 +5756,62 @@ static auto fexfn_impl_libGL_VEXA_FFDrawList(const unsigned* buffers, const int*
   if (!buffers || !counts || !colors || !mvp || item_count <= 0 || !VexaFFEnsureProgram()) {
     return;
   }
-  if (item_count > 256) {
-    item_count = 256;
-  }
-  glUseProgram(g_vexa_ff_program);
-  glUniformMatrix4fv(g_vexa_ff_mvp, 1, GL_FALSE, mvp);
+  VexaFFDrawScope scope;
+  glUseProgram(VexaFF().program);
+  VexaFFStippleUniforms();
+  glUniform1i(glGetUniformLocation(VexaFF().program, "uVertexColors"), 0);
+  vexa_legacy_lighting::upload_wire(VexaFF().program, g_vexa_ff_lighting);
+  glUniformMatrix4fv(VexaFF().mvp, 1, GL_FALSE, mvp);
   for (int i = 0; i < item_count; ++i) {
-    const auto mesh = g_vexa_ff_meshes.find(buffers[i]);
-    if (mesh == g_vexa_ff_meshes.end() || counts[i] <= 0) {
+    const auto mesh = VexaFF().meshes.find(buffers[i]);
+    if (mesh == VexaFF().meshes.end() || counts[i] <= 0) {
       continue;
     }
-    glUniform4fv(g_vexa_ff_color, 1, colors + (i * 4));
+    glUniform4fv(VexaFF().color, 1, colors + (i * 4));
     glBindBuffer(GL_ARRAY_BUFFER, mesh->second.vbo);
     VexaFFBindMeshAttribs();
     VexaApplyAlphaTest();
   VexaApplyClipPlanes();
-    glDrawArrays(GL_TRIANGLES, 0, counts[i]);
+    glDrawArrays(mesh->second.mode, 0, counts[i]);
   }
   glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
-static auto fexfn_impl_libGL_VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color) -> void {
-  if (!vertices || !mvp || !color || float_count < 18 || (float_count % 6) != 0 || !VexaFFEnsureProgram()) {
+static auto fexfn_impl_libGL_VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color, unsigned mode) -> void {
+  if (!vertices || !mvp || !color || float_count < 15 || (float_count % 15) != 0 || mode > GL_TRIANGLES || !VexaFFEnsureProgram()) {
     return;
   }
-  glBindBuffer(GL_ARRAY_BUFFER, g_vexa_ff_immediate_vbo);
+  VexaFFDrawScope scope;
+  glBindBuffer(GL_ARRAY_BUFFER, VexaFF().immediate_vbo);
   glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(float_count) * static_cast<GLsizeiptr>(sizeof(float)), vertices, GL_DYNAMIC_DRAW);
   VexaFFBindMeshAttribs();
-  glUseProgram(g_vexa_ff_program);
-  glUniformMatrix4fv(g_vexa_ff_mvp, 1, GL_FALSE, mvp);
-  glUniform4fv(g_vexa_ff_color, 1, color);
+  glUseProgram(VexaFF().program);
+  VexaFFStippleUniforms();
+  glUniform1i(glGetUniformLocation(VexaFF().program, "uVertexColors"), 1);
+  vexa_legacy_lighting::upload_wire(VexaFF().program, g_vexa_ff_lighting);
+  glUniformMatrix4fv(VexaFF().mvp, 1, GL_FALSE, mvp);
+  glUniform4fv(VexaFF().color, 1, color);
   VexaApplyAlphaTest();
   VexaApplyClipPlanes();
-  glDrawArrays(GL_TRIANGLES, 0, float_count / 6);
+  glDrawArrays(mode, 0, float_count / 15);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 static auto fexfn_impl_libGL_VEXA_FFDelete(unsigned buffer) -> void {
-  const auto mesh = g_vexa_ff_meshes.find(buffer);
-  if (mesh == g_vexa_ff_meshes.end()) {
+  const auto mesh = VexaFF().meshes.find(buffer);
+  if (mesh == VexaFF().meshes.end()) {
     return;
   }
   glDeleteBuffers(1, &mesh->second.vbo);
-  g_vexa_ff_meshes.erase(mesh);
+  VexaFF().meshes.erase(mesh);
 }
 #endif
 
 #include "arb_shader_objects.h"
 #include "legacy_state.h"
 #include "arb_assembly.h"
+static GLboolean fexfn_impl_libGL_glIsEnabled(GLenum cap) { return VexaCompatIsEnabled(cap); }
+
 #include "thunkgen_host_libGL.inl"
 
 #ifdef BUILD_ANDROID

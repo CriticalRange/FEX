@@ -244,7 +244,7 @@ public:
   void RemoveForceTSOInformation(uint64_t Address, uint64_t Size) override;
 
   void MarkMonoDetected() override {
-    MonoDetected = true;
+    MonoDetected.store(true, std::memory_order_relaxed);
   }
 
   void MarkMonoBackpatcherBlock(uint64_t BlockEntry) override;
@@ -464,7 +464,7 @@ public:
   }
 
   bool AreMonoHacksActive() const {
-    return Config.MonoHacks && MonoDetected;
+    return Config.MonoHacks && MonoDetected.load(std::memory_order_relaxed);
   }
 
   bool RequiresRelocatableConstants() const;
@@ -512,7 +512,8 @@ private:
   IntervalList<uint64_t> ForceTSOValidRanges; // The ranges for which ForceTSOInstructions has populated data
   fextl::set<uint64_t> ForceTSOInstructions;
 
-  bool MonoDetected = false;
+  // Set once, possibly while other threads decode (Linux detects Mono when its library is mapped).
+  std::atomic<bool> MonoDetected {false};
   std::atomic<uint64_t> MonoBackpatcherBlock;
 
   std::mutex CodeBufferListLock;

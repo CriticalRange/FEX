@@ -25,12 +25,7 @@ void RegisterMemory(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(madvise, [](FEXCore::Core::CpuStateFrame* Frame, void* addr, size_t length, int32_t advice) -> uint64_t {
-    uint64_t Result = ::madvise(addr, length, advice);
-
-    if (Result != -1) {
-      FEX::HLE::_SyscallHandler->TrackMadvise(Frame->Thread, (uintptr_t)addr, length, advice);
-    }
-    SYSCALL_ERRNO();
+    return FEX::HLE::_SyscallHandler->GuestMadvise(Frame->Thread, addr, length, advice);
   });
 }
 } // namespace FEX::HLE

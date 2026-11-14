@@ -4,7 +4,15 @@
 // Display lists are baked into static meshes. A later glCallList crosses to the
 // host once and only updates the current matrix and color. Immediate glBegin/glEnd
 // still works, as one host transition per primitive instead of a full GLES setup.
+#include "vexa_evaluator_state.h"
+#include "raster_position_core.h"
+#include "legacy_lighting_wire.h"
+#include "pixel_transfer_state.h"
+#include "vexa_selection_state.h"
+#include "stipple_core.h"
+#include <array>
 #include <cmath>
+#include <functional>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -14,9 +22,9 @@
 #include <cstdlib>
 
 extern "C" {
-unsigned fexfn_pack_VEXA_FFUpload(const float* vertices, int float_count);
+unsigned fexfn_pack_VEXA_FFUpload(const float* vertices, int float_count, unsigned mode);
 void fexfn_pack_VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp);
-void fexfn_pack_VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color);
+void fexfn_pack_VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color, unsigned mode);
 void fexfn_pack_VEXA_FFDelete(unsigned buffer);
 void fexfn_pack_VEXA_SetClipMatrices(const float* model, const float* projection, unsigned mode);
 void fexfn_pack_VEXA_MultiDrawIndirect(unsigned mode, unsigned type, uintptr_t indirect, int drawcount, int stride);
@@ -30,6 +38,7 @@ namespace vexa_ff {
 
 constexpr unsigned kModelView = 0x1700;
 constexpr unsigned kProjection = 0x1701;
+constexpr unsigned kTexture = 0x1702;
 constexpr unsigned kCompile = 0x1300;
 constexpr unsigned kQuads = 0x0007;
 constexpr unsigned kQuadStrip = 0x0008;
@@ -53,6 +62,9 @@ enum class CmdOp : uint8_t {
   Push,
   Pop,
   Call,
+  ListBase,
+  CallOffset,
+  Callback,
 };
 
 struct Cmd {
@@ -64,6 +76,7 @@ struct Cmd {
   float d = 0.f;
   float e = 0.f;
   float f = 0.f;
+  std::function<void()> callback;
 };
 
 struct Batch {
@@ -72,12 +85,15 @@ struct Batch {
   std::vector<float> verts;
   unsigned buffer = 0;
   int vertex_count = 0;
+  unsigned mode = 4;
+  bool mergeable = true;
 };
 
 struct DisplayList {
   std::vector<Batch> batches;
   std::vector<Cmd> cmds;
   bool baked = false;
+  bool defined = false;
   bool sets_color = false;
   bool sets_normal = false;
   float end_color[4] {0.8f, 0.8f, 0.8f, 1.f};
@@ -85,8 +101,15 @@ struct DisplayList {
 };
 
 struct State {
+  vexa_stipple::State stipple;
+  std::function<void(const std::vector<float>&, const float*, unsigned)> stipple_draw;
+  vexa_select::State selection;
+  std::function<void(const std::vector<float>&,unsigned)> selection_draw;
   float model[16] {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
   float projection[16] {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+  float texture[16] {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+  float texture_stack[32][16] {};
+  int texture_depth = 0;
   float model_stack[32][16] {};
   float projection_stack[32][16] {};
   int model_depth = 0;
@@ -95,10 +118,25 @@ struct State {
   bool inside = false;
   unsigned begin_mode = 0;
   float normal[3] {0.f, 0.f, 1.f};
+  float texcoord[4] {0.f, 0.f, 0.f, 1.f};
   float color[4] {0.8f, 0.8f, 0.8f, 1.f};
   std::vector<float> verts;
   bool compiling = false;
+  bool compile_execute = false;
+  unsigned list_depth = 0;
+  bool compile_inside = false;
+  vexa_eval::State evaluator;
+  vexa_raster::Position raster;
+  vexa_legacy_lighting::State lighting;
+  vexa_pixel::PixelTransferState pixels;
+  bool unpack_swap_bytes = false, unpack_lsb_first = false, pack_lsb_first = false, pack_swap_bytes = false;
+  double color_index = 1;
+  float clear_index = 0;
+  unsigned index_mask = ~0U;
+  bool edge_flag = true;
+  float accum_clear[4] = {};
   unsigned compile_id = 0;
+  unsigned list_base = 0;
   std::vector<Cmd> compile_cmds;
   std::vector<DisplayList> lists {1};
   std::vector<unsigned> scratch_buffers;
@@ -110,14 +148,21 @@ inline bool clip_enabled() {static const bool enabled=[] {const auto v=getenv("V
 inline std::unordered_map<uintptr_t,std::shared_ptr<State>>& context_states() {static std::unordered_map<uintptr_t,std::shared_ptr<State>> states;return states;}
 inline std::mutex& context_mutex() {static std::mutex mutex;return mutex;}
 inline std::shared_ptr<State>& active_state() {static thread_local std::shared_ptr<State> state;return state;}
-inline State& S() {static State fallback;return active_state()?*active_state():fallback;}
+inline State& S() {static thread_local State fallback;return active_state()?*active_state():fallback;}
+inline bool tracked_contexts() {
+  static const bool real_x11 = [] { const char* v = getenv("VEXA_REAL_X11"); return v && !strcmp(v, "1"); }();
+  return real_x11 || clip_enabled();
+}
 inline void select_context(uintptr_t context) {
-  if(!clip_enabled())return;
-  std::lock_guard lock(context_mutex());auto& slot=context_states()[context];if(!slot)slot=std::make_shared<State>();active_state()=slot;
+  if (!tracked_contexts()) return;
+  if (!context) { active_state().reset(); return; }
+  std::lock_guard lock(context_mutex()); auto& slot = context_states()[context];
+  if (!slot) slot = std::make_shared<State>();
+  active_state() = slot;
 }
 inline void forget_context(uintptr_t context) {
-  if(!clip_enabled())return;
-  std::lock_guard lock(context_mutex());context_states().erase(context);
+  if (!tracked_contexts()) return;
+  std::lock_guard lock(context_mutex()); context_states().erase(context);
 }
 inline void sync_clip_matrices() {if(clip_enabled())fexfn_pack_VEXA_SetClipMatrices(S().model,S().projection,S().matrix_mode);}
 
@@ -127,7 +172,7 @@ inline void identity(float* m) {
 }
 
 inline float* current() {
-  return S().matrix_mode == kProjection ? S().projection : S().model;
+  return S().matrix_mode == kProjection ? S().projection : S().matrix_mode == kTexture ? S().texture : S().model;
 }
 
 inline void multiply(float* a, const float* b) {
@@ -145,22 +190,25 @@ inline void current_mvp(float mvp[16]) {
   multiply(mvp, S().model);
 }
 
-inline void push_vertex(std::vector<float>& dst, float x, float y, float z, const float normal[3]) {
+inline void push_vertex(std::vector<float>& dst, float x, float y, float z, float w, const float normal[3], const float color[4], const float texcoord[4]) {
   dst.push_back(x);
   dst.push_back(y);
   dst.push_back(z);
+  dst.push_back(w);
   dst.push_back(normal[0]);
   dst.push_back(normal[1]);
   dst.push_back(normal[2]);
+  dst.insert(dst.end(), color, color + 4);
+  dst.insert(dst.end(), texcoord, texcoord + 4);
 }
 
 inline std::vector<float> expand(unsigned mode, const std::vector<float>& src) {
   std::vector<float> out;
-  const int count = static_cast<int>(src.size() / 6);
+  const int count = static_cast<int>(src.size() / 15);
   auto add = [&](int index) {
-    out.insert(out.end(), src.begin() + index * 6, src.begin() + (index + 1) * 6);
+    out.insert(out.end(), src.begin() + index * 15, src.begin() + (index + 1) * 15);
   };
-  if (mode == kTriangles) {
+  if (mode <= 3 || mode == kTriangles) {
     return src;
   }
   if (mode == kQuads) {
@@ -203,13 +251,21 @@ inline std::vector<float> expand(unsigned mode, const std::vector<float>& src) {
   return out;
 }
 
-inline void draw_immediate(const std::vector<float>& data, const float color[4]) {
-  if (data.size() < 18 || !color) {
+inline void draw_immediate(const std::vector<float>& data, const float color[4], unsigned mode) {
+  if (data.size() < 15 || !color) {
     return;
   }
   float mvp[16];
   current_mvp(mvp);
-  fexfn_pack_VEXA_FFDrawImmediate(data.data(), static_cast<int>(data.size()), mvp, color);
+#ifdef VEXA_FF_LIGHTING_BRIDGE
+  vexa_legacy_lighting::Mat4 model;
+  std::copy_n(S().model, 16, model.begin());
+  vexa_legacy_lighting::Wire wire{};
+  if (vexa_legacy_lighting::build_wire(S().lighting, model, wire, S().texture))
+    fexfn_pack_VEXA_FFSetLighting(&wire, sizeof(wire));
+#endif
+  if (S().stipple_draw) { S().stipple_draw(data, color, mode); return; }
+  fexfn_pack_VEXA_FFDrawImmediate(data.data(), static_cast<int>(data.size()), mvp, color, mode <= 3 ? mode : kTriangles);
 }
 
 inline void destroy_list(DisplayList& list) {
@@ -222,16 +278,19 @@ inline void destroy_list(DisplayList& list) {
   list.batches.clear();
   list.cmds.clear();
   list.baked = false;
+  list.defined = false;
   list.sets_color = false;
   list.sets_normal = false;
 }
 
 inline bool is_matrix_op(CmdOp op) {
   return op == CmdOp::MatrixMode || op == CmdOp::LoadIdentity || op == CmdOp::Translate || op == CmdOp::Rotate || op == CmdOp::Frustum ||
-         op == CmdOp::Push || op == CmdOp::Pop || op == CmdOp::Call;
+         op == CmdOp::Push || op == CmdOp::Pop || op == CmdOp::Call || op == CmdOp::ListBase || op == CmdOp::CallOffset || op == CmdOp::Callback;
 }
 
 inline bool bake_commands(const std::vector<Cmd>& cmds, DisplayList& out) {
+  // Color commands may occur between vertices; preserve their ordering on replay.
+  for (const auto& cmd : cmds) if (cmd.op == CmdOp::Material) return false;
   float color[4] {0.8f, 0.8f, 0.8f, 1.f};
   float normal[3] {0.f, 0.f, 1.f};
   bool color_from_list = false;
@@ -248,14 +307,16 @@ inline bool bake_commands(const std::vector<Cmd>& cmds, DisplayList& out) {
     std::vector<float> tris = expand(mode, verts);
     verts.clear();
     inside = false;
-    if (tris.size() < 18) {
+    if (tris.size() < 15) {
       return;
     }
     const bool live = !color_from_list;
-    if (batches.empty() || !same_color(batches.back(), color, live)) {
+    if (batches.empty() || !batches.back().mergeable || mode == 2 || mode == 3 || mode == 1 || (mode == kTriangles && (tris.size() / 15) % 3 != 0) || batches.back().mode != (mode <= 3 ? mode : kTriangles) || !same_color(batches.back(), color, live)) {
       Batch batch;
       std::memcpy(batch.color, color, sizeof(batch.color));
       batch.live_color = live;
+      batch.mode = mode <= 3 ? mode : kTriangles;
+      batch.mergeable = !(mode == 1 || mode == 2 || mode == 3 || (mode == kTriangles && (tris.size() / 15) % 3 != 0));
       batches.push_back(std::move(batch));
     }
     batches.back().verts.insert(batches.back().verts.end(), tris.begin(), tris.end());
@@ -273,7 +334,8 @@ inline bool bake_commands(const std::vector<Cmd>& cmds, DisplayList& out) {
       break;
     case CmdOp::Vertex:
       if (inside) {
-        push_vertex(verts, cmd.a, cmd.b, cmd.c, normal);
+        const float texcoord[4] {0,0,0,1};
+        push_vertex(verts, cmd.a, cmd.b, cmd.c, cmd.d, normal, color, texcoord);
       }
       break;
     case CmdOp::Normal:
@@ -314,13 +376,21 @@ inline void call_list(unsigned list) {
     cmd.op = CmdOp::Call;
     cmd.mode = list;
     state.compile_cmds.push_back(cmd);
+    if (state.compile_execute) {
+      state.compiling = false;
+      call_list(list);
+      state.compiling = true;
+    }
     return;
   }
-  if (list >= state.lists.size()) {
+  if (list >= state.lists.size() || !state.lists[list].defined) {
     return;
   }
+  // Recursive lists are legal, but nesting beyond the advertised limit is ignored.
+  if (state.list_depth >= 64) return;
+  struct DepthScope { unsigned& depth; DepthScope(unsigned& d):depth(d){++depth;} ~DepthScope(){--depth;} } depth(state.list_depth);
   DisplayList& compiled = state.lists[list];
-  if (!compiled.baked) {
+  if (!compiled.baked || state.lighting.lighting_enabled || state.selection.mode != vexa_select::kRender || state.stipple.line || state.stipple.polygon) {
     for (const Cmd& cmd : compiled.cmds) {
       apply(cmd);
     }
@@ -342,6 +412,13 @@ inline void call_list(unsigned list) {
     state.scratch_colors.insert(state.scratch_colors.end(), color, color + 4);
   }
   if (!state.scratch_buffers.empty()) {
+#ifdef VEXA_FF_LIGHTING_BRIDGE
+    vexa_legacy_lighting::Mat4 model;
+    std::copy_n(state.model, 16, model.begin());
+    vexa_legacy_lighting::Wire wire{};
+    if (vexa_legacy_lighting::build_wire(state.lighting, model, wire, state.texture))
+      fexfn_pack_VEXA_FFSetLighting(&wire, sizeof(wire));
+#endif
     fexfn_pack_VEXA_FFDrawList(state.scratch_buffers.data(), state.scratch_counts.data(), state.scratch_colors.data(),
                                static_cast<int>(state.scratch_buffers.size()), mvp);
   }
@@ -363,7 +440,7 @@ inline void apply(const Cmd& cmd) {
     break;
   case CmdOp::Vertex:
     if (state.inside) {
-      push_vertex(state.verts, cmd.a, cmd.b, cmd.c, state.normal);
+      push_vertex(state.verts, cmd.a, cmd.b, cmd.c, cmd.d, state.normal, state.color, state.texcoord);
     }
     break;
   case CmdOp::Normal:
@@ -376,14 +453,19 @@ inline void apply(const Cmd& cmd) {
     state.color[1] = cmd.b;
     state.color[2] = cmd.c;
     state.color[3] = cmd.d;
+    if (state.lighting.color_material_enabled) state.lighting.update_color_material(state.color);
     break;
   case CmdOp::End: {
+    if(state.selection.mode != vexa_select::kRender && state.selection_draw) {
+      state.selection_draw(state.verts,state.begin_mode);
+      state.inside=false;state.verts.clear();break;
+    }
     std::vector<float> tris = expand(state.begin_mode, state.verts);
     float color[4];
     std::memcpy(color, state.color, sizeof(color));
     state.inside = false;
     state.verts.clear();
-    draw_immediate(tris, color);
+    draw_immediate(tris, color, state.begin_mode);
     break;
   }
   case CmdOp::MatrixMode:
@@ -444,6 +526,8 @@ inline void apply(const Cmd& cmd) {
       if (state.projection_depth < 32) {
         std::memcpy(state.projection_stack[state.projection_depth++], state.projection, sizeof(state.projection));
       }
+    } else if (state.matrix_mode == kTexture) {
+      if (state.texture_depth < 32) std::memcpy(state.texture_stack[state.texture_depth++], state.texture, sizeof(state.texture));
     } else if (state.model_depth < 32) {
       std::memcpy(state.model_stack[state.model_depth++], state.model, sizeof(state.model));
     }
@@ -453,6 +537,8 @@ inline void apply(const Cmd& cmd) {
       if (state.projection_depth > 0) {
         std::memcpy(state.projection, state.projection_stack[--state.projection_depth], sizeof(state.projection));
       }
+    } else if (state.matrix_mode == kTexture) {
+      if (state.texture_depth > 0) std::memcpy(state.texture, state.texture_stack[--state.texture_depth], sizeof(state.texture));
     } else if (state.model_depth > 0) {
       std::memcpy(state.model, state.model_stack[--state.model_depth], sizeof(state.model));
     }
@@ -460,18 +546,50 @@ inline void apply(const Cmd& cmd) {
   case CmdOp::Call:
     call_list(cmd.mode);
     break;
+  case CmdOp::ListBase:
+    state.list_base = cmd.mode;
+    break;
+  case CmdOp::CallOffset:
+    call_list(state.list_base + cmd.mode);
+    break;
+  case CmdOp::Callback:
+    if (cmd.callback) cmd.callback();
+    break;
   }
+  if (cmd.op >= CmdOp::MatrixMode && cmd.op <= CmdOp::Pop) sync_clip_matrices();
 }
 
 inline void run_or_record(Cmd cmd) {
   if (S().compiling) {
     S().compile_cmds.push_back(cmd);
+    if (S().compile_execute) {
+      S().compiling = false;
+      apply(cmd);
+      S().compiling = true;
+    }
   } else {
     apply(cmd);
   }
 }
 
+inline void run_or_record_callback(std::function<void()> callback) {
+  Cmd cmd; cmd.op = CmdOp::Callback; cmd.callback = std::move(callback); run_or_record(std::move(cmd));
+}
+
+inline void matrix(const float* values, bool multiply_current) {
+  std::array<float,16> copy;
+  std::memcpy(copy.data(), values, sizeof(float)*16);
+  run_or_record_callback([copy, multiply_current] {
+    if (multiply_current) multiply(current(), copy.data());
+    else std::memcpy(current(), copy.data(), sizeof(float)*16);
+    sync_clip_matrices();
+  });
+}
+
+inline bool in_begin() { return S().compiling ? S().compile_inside : S().inside; }
+
 inline void begin(unsigned mode) {
+  if (S().compiling) S().compile_inside = true;
   Cmd cmd;
   cmd.op = CmdOp::Begin;
   cmd.mode = mode;
@@ -479,19 +597,22 @@ inline void begin(unsigned mode) {
 }
 
 inline void end() {
+  if (S().compiling) S().compile_inside = false;
   Cmd cmd;
   cmd.op = CmdOp::End;
   run_or_record(cmd);
 }
 
-inline void vertex(float x, float y, float z) {
+inline void vertex4(float x, float y, float z, float w) {
   Cmd cmd;
   cmd.op = CmdOp::Vertex;
   cmd.a = x;
   cmd.b = y;
   cmd.c = z;
+  cmd.d = w;
   run_or_record(cmd);
 }
+inline void vertex(float x, float y, float z) { vertex4(x, y, z, 1.0f); }
 
 inline void normal(float x, float y, float z) {
   Cmd cmd;
@@ -559,6 +680,7 @@ inline void pop_matrix() {
 }
 
 inline unsigned gen_lists(int count) {
+  if (count <= 0) return 0;
   State& state = S();
   const unsigned first = static_cast<unsigned>(state.lists.size());
   state.lists.resize(state.lists.size() + static_cast<size_t>(count > 0 ? count : 0));
@@ -567,13 +689,15 @@ inline unsigned gen_lists(int count) {
 
 inline void new_list(unsigned list, unsigned mode) {
   State& state = S();
-  if (list >= state.lists.size() || mode != kCompile) {
+  if (!list || state.compiling || list >= state.lists.size() || (mode != kCompile && mode != 0x1301)) {
     return;
   }
   destroy_list(state.lists[list]);
   state.compiling = true;
+  state.compile_execute = mode == 0x1301;
   state.compile_id = list;
   state.compile_cmds.clear();
+  state.compile_inside = false;
 }
 
 inline void end_list() {
@@ -586,6 +710,7 @@ inline void end_list() {
   std::vector<Cmd> cmds = std::move(state.compile_cmds);
   state.compiling = false;
   DisplayList& list = state.lists[id];
+  list.defined = true;
   if (!bake_commands(cmds, list)) {
     list.cmds = std::move(cmds);
     list.baked = false;
@@ -594,17 +719,18 @@ inline void end_list() {
   }
   int verts = 0;
   for (Batch& batch : list.batches) {
-    if (batch.verts.size() < 18) {
+    if (batch.verts.size() < 15) {
       batch.verts.clear();
       continue;
     }
-    batch.vertex_count = static_cast<int>(batch.verts.size() / 6);
-    batch.buffer = fexfn_pack_VEXA_FFUpload(batch.verts.data(), static_cast<int>(batch.verts.size()));
+    batch.vertex_count = static_cast<int>(batch.verts.size() / 15);
+    batch.buffer = fexfn_pack_VEXA_FFUpload(batch.verts.data(), static_cast<int>(batch.verts.size()), batch.mode);
     verts += batch.vertex_count;
     batch.verts.clear();
     batch.verts.shrink_to_fit();
   }
   list.baked = true;
+  list.cmds = std::move(cmds); // Replay original primitives in selection/feedback mode.
   fprintf(stderr, "[VEXA][FF] baked list %u batches %zu verts %d\n", id, list.batches.size(), verts);
 }
 
@@ -616,6 +742,17 @@ inline void delete_lists(unsigned list, int count) {
       destroy_list(state.lists[id]);
     }
   }
+}
+
+inline bool is_list(unsigned list) {
+  const State& state = S();
+  return list && list < state.lists.size() && state.lists[list].defined;
+}
+inline void list_base(unsigned base) {
+  Cmd cmd; cmd.op = CmdOp::ListBase; cmd.mode = base; run_or_record(cmd);
+}
+inline void call_offset(unsigned offset) {
+  Cmd cmd; cmd.op = CmdOp::CallOffset; cmd.mode = offset; run_or_record(cmd);
 }
 
 inline void material(unsigned pname, const float* params) {

@@ -1,11 +1,15 @@
 #include <GLES3/gl3.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "common/AndroidWindow.h"
 #include "common/Host.h"
 
 static void fexfn_impl_libGLESv2_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+  const char* real_x11 = std::getenv("VEXA_REAL_X11");
+  if (real_x11 && !std::strcmp(real_x11, "1")) { glViewport(x, y, width, height); return; }
   static bool logged = false;
   static int surface_w = 0;
   static int surface_h = 0;

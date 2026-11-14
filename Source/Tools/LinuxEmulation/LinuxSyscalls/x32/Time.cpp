@@ -124,22 +124,26 @@ void RegisterTime(FEX::HLE::SyscallHandler* Handler) {
 
   REGISTER_SYSCALL_IMPL_X32(clock_gettime, [](FEXCore::Core::CpuStateFrame* Frame, clockid_t clk_id, timespec32* tp) -> uint64_t {
     struct timespec tp64 {};
-    uint64_t Result = ::clock_gettime(clk_id, &tp64);
-    if (tp) {
-      FaultSafeUserMemAccess::VerifyIsWritable(tp, sizeof(*tp));
-      *tp = tp64;
+    if (::clock_gettime(clk_id, &tp64) == -1) {
+      return -errno;
     }
-    SYSCALL_ERRNO();
+    const timespec32 converted {tp64};
+    if (FaultSafeUserMemAccess::CopyToUser(tp, &converted, sizeof(converted))) {
+      return -EFAULT;
+    }
+    return 0;
   });
 
   REGISTER_SYSCALL_IMPL_X32(clock_getres, [](FEXCore::Core::CpuStateFrame* Frame, clockid_t clk_id, timespec32* tp) -> uint64_t {
     struct timespec tp64 {};
-    uint64_t Result = ::clock_getres(clk_id, &tp64);
-    if (tp) {
-      FaultSafeUserMemAccess::VerifyIsWritable(tp, sizeof(*tp));
-      *tp = tp64;
+    if (::clock_getres(clk_id, &tp64) == -1) {
+      return -errno;
     }
-    SYSCALL_ERRNO();
+    const timespec32 converted {tp64};
+    if (tp && FaultSafeUserMemAccess::CopyToUser(tp, &converted, sizeof(converted))) {
+      return -EFAULT;
+    }
+    return 0;
   });
 
   REGISTER_SYSCALL_IMPL_X32(

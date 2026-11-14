@@ -33,10 +33,23 @@ struct fex_gen_config<vkGetInstanceProcAddr> : fexgen::custom_host_impl, fexgen:
 template<typename>
 struct fex_gen_type {};
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+// ANativeWindow is owned by Android, never a guest i386 pointer.
+template<>
+struct fex_gen_config<&VkAndroidSurfaceCreateInfoKHR::window> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAndroidSurfaceCreateInfoKHR::pNext> : fexgen::custom_repack {};
+#endif
+
 // internal use
 void Vulkan_SetGuestXSync(uintptr_t, uintptr_t);
 void Vulkan_SetGuestXGetVisualInfo(uintptr_t, uintptr_t);
 void Vulkan_SetGuestXDisplayString(uintptr_t, uintptr_t);
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+void Vulkan_SetGuestMemoryCallbacks(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+template<>
+struct fex_gen_config<Vulkan_SetGuestMemoryCallbacks> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
+#endif
 template<>
 struct fex_gen_config<Vulkan_SetGuestXSync> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
 template<>
@@ -480,8 +493,8 @@ template<>
 struct fex_gen_config<&VkDescriptorUpdateTemplateCreateInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceAddressBindingCallbackDataEXT::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDeviceBufferMemoryRequirements::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceBufferMemoryRequirements::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceCreateInfo::pNext> : fexgen::custom_repack {};
 // template<>
@@ -516,8 +529,8 @@ template<>
 struct fex_gen_config<&VkDeviceGroupSubmitInfo::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceGroupSwapchainCreateInfoKHR::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkDeviceImageMemoryRequirements::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkDeviceImageMemoryRequirements::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkDeviceMemoryCopyKHR::pNext> : fexgen::custom_repack {};
 template<>
@@ -2086,8 +2099,8 @@ template<>
 struct fex_gen_config<&VkSparseImageMemoryRequirements2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSubmitInfo::pNext> : fexgen::custom_repack {};
-// template<>
-// struct fex_gen_config<&VkSubmitInfo2::pNext> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkSubmitInfo2::pNext> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkSubpassBeginInfo::pNext> : fexgen::custom_repack {};
 template<>
@@ -2566,6 +2579,30 @@ template<>
 struct fex_gen_type<ANativeWindow> : fexgen::opaque_type {};
 #endif
 
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+template<> struct fex_gen_config<&VkDeviceBufferMemoryRequirements::pCreateInfo> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkDeviceImageMemoryRequirements::pCreateInfo> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkSubmitInfo2::pWaitSemaphoreInfos> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkSubmitInfo2::pCommandBufferInfos> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkSubmitInfo2::pSignalSemaphoreInfos> : fexgen::custom_repack {};
+#endif
+
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+template<> struct fex_gen_config<&VkCopyBufferInfo2::pNext> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkCopyBufferInfo2::pRegions> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkCopyImageInfo2::pNext> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkCopyImageInfo2::pRegions> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkCopyBufferToImageInfo2::pNext> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkCopyBufferToImageInfo2::pRegions> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkCopyImageToBufferInfo2::pNext> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkCopyImageToBufferInfo2::pRegions> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkBlitImageInfo2::pNext> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkBlitImageInfo2::pRegions> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkResolveImageInfo2::pNext> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkResolveImageInfo2::pRegions> : fexgen::custom_repack {};
+#endif
 namespace internal {
 
 // Function, parameter index, parameter type [optional]
@@ -2674,7 +2711,11 @@ template<>
 struct fex_gen_param<vkMapMemory, 5, void**> : fexgen::ptr_passthrough {};
 #endif
 template<>
-struct fex_gen_config<vkUnmapMemory> {};
+struct fex_gen_config<vkUnmapMemory>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+: fexgen::custom_host_impl
+#endif
+{};
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkFlushMappedMemoryRanges> {};
@@ -2732,7 +2773,11 @@ template<>
 struct fex_gen_param<vkGetQueryPoolResults, 5, void*> : fexgen::assume_compatible_data_layout {};
 #endif
 template<>
-struct fex_gen_config<vkCreateBuffer> {};
+struct fex_gen_config<vkCreateBuffer>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+: fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_config<vkDestroyBuffer> {};
 template<>
@@ -2819,6 +2864,11 @@ struct fex_gen_config<vkCmdPipelineBarrier>
   : fexgen::custom_host_impl
 #endif
 {};
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+template<> struct fex_gen_param<vkCmdPipelineBarrier, 5, const VkMemoryBarrier*> : fexgen::ptr_passthrough {};
+template<> struct fex_gen_param<vkCmdPipelineBarrier, 7, const VkBufferMemoryBarrier*> : fexgen::ptr_passthrough {};
+template<> struct fex_gen_param<vkCmdPipelineBarrier, 9, const VkImageMemoryBarrier*> : fexgen::ptr_passthrough {};
+#endif
 #ifndef IS_32BIT_THUNK
 template<>
 struct fex_gen_config<vkCmdBeginQuery> {};
@@ -2874,7 +2924,11 @@ struct fex_gen_param<vkGetPipelineCacheData, 3, void*> : fexgen::assume_compatib
 template<>
 struct fex_gen_config<vkMergePipelineCaches> {};
 template<>
-struct fex_gen_config<vkCreateComputePipelines> {};
+struct fex_gen_config<vkCreateComputePipelines>
+#if defined(BUILD_ANDROID)
+  : fexgen::custom_host_impl
+#endif
+{};
 #endif
 template<>
 struct fex_gen_config<vkDestroyPipeline> {};
@@ -2945,7 +2999,7 @@ struct fex_gen_param<vkCmdPushConstants, 5, const void*> : fexgen::assume_compat
 // TODO: Should be custom_host_impl since there may be more than one VkGraphicsPipelineCreateInfo and more than one output pipeline
 template<>
 struct fex_gen_config<vkCreateGraphicsPipelines>
-#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+#if defined(BUILD_ANDROID)
   : fexgen::custom_host_impl
 #endif
 {};
@@ -3080,11 +3134,23 @@ template<>
 struct fex_gen_config<vkCmdDispatchBase> {};
 #endif
 template<>
-struct fex_gen_config<vkCreateDescriptorUpdateTemplate> {};
+struct fex_gen_config<vkCreateDescriptorUpdateTemplate>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkDestroyDescriptorUpdateTemplate> {};
+struct fex_gen_config<vkDestroyDescriptorUpdateTemplate>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkUpdateDescriptorSetWithTemplate> {};
+struct fex_gen_config<vkUpdateDescriptorSetWithTemplate>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_param<vkUpdateDescriptorSetWithTemplate, 3, const void*> : fexgen::assume_compatible_data_layout {};
 template<>
@@ -3238,7 +3304,11 @@ template<>
 struct fex_gen_config<vkCmdPushDescriptorSet> {};
 #endif
 template<>
-struct fex_gen_config<vkCmdPushDescriptorSetWithTemplate> {};
+struct fex_gen_config<vkCmdPushDescriptorSetWithTemplate>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_param<vkCmdPushDescriptorSetWithTemplate, 4, const void*> : fexgen::assume_compatible_data_layout {};
 #ifndef IS_32BIT_THUNK
@@ -3320,13 +3390,13 @@ struct fex_gen_config<vkGetSwapchainImagesKHR>
 {};
 template<>
 struct fex_gen_config<vkAcquireNextImageKHR>
-#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+#if defined(BUILD_ANDROID)
   : fexgen::custom_host_impl
 #endif
 {};
 template<>
 struct fex_gen_config<vkQueuePresentKHR>
-#if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
+#if defined(BUILD_ANDROID)
   : fexgen::custom_host_impl
 #endif
 {};
@@ -3436,15 +3506,31 @@ template<>
 struct fex_gen_config<vkCmdPushDescriptorSetKHR> {};
 #endif
 template<>
-struct fex_gen_config<vkCmdPushDescriptorSetWithTemplateKHR> {};
+struct fex_gen_config<vkCmdPushDescriptorSetWithTemplateKHR>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_param<vkCmdPushDescriptorSetWithTemplateKHR, 4, const void*> : fexgen::assume_compatible_data_layout {};
 template<>
-struct fex_gen_config<vkCreateDescriptorUpdateTemplateKHR> {};
+struct fex_gen_config<vkCreateDescriptorUpdateTemplateKHR>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkDestroyDescriptorUpdateTemplateKHR> {};
+struct fex_gen_config<vkDestroyDescriptorUpdateTemplateKHR>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
-struct fex_gen_config<vkUpdateDescriptorSetWithTemplateKHR> {};
+struct fex_gen_config<vkUpdateDescriptorSetWithTemplateKHR>
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+ : fexgen::custom_host_impl
+#endif
+{};
 template<>
 struct fex_gen_param<vkUpdateDescriptorSetWithTemplateKHR, 3, const void*> : fexgen::assume_compatible_data_layout {};
 template<>
@@ -4562,6 +4648,114 @@ struct fex_gen_param<vkGetPhysicalDeviceXlibPresentationSupportKHR, 2, Display*>
 // VEXA_FIXES: vulkan_android.h â€” real surface creation path on Android.
 template<>
 struct fex_gen_config<vkCreateAndroidSurfaceKHR> : fexgen::custom_host_impl {};
+#endif
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+template<> struct fex_gen_config<vkGetPhysicalDeviceMemoryProperties2> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceMemoryProperties2KHR> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceExternalSemaphoreProperties> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceExternalFenceProperties> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceExternalBufferProperties> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceFeatures2KHR> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceProperties2KHR> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceFormatProperties2KHR> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceImageFormatProperties2KHR> {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceQueueFamilyProperties2> : fexgen::custom_host_impl {};
+template<> struct fex_gen_param<vkGetPhysicalDeviceQueueFamilyProperties2, 2, VkQueueFamilyProperties2*> : fexgen::ptr_passthrough {};
+template<> struct fex_gen_config<vkFlushMappedMemoryRanges> : fexgen::custom_host_impl {};
+template<> struct fex_gen_param<vkFlushMappedMemoryRanges, 2, const VkMappedMemoryRange*> : fexgen::ptr_passthrough {};
+template<> struct fex_gen_config<vkInvalidateMappedMemoryRanges> : fexgen::custom_host_impl {};
+template<> struct fex_gen_param<vkInvalidateMappedMemoryRanges, 2, const VkMappedMemoryRange*> : fexgen::ptr_passthrough {};
+// Android WSI and memory-query aliases must use the same ABI repackers as core calls.
+template<> struct fex_gen_config<vkGetBufferMemoryRequirements2> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkAcquireNextImage2KHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceSurfaceCapabilities2KHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetPhysicalDeviceSurfaceFormats2KHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetImageMemoryRequirements2KHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetBufferMemoryRequirements2KHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetDeviceBufferMemoryRequirementsKHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetDeviceImageMemoryRequirementsKHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetDeviceBufferMemoryRequirements> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkGetDeviceImageMemoryRequirements> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkQueueSubmit2> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<vkQueueSubmit2KHR> : fexgen::custom_host_impl {};
+template<> struct fex_gen_param<vkQueueSubmit2, 2, const VkSubmitInfo2*> : fexgen::ptr_passthrough {};
+template<> struct fex_gen_param<vkQueueSubmit2KHR, 2, const VkSubmitInfo2*> : fexgen::ptr_passthrough {};
+#endif
+
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+template<> struct fex_gen_config<vkCreateQueryPool> {};
+template<> struct fex_gen_config<vkGetQueryPoolResults> {};
+template<> struct fex_gen_config<vkCmdCopyQueryPoolResults> {};
+template<> struct fex_gen_config<vkDestroyEvent> {};
+template<> struct fex_gen_config<vkCmdDrawIndirect> {};
+template<> struct fex_gen_config<vkCmdDrawIndexedIndirect> {};
+template<> struct fex_gen_config<vkCmdNextSubpass> {};
+template<> struct fex_gen_config<vkCmdUpdateBuffer> {};
+template<> struct fex_gen_config<vkCmdWriteTimestamp> {};
+template<> struct fex_gen_param<vkGetQueryPoolResults, 5, void*> : fexgen::assume_compatible_data_layout {};
+template<> struct fex_gen_param<vkCmdUpdateBuffer, 4, const void*> : fexgen::assume_compatible_data_layout {};
+template<> struct fex_gen_config<vkCmdExecuteCommands> : fexgen::custom_host_impl {};
+template<> struct fex_gen_param<vkCmdExecuteCommands, 2, const VkCommandBuffer*> : fexgen::ptr_passthrough {};
+template<> struct fex_gen_config<vkCmdClearColorImage> {};
+template<> struct fex_gen_config<vkCmdBeginQuery> {};
+template<> struct fex_gen_config<vkCmdEndQuery> {};
+template<> struct fex_gen_config<vkCmdDrawIndexed> {};
+template<> struct fex_gen_config<vkCmdDispatch> {};
+template<> struct fex_gen_config<vkCmdDispatchIndirect> {};
+template<> struct fex_gen_config<vkCmdDrawIndexedIndirectCount> {};
+template<> struct fex_gen_config<vkCmdDrawIndirectCount> {};
+template<> struct fex_gen_config<vkCmdFillBuffer> {};
+template<> struct fex_gen_config<vkCmdResetQueryPool> {};
+template<> struct fex_gen_config<vkCmdClearDepthStencilImage> {};
+template<> struct fex_gen_config<vkCmdResolveImage> {};
+template<> struct fex_gen_config<vkCmdResetEvent> {};
+template<> struct fex_gen_config<vkCmdSetEvent> {};
+template<> struct fex_gen_config<vkCmdWriteTimestamp2> {};
+template<> struct fex_gen_config<vkGetFenceStatus> {};
+template<> struct fex_gen_config<vkGetEventStatus> {};
+template<> struct fex_gen_config<vkCreateEvent> {};
+template<> struct fex_gen_config<vkResetEvent> {};
+template<> struct fex_gen_config<vkSetEvent> {};
+template<> struct fex_gen_config<vkDestroyQueryPool> {};
+template<> struct fex_gen_config<vkSignalSemaphore> {};
+template<> struct fex_gen_config<vkGetSemaphoreCounterValue> {};
+template<> struct fex_gen_config<vkResetQueryPool> {};
+template<> struct fex_gen_config<vkMergePipelineCaches> {};
+template<> struct fex_gen_config<vkCmdBeginRenderPass2> {};
+template<> struct fex_gen_config<vkCmdNextSubpass2> {};
+template<> struct fex_gen_config<vkCmdEndRenderPass2> {};
+template<> struct fex_gen_config<vkCmdBindTransformFeedbackBuffersEXT> {};
+template<> struct fex_gen_config<vkCmdEndTransformFeedbackEXT> {};
+template<> struct fex_gen_config<vkWaitSemaphoresKHR> {};
+template<> struct fex_gen_config<vkCmdPushConstants> {};
+template<> struct fex_gen_param<vkCmdPushConstants, 5, const void*> : fexgen::assume_compatible_data_layout {};
+template<> struct fex_gen_config<vkGetDeviceQueue2> : fexgen::custom_host_impl {};
+template<> struct fex_gen_param<vkGetDeviceQueue2, 2, VkQueue*> : fexgen::ptr_passthrough {};
+#endif
+
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+template<> struct fex_gen_config<vkCmdCopyBuffer2> {};
+template<> struct fex_gen_config<vkCmdCopyBuffer2KHR> {};
+template<> struct fex_gen_config<vkCmdCopyImage2> {};
+template<> struct fex_gen_config<vkCmdCopyImage2KHR> {};
+template<> struct fex_gen_config<vkCmdCopyBufferToImage2> {};
+template<> struct fex_gen_config<vkCmdCopyBufferToImage2KHR> {};
+template<> struct fex_gen_config<vkCmdCopyImageToBuffer2> {};
+template<> struct fex_gen_config<vkCmdCopyImageToBuffer2KHR> {};
+template<> struct fex_gen_config<vkCmdBlitImage2> {};
+template<> struct fex_gen_config<vkCmdBlitImage2KHR> {};
+template<> struct fex_gen_config<vkCmdResolveImage2> {};
+template<> struct fex_gen_config<vkCmdResolveImage2KHR> {};
+#endif
+
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+template<> struct fex_gen_param<vkCreateGraphicsPipelines, 3, const VkGraphicsPipelineCreateInfo*> : fexgen::ptr_passthrough {};
+template<> struct fex_gen_config<vkCreateComputePipelines> : fexgen::custom_host_impl {};
+template<> struct fex_gen_param<vkCreateComputePipelines, 3, const VkComputePipelineCreateInfo*> : fexgen::ptr_passthrough {};
 #endif
 
 } // namespace internal

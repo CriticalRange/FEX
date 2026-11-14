@@ -13,8 +13,15 @@ $end_info$
 #include "Common/FileMappingBaseAddress.h"
 
 #include <filesystem>
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
+#include <string_view>
+#include <utility>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/personality.h>
@@ -329,6 +336,219 @@ LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, VMATracking::VMATracki
   return Result;
 }
 
+// Guest x86 code never executes natively: FEX only reads it to translate it, and
+// VMA tracking keeps the guest's view of the protection. Host mappings of guest
+// memory therefore never need PROT_EXEC. On Android this avoids SELinux exec
+// denials (and the retry they forced) for game files in app storage, and keeps
+// guest JIT regions from becoming RWX host mappings.
+static inline int HostProtForGuest(int Prot) {
+#if defined(__ANDROID__)
+  if (Prot & PROT_EXEC) {
+    Prot = (Prot & ~PROT_EXEC) | PROT_READ;
+  }
+#endif
+  return Prot;
+}
+
+#if defined(__ANDROID__)
+// The guest shares this process with ART, bionic, GPU drivers and FEX itself, so
+// it must never replace, unmap or reprotect memory it does not own. Guest
+// ownership is VMA tracking: every guest mmap, mremap and loader mapping is
+// recorded there.
+
+// Visits the parts of [Base, End) not covered by tracked guest VMAs, in address
+// order. Visit returns false to stop.
+template<typename Fn>
+static void ForEachUntrackedRange(const VMATracking::VMATracking& Tracking, uint64_t Base, uint64_t End, Fn&& Visit) {
+  uint64_t Cur = Base;
+  auto It = Tracking.VMAs.upper_bound(Cur);
+  if (It != Tracking.VMAs.begin()) {
+    auto Prev = std::prev(It);
+    if (Prev->first + Prev->second.Length > Cur) {
+      It = Prev;
+    }
+  }
+  while (Cur < End) {
+    if (It == Tracking.VMAs.end() || It->first >= End) {
+      Visit(Cur, End);
+      return;
+    }
+    if (It->first > Cur && !Visit(Cur, It->first)) {
+      return;
+    }
+    Cur = std::max<uint64_t>(Cur, It->first + It->second.Length);
+    ++It;
+  }
+}
+
+// Visits maximal runs of [Base, End) covered by tracked guest VMAs. Visit returns false to stop.
+template<typename Fn>
+static void ForEachTrackedRun(const VMATracking::VMATracking& Tracking, uint64_t Base, uint64_t End, Fn&& Visit) {
+  auto It = Tracking.VMAs.upper_bound(Base);
+  if (It != Tracking.VMAs.begin()) {
+    auto Prev = std::prev(It);
+    if (Prev->first + Prev->second.Length > Base) {
+      It = Prev;
+    }
+  }
+  uint64_t RunBegin = 0;
+  uint64_t RunEnd = 0;
+  for (; It != Tracking.VMAs.end() && It->first < End; ++It) {
+    const uint64_t Begin = std::max<uint64_t>(Base, It->first);
+    const uint64_t Stop = std::min<uint64_t>(End, It->first + It->second.Length);
+    if (Begin >= Stop) {
+      continue;
+    }
+    if (RunEnd != 0 && Begin == RunEnd) {
+      RunEnd = Stop;
+      continue;
+    }
+    if (RunEnd != 0 && !Visit(RunBegin, RunEnd)) {
+      return;
+    }
+    RunBegin = Begin;
+    RunEnd = Stop;
+  }
+  if (RunEnd != 0) {
+    Visit(RunBegin, RunEnd);
+  }
+}
+
+static bool IsRangeFullyTracked(const VMATracking::VMATracking& Tracking, uint64_t Base, uint64_t End) {
+  bool Tracked = true;
+  ForEachUntrackedRange(Tracking, Base, End, [&](uint64_t, uint64_t) {
+    Tracked = false;
+    return false;
+  });
+  return Tracked;
+}
+
+// The Linux frontend has no module-load observer like FEX's Windows one, so
+// detect Mono when its runtime library is mapped for execution. With Mono
+// handling active, FEX stops multiblock tracking past calls in Mono-generated
+// code, which otherwise recompiles a block once per backpatched call site and
+// churns the JIT code buffer.
+static void MaybeMarkMonoRuntime(FEXCore::Context::Context* CTX, std::string_view Path) {
+  static std::atomic<bool> Marked {false};
+  if (Marked.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const auto Slash = Path.rfind('/');
+  const auto Name = Slash == std::string_view::npos ? Path : Path.substr(Slash + 1);
+  if (!Name.starts_with("libmono") || Name.find(".so") == std::string_view::npos) {
+    return;
+  }
+  FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
+  FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
+  FEX_CONFIG_OPT(MaxInst, MAXINST);
+  if (!MonoHacks() || !Multiblock() || MaxInst() < 500 || Marked.exchange(true)) {
+    return;
+  }
+  CTX->MarkMonoDetected();
+  fprintf(stderr, "[VEXA][FEX] Mono runtime mapped (%.*s); Mono JIT handling enabled\n", static_cast<int>(Name.size()), Name.data());
+}
+
+static void LogRefusedHostRange(const char* Operation, uint64_t Begin, uint64_t End) {
+  static std::atomic<uint32_t> Logged {};
+  if (Logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+    LogMan::Msg::EFmt("[VEXA] refusing guest {} over host memory {:#x}-{:#x}", Operation, Begin, End);
+  }
+}
+
+static bool IsDestructiveAdvice(int Advice) {
+  constexpr int AdviceDontNeed = 4;
+  constexpr int AdviceFree = 8;
+  constexpr int AdviceRemove = 9;
+  constexpr int AdviceWipeOnFork = 18;
+  constexpr int AdviceDontNeedLocked = 24;
+  constexpr int AdviceHWPoison = 100;
+  constexpr int AdviceSoftOffline = 101;
+  switch (Advice) {
+  case AdviceDontNeed:
+  case AdviceFree:
+  case AdviceRemove:
+  case AdviceWipeOnFork:
+  case AdviceDontNeedLocked:
+  case AdviceHWPoison:
+  case AdviceSoftOffline: return true;
+  default: return false;
+  }
+}
+#endif
+
+void SyscallHandler::AddGuestClaimableRange(uint64_t Base, uint64_t Length) {
+  if (!Length || Base + Length < Base) {
+    return;
+  }
+  auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(VMATracking.Mutex, nullptr);
+  GuestClaimableRanges.emplace_back(Base, Base + Length);
+}
+
+void SyscallHandler::ReleaseFixedRangeProbes(const fextl::vector<std::pair<uint64_t, uint64_t>>& Probes) {
+  for (const auto& [Begin, End] : Probes) {
+    ::munmap(reinterpret_cast<void*>(Begin), End - Begin);
+  }
+}
+
+int SyscallHandler::PrepareFixedGuestRange(uint64_t Base, uint64_t Length, fextl::vector<std::pair<uint64_t, uint64_t>>& Probes) {
+#if defined(__ANDROID__)
+  const uint64_t End = Base + FEXCore::AlignUp(Length, FEXCore::Utils::FEX_PAGE_SIZE);
+  if (End <= Base) {
+    return -EINVAL;
+  }
+
+  int Error = 0;
+  ForEachUntrackedRange(VMATracking, Base, End, [&](uint64_t GapBegin, uint64_t GapEnd) {
+    uint64_t Cur = GapBegin;
+    while (Cur < GapEnd) {
+      // Host reservations made for the guest may be replaced as-is.
+      uint64_t NextClaim = GapEnd;
+      uint64_t ClaimEnd = 0;
+      for (const auto& [ClaimBegin, ClaimStop] : GuestClaimableRanges) {
+        if (ClaimBegin <= Cur && Cur < ClaimStop) {
+          ClaimEnd = std::min(ClaimStop, GapEnd);
+          break;
+        }
+        if (ClaimBegin > Cur && ClaimBegin < NextClaim) {
+          NextClaim = ClaimBegin;
+        }
+      }
+      if (ClaimEnd) {
+        Cur = ClaimEnd;
+        continue;
+      }
+
+      // Anything else must be free. Reserving it also keeps another thread
+      // from mapping it before the guest's real MAP_FIXED.
+      const uint64_t PieceEnd = std::min(NextClaim, GapEnd);
+      void* Probe = ::mmap(reinterpret_cast<void*>(Cur), PieceEnd - Cur, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+      if (Probe == reinterpret_cast<void*>(Cur)) {
+        Probes.emplace_back(Cur, PieceEnd);
+        Cur = PieceEnd;
+        continue;
+      }
+      if (Probe != MAP_FAILED) {
+        // A kernel that ignored MAP_FIXED_NOREPLACE placed it elsewhere: occupied.
+        ::munmap(Probe, PieceEnd - Cur);
+      }
+      LogRefusedHostRange("fixed mapping", Cur, PieceEnd);
+      Error = -ENOMEM;
+      return false;
+    }
+    return true;
+  });
+
+  if (Error) {
+    ReleaseFixedRangeProbes(Probes);
+    Probes.clear();
+  }
+  return Error;
+#else
+  return 0;
+#endif
+}
+
 void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, int prot, int flags,
                                 int fd, off_t offset) {
   LOGMAN_THROW_A_FMT(Is64Bit || (length >> 32) == 0, "values must fit to 32 bits");
@@ -346,27 +566,32 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
     //       us to be more optimal by using GuardSignalDeferringSection instead
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(VMATracking.Mutex, Thread);
 
+    const int HostProt = HostProtForGuest(prot);
+    fextl::vector<std::pair<uint64_t, uint64_t>> FixedProbes;
+#if defined(__ANDROID__)
+    // MAP_FIXED replaces whatever is mapped there. Only allow that over guest
+    // memory, claimable reservations or free space.
+    if (addr && (flags & MAP_FIXED) && !(flags & MAP_FIXED_NOREPLACE)) {
+      if (const int Error = PrepareFixedGuestRange(reinterpret_cast<uint64_t>(addr), length, FixedProbes)) {
+        return reinterpret_cast<void*>(static_cast<intptr_t>(Error));
+      }
+    }
+#endif
+
     bool Map32Bit = !Is64Bit || (flags & FEX::HLE::X86_64_MAP_32BIT);
     if (Map32Bit) {
-      Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, prot, flags, fd, offset);
-#if defined(__ANDROID__)
-      if (Result == static_cast<uint64_t>(-EACCES) && (prot & PROT_EXEC) && !(flags & MAP_ANONYMOUS) && fd >= 0) {
-        Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, (prot & ~PROT_EXEC) | PROT_READ, flags, fd, offset);
-      }
-#endif
+      Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, HostProt, flags, fd, offset);
       if (FEX::HLE::HasSyscallError(Result)) {
+        ReleaseFixedRangeProbes(FixedProbes);
         return reinterpret_cast<void*>(Result);
       }
       LOGMAN_THROW_A_FMT(Is64Bit || (Result >> 32) == 0 || (Result >> 32) == 0xFFFFFFFF, "values must fit to 32 bits");
     } else {
-      Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
-#if defined(__ANDROID__)
-      if (Result == ~0ULL && errno == EACCES && (prot & PROT_EXEC) && !(flags & MAP_ANONYMOUS) && fd >= 0) {
-        Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, (prot & ~PROT_EXEC) | PROT_READ, flags, fd, offset));
-      }
-#endif
+      Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, HostProt, flags, fd, offset));
       if (Result == ~0ULL) {
-        return reinterpret_cast<void*>(-errno);
+        const int Error = errno;
+        ReleaseFixedRangeProbes(FixedProbes);
+        return reinterpret_cast<void*>(-static_cast<intptr_t>(Error));
       }
     }
 
@@ -403,25 +628,37 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
     // To be more optimal the frontend should provide this code with a valid Thread object earlier.
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(VMATracking.Mutex, Thread);
 
-    // VEXA_DIAG: full-range coverage check, same intent as GuestMprotect.
-    if (reinterpret_cast<uintptr_t>(addr) >= 0x1'0000'0000ULL) {
-      uintptr_t Cur = reinterpret_cast<uintptr_t>(addr);
-      const uintptr_t End = Cur + length;
-      bool gap = false;
-      while (!gap && Cur < End) {
-        auto It = VMATracking.FindVMAEntry(Cur);
-        if (It == VMATracking.VMAs.end() || It->second.Base > Cur) {
-          gap = true;
-        } else {
-          Cur = It->second.Base + It->second.Length;
-        }
-      }
-      if (gap) {
-        fprintf(stderr, "[VEXA][MUNMAP-MISS] addr=%p len=%lx rip=%lx\n", addr, length,
-                Thread ? Thread->CurrentFrame->State.rip : 0);
-      }
+#if defined(__ANDROID__)
+    const uint64_t Base = reinterpret_cast<uint64_t>(addr);
+    const uint64_t End = Base + Size;
+    if ((Base & (FEXCore::Utils::FEX_PAGE_SIZE - 1)) || length == 0 || End < Base) {
+      return -EINVAL;
     }
 
+    // Unmap only guest-tracked memory. Untracked parts are either already free or
+    // belong to the host (ART heap, bionic, drivers, FEX) and stay mapped.
+    constexpr uint64_t First64BitAddr = 0x1'0000'0000ULL;
+    Result = 0;
+    ForEachTrackedRun(VMATracking, Base, End, [&](uint64_t RunBegin, uint64_t RunEnd) {
+      if (RunBegin < First64BitAddr) {
+        const uint64_t LowEnd = std::min(RunEnd, First64BitAddr);
+        const int LowResult = Get32BitAllocator()->Munmap(reinterpret_cast<void*>(RunBegin), LowEnd - RunBegin);
+        if (LowResult < 0) {
+          Result = static_cast<uint64_t>(static_cast<int64_t>(LowResult));
+          return false;
+        }
+        RunBegin = LowEnd;
+      }
+      if (RunBegin < RunEnd && ::munmap(reinterpret_cast<void*>(RunBegin), RunEnd - RunBegin) == -1) {
+        Result = -errno;
+        return false;
+      }
+      return true;
+    });
+    if (FEX::HLE::HasSyscallError(Result)) {
+      return Result;
+    }
+#else
     if (reinterpret_cast<uintptr_t>(addr) < 0x1'0000'0000ULL) {
       Result = Get32BitAllocator()->Munmap(addr, length);
       if (FEX::HLE::HasSyscallError(Result)) {
@@ -433,6 +670,7 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
         return -errno;
       }
     }
+#endif
     TrackMunmap(Thread, addr, length);
     PendingResourceDeletion = VMATracking.HasPendingResourceDeletions();
   }
@@ -452,14 +690,36 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
+    fextl::vector<std::pair<uint64_t, uint64_t>> FixedProbes;
+#if defined(__ANDROID__)
+    // The source must be guest memory; the kernel would move host memory too.
+    const uint64_t OldBase = reinterpret_cast<uint64_t>(old_address);
+    if (OldBase & (FEXCore::Utils::FEX_PAGE_SIZE - 1)) {
+      return -EINVAL;
+    }
+    const uint64_t OldLength = std::max<uint64_t>(FEXCore::AlignUp(old_size, FEXCore::Utils::FEX_PAGE_SIZE), FEXCore::Utils::FEX_PAGE_SIZE);
+    if (OldBase + OldLength < OldBase || !IsRangeFullyTracked(VMATracking, OldBase, OldBase + OldLength)) {
+      LogRefusedHostRange("mremap", OldBase, OldBase + OldLength);
+      return -EFAULT;
+    }
+    // MREMAP_FIXED replaces whatever is at the destination, like MAP_FIXED.
+    if ((flags & MREMAP_FIXED) && new_address) {
+      if (const int Error = PrepareFixedGuestRange(reinterpret_cast<uint64_t>(new_address), new_size, FixedProbes)) {
+        return Error;
+      }
+    }
+#endif
     if (Is64Bit) {
       Result = reinterpret_cast<uint64_t>(::mremap(old_address, old_size, new_size, flags, new_address));
       if (Result == -1) {
-        return -errno;
+        const int Error = errno;
+        ReleaseFixedRangeProbes(FixedProbes);
+        return -Error;
       }
     } else {
       Result = reinterpret_cast<uint64_t>(Get32BitAllocator()->Mremap(old_address, old_size, new_size, flags, new_address));
       if (FEX::HLE::HasSyscallError(Result)) {
+        ReleaseFixedRangeProbes(FixedProbes);
         return Result;
       }
     }
@@ -526,43 +786,53 @@ int SyscallHandler::OpenCodeMapFile() {
 
 uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
   uint64_t Result {};
+  size_t AppliedLength = len;
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
-    // VEXA_DIAG: flag mprotect calls whose range isn't fully covered by guest
-    // VMA tracking. Those punch holes into host-internal mappings (scudo heap,
-    // FEX arenas, InternalThreadState pages) and corrupt FEX later on.
-    {
-      uintptr_t Cur = reinterpret_cast<uintptr_t>(addr);
-      const uintptr_t End = Cur + len;
-      bool gap = false;
-      while (!gap && Cur < End) {
-        auto It = VMATracking.FindVMAEntry(Cur);
-        if (It == VMATracking.VMAs.end() || It->second.Base > Cur) {
-          gap = true;
-        } else {
-          Cur = It->second.Base + It->second.Length;
-        }
-      }
-      if (gap) {
-        fprintf(stderr, "[VEXA][MPROTECT-MISS] addr=%p len=%zx prot=%x rip=%lx\n", addr, len, prot,
-                Thread ? Thread->CurrentFrame->State.rip : 0);
-      }
-    }
-    Result = ::mprotect(addr, len, prot);
 #if defined(__ANDROID__)
-    if (Result == -1 && errno == EACCES && (prot & PROT_EXEC)) {
-      Result = ::mprotect(addr, len, (prot & ~PROT_EXEC) | PROT_READ);
+    // Like the kernel, apply the change up to the first address that is not
+    // guest memory and fail there with ENOMEM. Untracked memory is either
+    // unmapped or belongs to the host, which the guest must never reprotect.
+    const uint64_t Base = reinterpret_cast<uint64_t>(addr);
+    if (Base & (FEXCore::Utils::FEX_PAGE_SIZE - 1)) {
+      return -EINVAL;
     }
-#endif
+    const uint64_t End = Base + FEXCore::AlignUp(len, FEXCore::Utils::FEX_PAGE_SIZE);
+    if (End < Base) {
+      return -ENOMEM;
+    }
+    uint64_t FirstUntracked = End;
+    ForEachUntrackedRange(VMATracking, Base, End, [&](uint64_t GapBegin, uint64_t) {
+      FirstUntracked = GapBegin;
+      return false;
+    });
+    AppliedLength = FirstUntracked - Base;
+    if (AppliedLength) {
+      if (::mprotect(addr, AppliedLength, HostProtForGuest(prot)) == -1) {
+        return -errno;
+      }
+      TrackMprotect(Thread, addr, AppliedLength, prot);
+    }
+    if (FirstUntracked != End) {
+      Result = -ENOMEM;
+    }
+#else
+    Result = ::mprotect(addr, len, HostProtForGuest(prot));
     if (Result == -1) {
       return -errno;
     }
 
     TrackMprotect(Thread, addr, len, prot);
+#endif
   }
 
-  InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), len, false);
+  if (AppliedLength) {
+    InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), AppliedLength, false);
+  }
+  if (FEX::HLE::HasSyscallError(Result)) {
+    return Result;
+  }
 
   // Prepare for delayed code cache load after ld/Wine is done applying relocations.
   // Hooking into mprotect is a reliable heuristic that matches behavior of ld (for ELF) and Wine (for PE).
@@ -595,6 +865,48 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
   }
 
   return Result;
+}
+
+uint64_t SyscallHandler::GuestMadvise(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, int advice) {
+#if defined(__ANDROID__)
+  // Advice that discards or poisons contents must only reach guest memory.
+  // Like the kernel, apply it to every mapped part and report ENOMEM if the
+  // range also covered memory the guest doesn't own.
+  if (IsDestructiveAdvice(advice)) {
+    const uint64_t Base = reinterpret_cast<uint64_t>(addr);
+    const uint64_t End = Base + FEXCore::AlignUp(length, FEXCore::Utils::FEX_PAGE_SIZE);
+    if ((Base & (FEXCore::Utils::FEX_PAGE_SIZE - 1)) || End < Base) {
+      return -EINVAL;
+    }
+    if (End == Base) {
+      return 0;
+    }
+
+    bool HadUntracked = false;
+    uint64_t Error = 0;
+    {
+      auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
+      HadUntracked = !IsRangeFullyTracked(VMATracking, Base, End);
+      ForEachTrackedRun(VMATracking, Base, End, [&](uint64_t RunBegin, uint64_t RunEnd) {
+        if (::madvise(reinterpret_cast<void*>(RunBegin), RunEnd - RunBegin, advice) == -1) {
+          Error = -errno;
+          return false;
+        }
+        return true;
+      });
+    }
+    if (Error) {
+      return Error;
+    }
+    TrackMadvise(Thread, Base, length, advice);
+    return HadUntracked ? -ENOMEM : 0;
+  }
+#endif
+  if (::madvise(addr, length, advice) == -1) {
+    return -errno;
+  }
+  TrackMadvise(Thread, reinterpret_cast<uintptr_t>(addr), length, advice);
+  return 0;
 }
 
 uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, int shmid, const void* shmaddr, int shmflg) {
@@ -714,6 +1026,12 @@ SyscallHandler::TrackMmap(FEXCore::Core::InternalThreadState* Thread, uint64_t a
 
     char Tmp[PATH_MAX];
     auto PathLength = FEX::get_fdpath(fd, Tmp);
+
+#if defined(__ANDROID__)
+    if (PathLength > 0 && (prot & PROT_EXEC)) {
+      MaybeMarkMonoRuntime(CTX, std::string_view(Tmp, PathLength));
+    }
+#endif
 
     auto [ResourceIt, ResourceEnd] = VMATracking.FindResources(mrid);
     bool Inserted = false;

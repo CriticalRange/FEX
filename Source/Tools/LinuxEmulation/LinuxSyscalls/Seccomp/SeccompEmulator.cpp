@@ -129,7 +129,23 @@ uint64_t SeccompEmulator::Handle(FEXCore::Core::CpuStateFrame* Frame, uint32_t O
 
   switch (Op) {
   case SECCOMP_SET_MODE_STRICT: return SetModeStrict(Frame, flags, arg);
-  case SECCOMP_SET_MODE_FILTER: return SetModeFilter(Frame, flags, static_cast<const sock_fprog*>(arg));
+  case SECCOMP_SET_MODE_FILTER: {
+    sock_fprog Program {};
+    if (Is64BitMode()) {
+      if (FaultSafeUserMemAccess::CopyFromUser(&Program, arg, sizeof(Program))) return -EFAULT;
+    } else {
+      struct GuestProgram32 {
+        uint16_t Length;
+        uint16_t Padding;
+        uint32_t Filter;
+      } Guest {};
+      static_assert(sizeof(GuestProgram32) == 8);
+      if (FaultSafeUserMemAccess::CopyFromUser(&Guest, arg, sizeof(Guest))) return -EFAULT;
+      Program.len = Guest.Length;
+      Program.filter = reinterpret_cast<sock_filter*>(static_cast<uintptr_t>(Guest.Filter));
+    }
+    return SetModeFilter(Frame, flags, &Program);
+  }
   case SECCOMP_GET_ACTION_AVAIL: return GetActionAvail(flags, static_cast<const uint32_t*>(arg));
   case SECCOMP_GET_NOTIF_SIZES: return GetNotifSizes(flags, static_cast<struct seccomp_notif_sizes*>(arg));
   default:
@@ -634,6 +650,13 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     // program was zero or exceeded BPF_MAXINSNS (4096) instructions.
     return -EINVAL;
   }
+
+  // Keep guest pointers out of the JIT, and return EFAULT on inaccessible input.
+  fextl::vector<sock_filter> Instructions(prog->len);
+  if (FaultSafeUserMemAccess::CopyFromUser(Instructions.data(), prog->filter,
+                                         Instructions.size() * sizeof(sock_filter))) return -EFAULT;
+  const sock_fprog LocalProgram {prog->len, Instructions.data()};
+  prog = &LocalProgram;
 
   // Don't interrupt me while I'm jitting.
   auto lk = FEXCore::MaskSignalsAndLockMutex(FilterMutex);

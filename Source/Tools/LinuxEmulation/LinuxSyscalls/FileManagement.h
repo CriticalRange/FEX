@@ -8,6 +8,7 @@ $end_info$
 #pragma once
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/fextl/map.h>
+#include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/unordered_map.h>
@@ -46,6 +47,7 @@ static ssize_t GetSymlink(int FD, const char* Filename, char* ResultBuffer, size
 }
 
 struct open_how;
+class AndroidRootFSResolver;
 
 class FileManager final {
 public:
@@ -182,6 +184,16 @@ private:
   FEX::EmulatedFile::EmulatedFDManager EmuFD;
 
   fextl::map<fextl::string, fextl::string, std::less<>> ThunkOverlays;
+  // Final path components of every overlay. Relative paths only need the
+  // (costly) cwd or dirfd resolution when their basename can match an overlay.
+  fextl::unordered_set<fextl::string> ThunkOverlayBasenames;
+  bool MayMatchThunkOverlay(const char* Pathname) const;
+
+#if defined(__ANDROID__)
+  // In-root path resolution replacing openat2(RESOLVE_IN_ROOT), with a validated directory cache.
+  fextl::unique_ptr<AndroidRootFSResolver> RootFSResolver;
+#endif
+  int OpenInRootFS(int dirfd, const char* path, const open_how* how, size_t usize);
 
   FEX_CONFIG_OPT(Filename, APP_FILENAME);
   FEX_CONFIG_OPT(LDPath, ROOTFS);

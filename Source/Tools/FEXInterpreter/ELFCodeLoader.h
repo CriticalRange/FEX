@@ -10,7 +10,11 @@
 #include "VDSO_Emulation.h"
 #include "Linux/Utils/ELFParser.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <string_view>
+#include <utility>
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Utils/MathUtils.h>
@@ -126,6 +130,25 @@ class ELFCodeLoader final : public FEX::CodeLoader {
     return rv;
   }
 
+  // Names the host mappings that block a fixed guest image (load-time diagnostics only).
+  static void LogHostMappingsInRange(uint64_t Begin, uint64_t End) {
+    FILE* Maps = fopen("/proc/self/maps", "re");
+    if (!Maps) {
+      return;
+    }
+    char Line[512];
+    while (fgets(Line, sizeof(Line), Maps)) {
+      unsigned long long MapBegin = 0;
+      unsigned long long MapEnd = 0;
+      if (sscanf(Line, "%llx-%llx", &MapBegin, &MapEnd) != 2 || MapEnd <= Begin || MapBegin >= End) {
+        continue;
+      }
+      const auto Length = strcspn(Line, "\n");
+      LogMan::Msg::EFmt("  conflicting host mapping: {}", std::string_view(Line, Length));
+    }
+    fclose(Maps);
+  }
+
   std::optional<uintptr_t> LoadElfFile(ELFParser& Elf, uintptr_t* BrkBase, FEX::HLE::SyscallMmapInterface* const Handler,
                                        FEXCore::Core::InternalThreadState* Thread, uint64_t LoadHint = 0) {
 
@@ -148,6 +171,34 @@ class ELFCodeLoader final : public FEX::CodeLoader {
         BrkLoadBase = LoadBase + (TotalSize - BRK_SIZE);
       }
     }
+
+#if defined(__ANDROID__)
+    // ET_EXEC images load at fixed addresses. In an Android app process the low
+    // VA range also holds ART's heap and boot image, so claim the whole image
+    // range first: a collision then fails cleanly, naming the host mapping,
+    // instead of overwriting host memory or failing halfway through the segments.
+    std::pair<uint64_t, uint64_t> ExecImage {0, 0};
+    if (!DynELF) {
+      uint64_t ImageBegin = ~0ULL;
+      uint64_t ImageEnd = 0;
+      for (const auto& Header : Elf.phdrs) {
+        if (Header.p_type == PT_LOAD && Header.p_memsz) {
+          ImageBegin = std::min<uint64_t>(ImageBegin, PAGE_START(Header.p_vaddr));
+          ImageEnd = std::max<uint64_t>(ImageEnd, PAGE_ALIGN(Header.p_vaddr + Header.p_memsz));
+        }
+      }
+      if (ImageBegin < ImageEnd) {
+        const auto Reserved = (uintptr_t)Handler->GuestMmap(Thread, reinterpret_cast<void*>(ImageBegin), ImageEnd - ImageBegin, PROT_NONE,
+                                                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        if (FEX::HLE::HasSyscallError(Reserved)) {
+          LogMan::Msg::EFmt("ET_EXEC image {:#x}-{:#x} overlaps host memory and cannot be loaded", ImageBegin, ImageEnd);
+          LogHostMappingsInRange(ImageBegin, ImageEnd);
+          return {};
+        }
+        ExecImage = {ImageBegin, ImageEnd};
+      }
+    }
+#endif
 
     for (const auto& Header : Elf.phdrs) {
       if (Header.p_type != PT_LOAD) {
@@ -191,6 +242,26 @@ class ELFCodeLoader final : public FEX::CodeLoader {
         }
       }
     }
+
+#if defined(__ANDROID__)
+    if (ExecImage.second) {
+      // Match the kernel: the space between segments stays unmapped.
+      fextl::vector<std::pair<uint64_t, uint64_t>> Segments;
+      for (const auto& Header : Elf.phdrs) {
+        if (Header.p_type == PT_LOAD && Header.p_memsz) {
+          Segments.emplace_back(PAGE_START(Header.p_vaddr), PAGE_ALIGN(Header.p_vaddr + Header.p_memsz));
+        }
+      }
+      std::sort(Segments.begin(), Segments.end());
+      uint64_t Cursor = ExecImage.first;
+      for (const auto& [SegmentBegin, SegmentEnd] : Segments) {
+        if (SegmentBegin > Cursor) {
+          Handler->GuestMunmap(Thread, reinterpret_cast<void*>(Cursor), SegmentBegin - Cursor);
+        }
+        Cursor = std::max(Cursor, SegmentEnd);
+      }
+    }
+#endif
 
     if (NeedsLateBRKMap) {
       // Map the BRK after ELF if possible.

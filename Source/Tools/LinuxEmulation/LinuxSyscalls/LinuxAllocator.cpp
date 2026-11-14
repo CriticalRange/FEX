@@ -261,7 +261,8 @@ int MemAllocator32Bit::Munmap(void* addr, size_t length) {
     return -EINVAL;
   }
 
-  if (Addr + length > std::numeric_limits<uint32_t>::max()) {
+  // A range may end exactly at 4GiB (the 32-bit stack does).
+  if (Addr + length > 0x1'0000'0000ULL) {
     return -EOVERFLOW;
   }
 
@@ -271,18 +272,21 @@ int MemAllocator32Bit::Munmap(void* addr, size_t length) {
     return 0;
   }
 
-  while (PageAddr != PageEnd) {
-    // Always pass to munmap, it may be something allocated we aren't tracking
-    int Result = ::munmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT), FEXCore::Utils::FEX_PAGE_SIZE);
-    if (Result != 0) {
-      return -errno;
-    }
+  // The top page stays reserved, as in the constructor.
+  PageEnd = std::min<uintptr_t>(PageEnd, TOP_KEY);
+  if (PageAddr >= PageEnd) {
+    return 0;
+  }
 
-    if (MappedPages.test(PageAddr)) {
-      MappedPages.reset(PageAddr);
-    }
+  // One syscall for the whole range: munmap tolerates holes, and the previous
+  // page-at-a-time loop cost one syscall per 4KiB when releasing large regions.
+  if (PageEnd != PageAddr &&
+      ::munmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT), (PageEnd - PageAddr) << FEXCore::Utils::FEX_PAGE_SHIFT) != 0) {
+    return -errno;
+  }
 
-    ++PageAddr;
+  for (; PageAddr != PageEnd; ++PageAddr) {
+    MappedPages.reset(PageAddr);
   }
 
   return 0;

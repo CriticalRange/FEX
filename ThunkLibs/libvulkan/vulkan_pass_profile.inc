@@ -210,8 +210,70 @@ static void FEXFN_IMPL(vkCmdExecuteCommands)(VkCommandBuffer buffer, uint32_t co
   }
   LDR_PTR(vkCmdExecuteCommands)(buffer, count, secondary);
 }
+static VkResult FEXFN_IMPL(vkCreateShaderModule)(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule*);
+// Drivers without maintenance5 (Mali) dereference a null stage module. DXVK
+// passes module=VK_NULL_HANDLE plus a chained VkShaderModuleCreateInfo, so
+// materialize a real module for such stages.
+static bool VexaStageIsInline(const VkPipelineShaderStageCreateInfo& stage) {
+  if (stage.module != VK_NULL_HANDLE) return false;
+  for (auto* p = static_cast<const VkBaseInStructure*>(stage.pNext); p; p = p->pNext)
+    if (p->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) return true;
+  return false;
+}
+static VkResult VexaMaterializeStage(VkDevice device, VkPipelineShaderStageCreateInfo& stage, std::vector<VkShaderModule>& modules) {
+  const VkBaseInStructure* previous = nullptr;
+  auto* node = static_cast<const VkBaseInStructure*>(stage.pNext);
+  while (node && node->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) { previous = node; node = node->pNext; }
+  VkShaderModule module = VK_NULL_HANDLE;
+  const auto result = FEXFN_IMPL(vkCreateShaderModule)(device, reinterpret_cast<const VkShaderModuleCreateInfo*>(node), nullptr, &module);
+  if (result != VK_SUCCESS) return result;
+  modules.push_back(module);
+  stage.module = module;
+  if (previous) const_cast<VkBaseInStructure*>(previous)->pNext = node->pNext;
+  else stage.pNext = node->pNext;
+  return VK_SUCCESS;
+}
+static void VexaDestroyStageModules(VkDevice device, const std::vector<VkShaderModule>& modules) {
+  if (modules.empty()) return;
+  const auto destroy = reinterpret_cast<PFN_vkDestroyShaderModule>(LDR_PTR(vkGetDeviceProcAddr)(device, "vkDestroyShaderModule"));
+  for (const auto module : modules) destroy(device, module, nullptr);
+}
+static VkResult FEXFN_IMPL(vkCreateComputePipelines)(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                                    const VkComputePipelineCreateInfo* info, const VkAllocationCallbacks* alloc, VkPipeline* out) {
+  std::vector<VkComputePipelineCreateInfo> patched;
+  std::vector<VkShaderModule> modules;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (!VexaStageIsInline(info[i].stage)) continue;
+    if (patched.empty()) patched.assign(info, info + count);
+    if (const auto result = VexaMaterializeStage(device, patched[i].stage, modules); result != VK_SUCCESS) {
+      VexaDestroyStageModules(device, modules);
+      return result;
+    }
+  }
+  const auto result = LDR_PTR(vkCreateComputePipelines)(device, cache, count, patched.empty() ? info : patched.data(), alloc, out);
+  VexaDestroyStageModules(device, modules);
+  return result;
+}
 static VkResult FEXFN_IMPL(vkCreateGraphicsPipelines)(VkDevice device, VkPipelineCache cache, uint32_t count,
                                                      const VkGraphicsPipelineCreateInfo* info, const VkAllocationCallbacks* alloc, VkPipeline* out) {
+  std::vector<VkGraphicsPipelineCreateInfo> patchedInfos;
+  std::vector<std::vector<VkPipelineShaderStageCreateInfo>> patchedStages;
+  std::vector<VkShaderModule> inlineModules;
+  for (uint32_t i = 0; i < count; ++i) {
+    bool inlineStage = false;
+    for (uint32_t j = 0; j < info[i].stageCount; ++j) inlineStage |= VexaStageIsInline(info[i].pStages[j]);
+    if (!inlineStage) continue;
+    if (patchedInfos.empty()) { patchedInfos.assign(info, info + count); patchedStages.resize(count); }
+    patchedStages[i].assign(info[i].pStages, info[i].pStages + info[i].stageCount);
+    patchedInfos[i].pStages = patchedStages[i].data();
+    for (auto& stage : patchedStages[i]) {
+      if (const auto result = VexaMaterializeStage(device, stage, inlineModules); result != VK_SUCCESS) {
+        VexaDestroyStageModules(device, inlineModules);
+        return result;
+      }
+    }
+  }
+  if (!patchedInfos.empty()) info = patchedInfos.data();
   if (VexaVkProfileEnabled()) {
     static std::atomic<uint64_t> calls {};
     if (++calls <= 8) for (uint32_t i = 0; i < count; ++i) {
@@ -220,6 +282,7 @@ static VkResult FEXFN_IMPL(vkCreateGraphicsPipelines)(VkDevice device, VkPipelin
     }
   }
   const auto result = LDR_PTR(vkCreateGraphicsPipelines)(device, cache, count, info, alloc, out);
+  VexaDestroyStageModules(device, inlineModules);
   if (result == VK_SUCCESS && VexaVkProfileEnabled()) {
     std::lock_guard lock {VexaShaderMutex};
     for (uint32_t i = 0; i < count; ++i) for (uint32_t j = 0; j < info[i].stageCount; ++j) {

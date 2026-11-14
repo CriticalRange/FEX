@@ -38,13 +38,16 @@ struct VexaPipelineClone {
   GLuint Original = 0, Clone = 0;
 };
 
+struct VexaFFState;
 struct VexaProgramContextState {
+  std::shared_ptr<VexaFFState> FixedFunction;
   ~VexaProgramContextState();
   std::shared_ptr<VexaProgramShareState> Shared = std::make_shared<VexaProgramShareState>();
   std::unordered_map<GLuint, int> Pipelines;
   std::unordered_map<GLuint, VexaPipelineClone> OwnedClones;
   GLuint IntendedPipeline = 0, StageProgram = 0, CurrentProgram = 0;
   uint64_t SeenGeneration = 0;
+  bool UnpackSwapBytes = false;
   bool AlphaTest = false;
   GLenum AlphaFunction = GL_ALWAYS, CompatError = GL_NO_ERROR;
   GLfloat AlphaReference = 0.0f;
@@ -99,8 +102,11 @@ static void VexaForgetClone(VexaProgramShareState& state, GLuint original, GLuin
   state.BGRAPrograms.erase(clone);
 }
 
+static void VexaRetireFixedFunction(VexaProgramContextState& context);
+
 VexaProgramContextState::~VexaProgramContextState() {
   std::lock_guard lock(Shared->Mutex);
+  VexaRetireFixedFunction(*this);
   for (auto& [key, linked] : Assembly.Linked) Shared->Retired.push_back(linked.Program);
   for (auto& object : Assembly.Default) if (object.Shader) Shared->AssemblyRetiredShaders.push_back(object.Shader);
   for(auto buffer:LegacyClient.Staging)if(buffer)Shared->LegacyRetiredBuffers.push_back(buffer);

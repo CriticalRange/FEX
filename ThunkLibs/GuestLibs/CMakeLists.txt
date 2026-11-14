@@ -258,6 +258,16 @@ if (BITNESS EQUAL 64)
   target_link_libraries(SDL2-guest PRIVATE dl)
   endif()
 
+
+  # VEXA_FIXES: Disable DRM guest thunk for Android bring-up.
+  if (NOT ANDROID AND NOT BUILD_ANDROID)
+    generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
+    target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
+    target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
+    add_guest_lib(drm "libdrm.so.2")
+  endif()
+endif()
+
   # VEXA_FIXES: Disable Vulkan thunk build when not needed (Hytale is OpenGL-first).
   # Vulkan thunk path pulls Linux desktop headers from Vulkan-Headers (eg xcb),
   # which are not available in Android NDK cross-build environments.
@@ -270,14 +280,6 @@ if (BITNESS EQUAL 64)
     add_guest_lib(vulkan "libvulkan.so.1")
   endif()
 
-  # VEXA_FIXES: Disable DRM guest thunk for Android bring-up.
-  if (NOT ANDROID AND NOT BUILD_ANDROID)
-    generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
-    target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
-    target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
-    add_guest_lib(drm "libdrm.so.2")
-  endif()
-endif()
 
 # VEXA_FIXES: OpenAL is independent of SDL3 and supports both 32-bit and 64-bit guests.
 if ((NOT ANDROID AND NOT BUILD_ANDROID) OR NOT VEXA_OPENAL_PREFIX STREQUAL "")

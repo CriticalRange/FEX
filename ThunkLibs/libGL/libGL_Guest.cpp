@@ -8,6 +8,13 @@ $end_info$
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
 
+// Ubuntu's x86_64 build sysroot defaults fmod to GLIBC_2.38, while the
+// Proton runtime still supplies the original ABI. Both compute the same
+// remainder; keep the guest thunk loadable on that older rootfs.
+#if defined(__x86_64__) && defined(__linux__)
+asm(".symver fmod,fmod@GLIBC_2.2.5");
+#endif
+
 // VEXA_FIXES: Android NDK sysroot doesn't provide desktop GLX headers.
 #ifdef BUILD_ANDROID
 #include <GLES3/gl3.h>
@@ -107,7 +114,28 @@ static int VexaGLGuestFprintf(FILE* stream, const char* fmt, ...) {
 #include "thunkgen_guest_libGL.inl"
 
 #ifdef BUILD_ANDROID
+#define VEXA_FF_LIGHTING_BRIDGE 1
 #include "android_fixed_function.h"
+#undef VEXA_GL_GUEST_EXPORT
+#define VEXA_GL_GUEST_EXPORT extern "C" __attribute__((visibility("default")))
+#include "raster_position_bridge.inc"
+#include "legacy_lighting_guest.inc"
+#include "pixel_transfer_bridge.inc"
+#include "legacy_rgb_guest.inc"
+#include "evaluator_draw_guest.inc"
+#include "selection_guest.inc"
+#include "array_element_guest.inc"
+#include "stipple_guest.inc"
+#include "unsigned_byte_attrib_guest.inc"
+static void VexaSetTexCoord4f(GLuint, GLfloat s, GLfloat t, GLfloat r, GLfloat q) {
+  vexa_ff::run_or_record_callback([=] {
+    const GLfloat values[]{s,t,r,q};
+    std::copy_n(values, 4, vexa_ff::S().texcoord);
+    fexfn_pack_glVertexAttrib4f(8,s,t,r,q);
+  });
+}
+#undef VEXA_GL_GUEST_EXPORT
+#define VEXA_GL_GUEST_EXPORT __attribute__((visibility("default")))
 #endif
 
 typedef void voidFunc();
@@ -563,7 +591,6 @@ void glMultMatrixf(const GLfloat*);void glMultMatrixd(const GLdouble*);
 void glScalef(GLfloat,GLfloat,GLfloat);void glScaled(GLdouble,GLdouble,GLdouble);
 }
 void glDepthBounds(GLclampd, GLclampd);
-void glSelectBuffer(GLsizei, GLuint*);
 void glFrameTerminator(void);
 void glPushGroupMarker(GLsizei, const GLchar*);
 void glPopGroupMarker(void);
@@ -610,6 +637,130 @@ unsigned int glXGetContextGPUIDAMD(void*);
 int glXSwapIntervalSGI(int);
 
 uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
+#ifdef BUILD_ANDROID
+  if (auto attrib = VexaUnsignedByteAttribProc(procname)) return attrib;
+#endif
+  if(procname=="glDrawArrays" || procname=="glDrawArraysEXT")return reinterpret_cast<uintptr_t>(glDrawArrays);
+  if(procname=="glDrawElements")return reinterpret_cast<uintptr_t>(glDrawElements);
+  if (procname == "glArrayElement") return reinterpret_cast<uintptr_t>(glArrayElement);
+  if (procname == "glCopyPixels") return reinterpret_cast<uintptr_t>(glCopyPixels);
+  if (procname == "glEdgeFlagPointer") return reinterpret_cast<uintptr_t>(glEdgeFlagPointer);
+  if (procname == "glSelectBuffer") return reinterpret_cast<uintptr_t>(glSelectBuffer);
+  if (procname == "glFeedbackBuffer") return reinterpret_cast<uintptr_t>(glFeedbackBuffer);
+  if (procname == "glGetPolygonStipple") return reinterpret_cast<uintptr_t>(glGetPolygonStipple);
+  if (procname == "glIndexPointer") return reinterpret_cast<uintptr_t>(glIndexPointer);
+  if (procname == "glInitNames") return reinterpret_cast<uintptr_t>(glInitNames);
+  if (procname == "glLineStipple") return reinterpret_cast<uintptr_t>(glLineStipple);
+  if (procname == "glLoadName") return reinterpret_cast<uintptr_t>(glLoadName);
+  if (procname == "glPassThrough") return reinterpret_cast<uintptr_t>(glPassThrough);
+  if (procname == "glPolygonStipple") return reinterpret_cast<uintptr_t>(glPolygonStipple);
+  if (procname == "glPopName") return reinterpret_cast<uintptr_t>(glPopName);
+  if (procname == "glPushName") return reinterpret_cast<uintptr_t>(glPushName);
+  if (procname == "glRenderMode") return reinterpret_cast<uintptr_t>(glRenderMode);
+
+  if (procname == "glEvalPoint1") return reinterpret_cast<uintptr_t>(glEvalPoint1);
+  if (procname == "glEvalPoint2") return reinterpret_cast<uintptr_t>(glEvalPoint2);
+  if (procname == "glEvalMesh1") return reinterpret_cast<uintptr_t>(glEvalMesh1);
+  if (procname == "glEvalMesh2") return reinterpret_cast<uintptr_t>(glEvalMesh2);
+  if (procname == "glEvalCoord1d") return reinterpret_cast<uintptr_t>(glEvalCoord1d);
+  if (procname == "glEvalCoord1dv") return reinterpret_cast<uintptr_t>(glEvalCoord1dv);
+  if (procname == "glEvalCoord1f") return reinterpret_cast<uintptr_t>(glEvalCoord1f);
+  if (procname == "glEvalCoord1fv") return reinterpret_cast<uintptr_t>(glEvalCoord1fv);
+  if (procname == "glEvalCoord2d") return reinterpret_cast<uintptr_t>(glEvalCoord2d);
+  if (procname == "glEvalCoord2dv") return reinterpret_cast<uintptr_t>(glEvalCoord2dv);
+  if (procname == "glEvalCoord2f") return reinterpret_cast<uintptr_t>(glEvalCoord2f);
+  if (procname == "glEvalCoord2fv") return reinterpret_cast<uintptr_t>(glEvalCoord2fv);
+
+  // Legacy entry points implemented entirely in guest state must bypass the GLES resolver.
+  if (procname == "glAreTexturesResident") return reinterpret_cast<uintptr_t>(glAreTexturesResident);
+  if (procname == "glBitmap") return reinterpret_cast<uintptr_t>(glBitmap);
+  if (procname == "glClearIndex") return reinterpret_cast<uintptr_t>(glClearIndex);
+  if (procname == "glColorMaterial") return reinterpret_cast<uintptr_t>(glColorMaterial);
+  if (procname == "glDrawPixels") return reinterpret_cast<uintptr_t>(glDrawPixels);
+  if (procname == "glEdgeFlag") return reinterpret_cast<uintptr_t>(glEdgeFlag);
+  if (procname == "glEdgeFlagv") return reinterpret_cast<uintptr_t>(glEdgeFlagv);
+  if (procname == "glFogf") return reinterpret_cast<uintptr_t>(glFogf);
+  if (procname == "glFogfv") return reinterpret_cast<uintptr_t>(glFogfv);
+  if (procname == "glFogi") return reinterpret_cast<uintptr_t>(glFogi);
+  if (procname == "glFogiv") return reinterpret_cast<uintptr_t>(glFogiv);
+  if (procname == "glGetLightfv") return reinterpret_cast<uintptr_t>(glGetLightfv);
+  if (procname == "glGetLightiv") return reinterpret_cast<uintptr_t>(glGetLightiv);
+  if (procname == "glGetMaterialfv") return reinterpret_cast<uintptr_t>(glGetMaterialfv);
+  if (procname == "glGetMaterialiv") return reinterpret_cast<uintptr_t>(glGetMaterialiv);
+  if (procname == "glGetPixelMapfv") return reinterpret_cast<uintptr_t>(glGetPixelMapfv);
+  if (procname == "glGetPixelMapuiv") return reinterpret_cast<uintptr_t>(glGetPixelMapuiv);
+  if (procname == "glGetPixelMapusv") return reinterpret_cast<uintptr_t>(glGetPixelMapusv);
+  if (procname == "glGetTexEnvfv") return reinterpret_cast<uintptr_t>(glGetTexEnvfv);
+  if (procname == "glGetTexEnviv") return reinterpret_cast<uintptr_t>(glGetTexEnviv);
+  if (procname == "glGetTexGendv") return reinterpret_cast<uintptr_t>(glGetTexGendv);
+  if (procname == "glGetTexGenfv") return reinterpret_cast<uintptr_t>(glGetTexGenfv);
+  if (procname == "glGetTexGeniv") return reinterpret_cast<uintptr_t>(glGetTexGeniv);
+  if (procname == "glIndexMask") return reinterpret_cast<uintptr_t>(glIndexMask);
+  if (procname == "glIndexd") return reinterpret_cast<uintptr_t>(glIndexd);
+  if (procname == "glIndexdv") return reinterpret_cast<uintptr_t>(glIndexdv);
+  if (procname == "glIndexf") return reinterpret_cast<uintptr_t>(glIndexf);
+  if (procname == "glIndexfv") return reinterpret_cast<uintptr_t>(glIndexfv);
+  if (procname == "glIndexi") return reinterpret_cast<uintptr_t>(glIndexi);
+  if (procname == "glIndexiv") return reinterpret_cast<uintptr_t>(glIndexiv);
+  if (procname == "glIndexs") return reinterpret_cast<uintptr_t>(glIndexs);
+  if (procname == "glIndexsv") return reinterpret_cast<uintptr_t>(glIndexsv);
+  if (procname == "glIndexub") return reinterpret_cast<uintptr_t>(glIndexub);
+  if (procname == "glIndexubv") return reinterpret_cast<uintptr_t>(glIndexubv);
+  if (procname == "glLightModelf") return reinterpret_cast<uintptr_t>(glLightModelf);
+  if (procname == "glLightModelfv") return reinterpret_cast<uintptr_t>(glLightModelfv);
+  if (procname == "glLightModeli") return reinterpret_cast<uintptr_t>(glLightModeli);
+  if (procname == "glLightModeliv") return reinterpret_cast<uintptr_t>(glLightModeliv);
+  if (procname == "glLightf") return reinterpret_cast<uintptr_t>(glLightf);
+  if (procname == "glLightfv") return reinterpret_cast<uintptr_t>(glLightfv);
+  if (procname == "glLighti") return reinterpret_cast<uintptr_t>(glLighti);
+  if (procname == "glLightiv") return reinterpret_cast<uintptr_t>(glLightiv);
+  if (procname == "glMaterialf") return reinterpret_cast<uintptr_t>(glMaterialf);
+  if (procname == "glMaterialfv") return reinterpret_cast<uintptr_t>(glMaterialfv);
+  if (procname == "glMateriali") return reinterpret_cast<uintptr_t>(glMateriali);
+  if (procname == "glMaterialiv") return reinterpret_cast<uintptr_t>(glMaterialiv);
+  if (procname == "glPixelMapfv") return reinterpret_cast<uintptr_t>(glPixelMapfv);
+  if (procname == "glPixelMapuiv") return reinterpret_cast<uintptr_t>(glPixelMapuiv);
+  if (procname == "glPixelMapusv") return reinterpret_cast<uintptr_t>(glPixelMapusv);
+  if (procname == "glPixelStorei") return reinterpret_cast<uintptr_t>(glPixelStorei);
+  if (procname == "glPixelTransferf") return reinterpret_cast<uintptr_t>(glPixelTransferf);
+  if (procname == "glPixelTransferi") return reinterpret_cast<uintptr_t>(glPixelTransferi);
+  if (procname == "glPixelZoom") return reinterpret_cast<uintptr_t>(glPixelZoom);
+  if (procname == "glPrioritizeTextures") return reinterpret_cast<uintptr_t>(glPrioritizeTextures);
+  if (procname == "glRasterPos2d") return reinterpret_cast<uintptr_t>(glRasterPos2d);
+  if (procname == "glRasterPos2dv") return reinterpret_cast<uintptr_t>(glRasterPos2dv);
+  if (procname == "glRasterPos2f") return reinterpret_cast<uintptr_t>(glRasterPos2f);
+  if (procname == "glRasterPos2fv") return reinterpret_cast<uintptr_t>(glRasterPos2fv);
+  if (procname == "glRasterPos2i") return reinterpret_cast<uintptr_t>(glRasterPos2i);
+  if (procname == "glRasterPos2iv") return reinterpret_cast<uintptr_t>(glRasterPos2iv);
+  if (procname == "glRasterPos2s") return reinterpret_cast<uintptr_t>(glRasterPos2s);
+  if (procname == "glRasterPos2sv") return reinterpret_cast<uintptr_t>(glRasterPos2sv);
+  if (procname == "glRasterPos3d") return reinterpret_cast<uintptr_t>(glRasterPos3d);
+  if (procname == "glRasterPos3dv") return reinterpret_cast<uintptr_t>(glRasterPos3dv);
+  if (procname == "glRasterPos3f") return reinterpret_cast<uintptr_t>(glRasterPos3f);
+  if (procname == "glRasterPos3fv") return reinterpret_cast<uintptr_t>(glRasterPos3fv);
+  if (procname == "glRasterPos3i") return reinterpret_cast<uintptr_t>(glRasterPos3i);
+  if (procname == "glRasterPos3iv") return reinterpret_cast<uintptr_t>(glRasterPos3iv);
+  if (procname == "glRasterPos3s") return reinterpret_cast<uintptr_t>(glRasterPos3s);
+  if (procname == "glRasterPos3sv") return reinterpret_cast<uintptr_t>(glRasterPos3sv);
+  if (procname == "glRasterPos4d") return reinterpret_cast<uintptr_t>(glRasterPos4d);
+  if (procname == "glRasterPos4dv") return reinterpret_cast<uintptr_t>(glRasterPos4dv);
+  if (procname == "glRasterPos4f") return reinterpret_cast<uintptr_t>(glRasterPos4f);
+  if (procname == "glRasterPos4fv") return reinterpret_cast<uintptr_t>(glRasterPos4fv);
+  if (procname == "glRasterPos4i") return reinterpret_cast<uintptr_t>(glRasterPos4i);
+  if (procname == "glRasterPos4iv") return reinterpret_cast<uintptr_t>(glRasterPos4iv);
+  if (procname == "glRasterPos4s") return reinterpret_cast<uintptr_t>(glRasterPos4s);
+  if (procname == "glRasterPos4sv") return reinterpret_cast<uintptr_t>(glRasterPos4sv);
+  if (procname == "glTexEnvf") return reinterpret_cast<uintptr_t>(glTexEnvf);
+  if (procname == "glTexEnvfv") return reinterpret_cast<uintptr_t>(glTexEnvfv);
+  if (procname == "glTexEnvi") return reinterpret_cast<uintptr_t>(glTexEnvi);
+  if (procname == "glTexEnviv") return reinterpret_cast<uintptr_t>(glTexEnviv);
+  if (procname == "glTexGend") return reinterpret_cast<uintptr_t>(glTexGend);
+  if (procname == "glTexGendv") return reinterpret_cast<uintptr_t>(glTexGendv);
+  if (procname == "glTexGenf") return reinterpret_cast<uintptr_t>(glTexGenf);
+  if (procname == "glTexGenfv") return reinterpret_cast<uintptr_t>(glTexGenfv);
+  if (procname == "glTexGeni") return reinterpret_cast<uintptr_t>(glTexGeni);
+  if (procname == "glTexGeniv") return reinterpret_cast<uintptr_t>(glTexGeniv);
+
   if(procname=="glColor4f")return reinterpret_cast<uintptr_t>(glColor4f);
   if(procname=="glColor4sv")return reinterpret_cast<uintptr_t>(glColor4sv);
   if(procname=="glTexCoord2f")return reinterpret_cast<uintptr_t>(glTexCoord2f);
@@ -625,6 +776,12 @@ uintptr_t ResolveAndroidCompatGuestProc(std::string_view procname) {
   if(procname=="glScaled")return reinterpret_cast<uintptr_t>(glScaled);
 
 #ifdef BUILD_ANDROID
+  if (procname == "glGetFloatv") return reinterpret_cast<uintptr_t>(glGetFloatv);
+  if (procname == "glGetIntegerv") return reinterpret_cast<uintptr_t>(glGetIntegerv);
+  if (procname == "glGetBooleanv") return reinterpret_cast<uintptr_t>(glGetBooleanv);
+  if (procname == "glEnable") return reinterpret_cast<uintptr_t>(glEnable);
+  if (procname == "glDisable") return reinterpret_cast<uintptr_t>(glDisable);
+  if (procname == "glIsEnabled") return reinterpret_cast<uintptr_t>(glIsEnabled);
   if (procname == "glXChooseVisual") return reinterpret_cast<uintptr_t>(glXChooseVisual);
   if (procname == "glXCreateContext") return reinterpret_cast<uintptr_t>(glXCreateContext);
   if (procname == "glXCreateContextAttribsARB") return reinterpret_cast<uintptr_t>(glXCreateContextAttribsARB);
@@ -1034,7 +1191,7 @@ extern "C" {
 // Android thunk builds don't naturally export all of them, so provide a compatibility
 // symbol surface to let GLWrapper::init() proceed.
 constexpr const char* kCompatGLXExts =
-  "GLX_ARB_create_context GLX_EXT_framebuffer_sRGB GLX_EXT_swap_control GLX_MESA_swap_control";
+  "GLX_ARB_create_context GLX_ARB_create_context_profile GLX_EXT_framebuffer_sRGB GLX_EXT_swap_control GLX_MESA_swap_control";
 constexpr uintptr_t kCompatDisplay = 0x47584453ULL;  // "GXDS"
 constexpr uintptr_t kCompatVisual = 0x47585649ULL;   // "GXVI"
 constexpr uintptr_t kCompatFBConfig = 0x47584642ULL; // "GXFB"
@@ -1076,7 +1233,31 @@ static_assert(sizeof(VexaXVisualInfo) == (sizeof(void*) == 8 ? 64 : 40), "XVisua
 
 static VexaVisual g_vexa_visual = {nullptr, 1, 4, 0x00ff0000, 0x0000ff00, 0x000000ff, 8, 256};
 
-static void* VexaGlxVisualInfo() {
+// Resolve guest Xlib, not the Android host's X11 types or connection.
+static void* VexaGuestXlibSymbol(const char* name) {
+  static void* xlib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+  return xlib ? dlsym(xlib, name) : nullptr;
+}
+static bool VexaRealDisplay(void* display) {
+  return display && reinterpret_cast<uintptr_t>(display) != kCompatDisplay;
+}
+static void* VexaGlxVisualInfo(void* display, int screen = -1) {
+  if (VexaRealDisplay(display)) {
+    auto default_screen = reinterpret_cast<int (*)(void*)>(VexaGuestXlibSymbol("XDefaultScreen"));
+    auto default_visual = reinterpret_cast<VexaVisual* (*)(void*, int)>(VexaGuestXlibSymbol("XDefaultVisual"));
+    auto get_info = reinterpret_cast<VexaXVisualInfo* (*)(void*, long, VexaXVisualInfo*, int*)>(
+      VexaGuestXlibSymbol("XGetVisualInfo"));
+    if (!default_screen || !default_visual || !get_info) return nullptr;
+    if (screen < 0) screen = default_screen(display);
+    auto visual = default_visual(display, screen);
+    if (!visual) return nullptr;
+    VexaXVisualInfo match{};
+    match.visualid = visual->visualid;
+    match.screen = screen;
+    int count = 0;
+    // Xlib allocates the result and the caller releases it with XFree.
+    return get_info(display, 3 /* VisualIDMask | VisualScreenMask */, &match, &count);
+  }
   auto* info = static_cast<VexaXVisualInfo*>(std::calloc(1, sizeof(VexaXVisualInfo)));
   if (!info) {
     return nullptr;
@@ -1094,9 +1275,9 @@ static void* VexaGlxVisualInfo() {
   return info;
 }
 
-VEXA_GL_GUEST_EXPORT void* glXChooseVisual(void* /*display*/, int /*screen*/, int* /*attributes*/) {
+VEXA_GL_GUEST_EXPORT void* glXChooseVisual(void* display, int screen, int* /*attributes*/) {
   fprintf(stderr, "[libGL thunk] compat glXChooseVisual\n");
-  return VexaGlxVisualInfo();
+  return VexaGlxVisualInfo(display, screen);
 }
 
 VEXA_GL_GUEST_EXPORT void* glXCreateContext(void* /*display*/, void* /*visual*/, void* share_list, int /*direct*/) {
@@ -1144,10 +1325,18 @@ VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentDrawable() {
   return g_vexa_current_drawable;
 }
 
-VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* /*display*/, unsigned long drawable, void* context) {
+VEXA_GL_GUEST_EXPORT int glXMakeCurrent(void* display, unsigned long drawable, void* context) {
   fprintf(stderr, "[libGL thunk] compat glXMakeCurrent drawable=%lu context=%p\n", drawable, context);
+  // The host queries the drawable over a separate X11 connection. Wait until
+  // the guest connection's buffered CreateWindow requests have been processed;
+  // XFlush alone cannot order requests between two server connections.
+  if (context && display && reinterpret_cast<uintptr_t>(display) != kCompatDisplay) {
+    static auto sync = reinterpret_cast<int (*)(void*, int)>(VexaGuestXlibSymbol("XSync"));
+    if (!sync) return 0;
+    sync(display, 0);
+  }
   const int result = context
-    ? fexfn_pack_VEXA_BindGlxSurface(reinterpret_cast<uintptr_t>(context))
+    ? fexfn_pack_VEXA_BindGlxSurface(reinterpret_cast<uintptr_t>(context), static_cast<uint32_t>(drawable))
     : fexfn_pack_VEXA_ReleaseGlxSurface();
   // A failed MakeCurrent must preserve the previous current context/drawable.
   if (result) {
@@ -1165,7 +1354,7 @@ VEXA_GL_GUEST_EXPORT void glXSwapBuffers(void* /*display*/, unsigned long drawab
   if (GLGuestTraceEnabled()) {
     fprintf(stderr, "[libGL thunk] compat glXSwapBuffers drawable=%lu\n", drawable);
   }
-  fexfn_pack_VEXA_SwapGlxBuffers();
+  fexfn_pack_VEXA_SwapGlxBuffers(static_cast<uint32_t>(drawable));
 }
 
 static void VexaGuestWindowSize(unsigned int* width, unsigned int* height) {
@@ -1183,12 +1372,21 @@ static void VexaGuestWindowSize(unsigned int* width, unsigned int* height) {
     return;
   }
   buf[n] = '\0';
-  int w = 0;
-  int h = 0;
-  if (sscanf(buf, "%d %d", &w, &h) == 2 && w > 1 && h > 1) {
-    *width = static_cast<unsigned int>(w);
-    *height = static_cast<unsigned int>(h);
-  }
+  // Avoid newer glibc's __isoc23_sscanf: Proton's rootfs can use an older
+  // libc than the guest build sysroot. The size file contains two decimals.
+  const char* cursor = buf;
+  auto number = [&cursor]() -> unsigned int {
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') ++cursor;
+    unsigned int value = 0; bool found = false;
+    while (*cursor >= '0' && *cursor <= '9') {
+      found = true;
+      if (value > 100000U) return 0;
+      value = value * 10 + static_cast<unsigned int>(*cursor++ - '0');
+    }
+    return found ? value : 0;
+  };
+  const unsigned int w = number(), h = number();
+  if (w > 1 && h > 1) { *width = w; *height = h; }
 #else
   (void)width;
   (void)height;
@@ -1245,9 +1443,9 @@ VEXA_GL_GUEST_EXPORT void glXDestroyPbuffer(void* /*display*/, unsigned long pbu
   fprintf(stderr, "[libGL thunk] compat glXDestroyPbuffer pbuffer=%lu\n", pbuffer);
 }
 
-VEXA_GL_GUEST_EXPORT void* glXGetVisualFromFBConfig(void* /*display*/, void* /*config*/) {
+VEXA_GL_GUEST_EXPORT void* glXGetVisualFromFBConfig(void* display, void* /*config*/) {
   fprintf(stderr, "[libGL thunk] compat glXGetVisualFromFBConfig\n");
-  return VexaGlxVisualInfo();
+  return VexaGlxVisualInfo(display);
 }
 
 static int vexa_glx_attrib(int attribute, int* value) {
@@ -1264,7 +1462,7 @@ static int vexa_glx_attrib(int attribute, int* value) {
     case 10:
     case 11: *value = 8; break;
     case 12: *value = 24; break;
-    case 13: *value = 0; break;
+    case 13: *value = 8; break; // GLX_STENCIL_SIZE, matching the D24S8 EGL config
     case 0x20: *value = 0x8000; break;
     case 0x22: *value = 0x8002; break;
     case 0x800B: *value = 1; break;
@@ -1326,7 +1524,14 @@ VEXA_GL_GUEST_EXPORT void* glXCreateNewContext(void*, void*, int, void* share_co
   return reinterpret_cast<void*>(fexfn_pack_VEXA_CreateGlxContext(reinterpret_cast<uintptr_t>(share_context)));
 }
 
-VEXA_GL_GUEST_EXPORT int glXGetFBConfigAttrib(void*, void*, int attribute, int* value) {
+VEXA_GL_GUEST_EXPORT int glXGetFBConfigAttrib(void* display, void*, int attribute, int* value) {
+  if (attribute == 0x800B && value && VexaRealDisplay(display)) { // GLX_VISUAL_ID
+    auto* info = static_cast<VexaXVisualInfo*>(VexaGlxVisualInfo(display));
+    if (!info) return 1;
+    *value = static_cast<int>(info->visualid);
+    std::free(info);
+    return 0;
+  }
   return vexa_glx_attrib(attribute, value);
 }
 
@@ -1351,7 +1556,10 @@ VEXA_GL_GUEST_EXPORT void glXUseXFont(unsigned long, int, int, int) {}
 VEXA_GL_GUEST_EXPORT void glXWaitGL(void) {}
 VEXA_GL_GUEST_EXPORT void glXWaitX(void) {}
 VEXA_GL_GUEST_EXPORT unsigned long glXCreatePixmap(void*, void*, unsigned long, const int*) { return 1; }
-VEXA_GL_GUEST_EXPORT unsigned long glXCreateWindow(void*, void*, unsigned long, const int*) { return kCompatDrawable; }
+VEXA_GL_GUEST_EXPORT unsigned long glXCreateWindow(void*, void*, unsigned long window, const int*) {
+  const char* real_x11 = getenv("VEXA_REAL_X11");
+  return real_x11 && strcmp(real_x11, "1") == 0 ? window : kCompatDrawable;
+}
 VEXA_GL_GUEST_EXPORT void glXDestroyPixmap(void*, unsigned long) {}
 VEXA_GL_GUEST_EXPORT void glXDestroyWindow(void*, unsigned long) {}
 VEXA_GL_GUEST_EXPORT unsigned long glXGetCurrentReadDrawable(void) { return g_vexa_current_drawable; }
@@ -1372,6 +1580,127 @@ VEXA_GL_GUEST_EXPORT int glXSwapIntervalMESA(unsigned int interval) {
   g_vexa_swap_interval = static_cast<int>(interval);
   return 0;
 }
+
+// The Android EGL configuration has no accumulation buffer. Desktop GL
+// requires GL_INVALID_OPERATION for a valid accumulation operation without one.
+static bool VexaEvaluatorCap(GLenum cap, bool enabled, bool query, GLboolean* result) {
+  const int one = vexa_eval::target_slot(cap, 1), two = vexa_eval::target_slot(cap, 2);
+  if (one < 0 && two < 0 && cap != 0x0D80) return false;
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); if (result) *result = GL_FALSE; return true; }
+  if (query) {
+    const auto& state = vexa_ff::S().evaluator;
+    const bool value = one >= 0 ? state.enabled1[one] : two >= 0 ? state.enabled2[two] : state.auto_normal;
+    if (result) *result = value ? GL_TRUE : GL_FALSE;
+  } else {
+    vexa_ff::run_or_record_callback([one,two,enabled] {
+      auto& state = vexa_ff::S().evaluator;
+      if (one >= 0) state.enabled1[one] = enabled;
+      else if (two >= 0) state.enabled2[two] = enabled;
+      else state.auto_normal = enabled;
+    });
+  }
+  return true;
+}
+VEXA_GL_GUEST_EXPORT void glEnable(GLenum cap) {
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return; }
+  if (!VexaStippleCap(cap,true,false) && !vexa_lighting_guest::set_cap(cap, true) && !VexaEvaluatorCap(cap, true, false, nullptr)) fexfn_pack_glEnable(cap);
+}
+VEXA_GL_GUEST_EXPORT void glDisable(GLenum cap) {
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return; }
+  if (!VexaStippleCap(cap,false,false) && !vexa_lighting_guest::set_cap(cap, false) && !VexaEvaluatorCap(cap, false, false, nullptr)) fexfn_pack_glDisable(cap);
+}
+VEXA_GL_GUEST_EXPORT GLboolean glIsEnabled(GLenum cap) {
+  GLboolean result = GL_FALSE;
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return result; }
+  if (VexaStippleCap(cap,false,true,&result)) return result;
+  if (vexa_lighting_guest::get_cap(cap, result)) return result;
+  return VexaEvaluatorCap(cap, false, true, &result) ? result : fexfn_pack_glIsEnabled(cap);
+}
+
+VEXA_GL_GUEST_EXPORT void glClearAccum(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return; }
+  vexa_ff::run_or_record_callback([=] {
+    auto& c = vexa_ff::S().accum_clear;
+    c[0]=std::clamp(r,-1.0f,1.0f); c[1]=std::clamp(g,-1.0f,1.0f);
+    c[2]=std::clamp(b,-1.0f,1.0f); c[3]=std::clamp(a,-1.0f,1.0f);
+  });
+}
+static int VexaCompatQuery(GLenum pname, GLfloat* values) {
+  const auto& s=vexa_ff::S();
+  switch(pname){
+    case 0x0B30: values[0]=s.compiling?(s.compile_execute?0x1301:0x1300):0;return 1;
+    case 0x0B31: values[0]=64;return 1;
+    case 0x0B32: values[0]=s.list_base;return 1;
+    case 0x0B33: values[0]=s.compiling?s.compile_id:0;return 1;
+    case 0x0B24: values[0]=s.stipple.line;return 1;
+    case 0x0B42: values[0]=s.stipple.polygon;return 1;
+    case 0x0B25: values[0]=s.stipple.pattern;return 1;
+    case 0x0B26: values[0]=s.stipple.factor;return 1;
+    case 0x0D00: values[0]=s.pack_swap_bytes;return 1;
+    case 0x0D01: values[0]=s.pack_lsb_first;return 1;
+    case 0x0C40: values[0]=s.selection.mode;return 1;
+    case 0x0DF1: values[0]=s.selection.feedback_size;return 1;
+    case 0x0DF2: values[0]=s.selection.feedback_type;return 1;
+    case 0x0DF4: values[0]=s.selection.select_size;return 1;
+    case 0x0D37: values[0]=vexa_select::kMaxNameDepth;return 1;
+    case 0x0D70: values[0]=s.selection.names.size();return 1;
+    default:break;
+  }
+  switch (pname) {
+    case 0x0B01: values[0] = vexa_ff::S().color_index; return 1;
+    case 0x0B43: values[0] = vexa_ff::S().edge_flag; return 1;
+    case 0x0C20: values[0] = vexa_ff::S().clear_index; return 1;
+    case 0x0C21: values[0] = vexa_ff::S().index_mask; return 1;
+    case 0x0C30: values[0] = 0; return 1; // GL_INDEX_MODE
+    case 0x0C31: values[0] = 1; return 1; // GL_RGBA_MODE
+    default: break;
+  }
+  if (pname == 0x0CF0) { values[0] = vexa_ff::S().unpack_swap_bytes; return 1; }
+  if (pname == 0x0CF1) { values[0] = vexa_ff::S().unpack_lsb_first; return 1; }
+  double raster[4]{};
+  unsigned count = 0;
+  if (VexaPixelQuery(pname, raster, count)) { values[0] = static_cast<GLfloat>(raster[0]); return 1; }
+  if (VexaRasterQuery(pname, raster, count)) {
+    for (unsigned i = 0; i < count; ++i) values[i] = static_cast<GLfloat>(raster[i]);
+    return static_cast<int>(count);
+  }
+  if (pname == 0x0B80) { memcpy(values, vexa_ff::S().accum_clear, 4 * sizeof(GLfloat)); return 4; }
+  if (pname >= 0x0D58 && pname <= 0x0D5B) { values[0] = 0; return 1; }
+  if (pname == 0x0D30) { values[0] = vexa_eval::kMaxOrder; return 1; }
+  return 0;
+}
+VEXA_GL_GUEST_EXPORT void glGetFloatv(GLenum pname, GLfloat* values) {
+  if (!values) return;
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return; }
+  if (VexaCompatQuery(pname, values)) return;
+  fexfn_pack_glGetFloatv(pname, values);
+}
+VEXA_GL_GUEST_EXPORT void glGetIntegerv(GLenum pname, GLint* values) {
+  if (pname == 0x0C21 && values && !vexa_ff::in_begin()) { *values = static_cast<GLint>(vexa_ff::S().index_mask); return; }
+  if (!values) return; GLfloat tmp[4]; int count = VexaCompatQuery(pname, tmp);
+  if (!count) { fexfn_pack_glGetIntegerv(pname, values); return; }
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return; }
+  for (int i=0;i<count;++i) values[i] = static_cast<GLint>(std::round(tmp[i]));
+}
+VEXA_GL_GUEST_EXPORT void glGetBooleanv(GLenum pname, GLboolean* values) {
+  if (!values) return; GLfloat tmp[4]; int count = VexaCompatQuery(pname, tmp);
+  if (!count) { fexfn_pack_glGetBooleanv(pname, values); return; }
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return; }
+  for (int i=0;i<count;++i) values[i] = tmp[i] != 0 ? GL_TRUE : GL_FALSE;
+}
+
+VEXA_GL_GUEST_EXPORT void glAccum(GLenum op, GLfloat) {
+  if (op < 0x0100 || op > 0x0104) fexfn_pack_VEXA_CompatError(0x0500);
+  else fexfn_pack_VEXA_CompatError(0x0502);
+}
+
+} // extern "C"
+#undef VEXA_GL_GUEST_EXPORT
+#define VEXA_GL_GUEST_EXPORT extern "C" __attribute__((visibility("default")))
+#include "vexa_evaluator_guest.inc"
+#undef VEXA_GL_GUEST_EXPORT
+#define VEXA_GL_GUEST_EXPORT __attribute__((visibility("default")))
+extern "C" {
 
 VEXA_GL_GUEST_EXPORT void glLineWidth(GLfloat width) {
   fprintf(stderr, "[libGL thunk] compat glLineWidth width=%f (no-op)\n", static_cast<double>(width));
@@ -1429,12 +1758,31 @@ VEXA_GL_GUEST_EXPORT void glGetDoublev(GLenum pname, GLdouble* params) {
   if (!params) {
     return;
   }
-  GLfloat tmp[16] {};
-  ::glGetFloatv(pname, tmp);
-  const int count = (pname >= 0x0BC0 && pname <= 0x0BC2) || pname == 0x864B || pname == 0x8620 || pname == 0x8804 || pname == 0x0BA0 || pname == 0x0D32 || (pname>=0x3000 && pname<0x3006) || (pname>=0x8074&&pname<=0x808D) || pname==0x84E1 || pname==0x84E2 || pname==0x8871 || (pname>=0x8896&&pname<=0x889A) ? 1 : 16;
-  for (int i = 0; i < count; ++i) {
-    params[i] = static_cast<GLdouble>(tmp[i]);
+  if (vexa_ff::in_begin()) { fexfn_pack_VEXA_CompatError(GL_INVALID_OPERATION); return; }
+  GLfloat compat[4];int compat_count=VexaCompatQuery(pname,compat);
+  if(compat_count){for(int i=0;i<compat_count;++i)params[i]=compat[i];return;}
+  unsigned raster_count = 0;
+  if (VexaRasterQuery(pname, params, raster_count)) return;
+  if (VexaPixelQuery(pname, params, raster_count)) return;
+  int count = 1;
+  switch (pname) {
+    case 0x0BA6: case 0x0BA7: case 0x0BA8: case 0x84E3: case 0x84E4: case 0x84E5: count = 16; break;
+    case 0x0B00: case 0x0B03: case 0x0B04: case 0x0B06: case 0x0B07: case 0x0B53:
+    case 0x0B66: case 0x0B80: case 0x0BA2: case 0x0C10: case 0x0C22: case 0x0C23:
+    case 0x8005: count = 4; break;
+    case 0x0B02: count = 3; break;
+    case 0x0B12: case 0x0B22: case 0x0B40: case 0x0B70: case 0x0D3A:
+    case 0x846D: case 0x846E: case 0x0DD1: case 0x0DD3: count = 2; break;
+    case 0x0DD2: count = 4; break;
+    case 0x86A3: glGetIntegerv(0x86A2, &count); break;
+    case 0x8DF8: glGetIntegerv(0x8DF9, &count); break;
+    case 0x87FF: glGetIntegerv(0x87FE, &count); break;
+    default: break;
   }
+  if (count <= 0) return;
+  std::vector<GLfloat> tmp(static_cast<size_t>(count));
+  ::glGetFloatv(pname, tmp.data());
+  for (int i = 0; i < count; ++i) params[i] = static_cast<GLdouble>(tmp[i]);
 }
 
 VEXA_GL_GUEST_EXPORT void glGetTexImage(GLenum /*target*/, GLint /*level*/, GLenum /*format*/, GLenum /*type*/, void* /*pixels*/) {
@@ -1469,8 +1817,19 @@ VEXA_GL_GUEST_EXPORT void glDepthRange(GLdouble z_near, GLdouble z_far) {
   fexfn_pack_glDepthRangef(static_cast<GLfloat>(z_near), static_cast<GLfloat>(z_far));
 }
 
+VEXA_GL_GUEST_EXPORT void glInterleavedArrays(GLenum format, GLsizei stride, const void* pointer) {
+  fexfn_pack_VEXA_InterleavedArrays(format, stride, reinterpret_cast<uintptr_t>(pointer));
+}
+
+VEXA_GL_GUEST_EXPORT void glNormalPointer(GLenum type, GLsizei stride, const void* pointer) {
+  fexfn_pack_VEXA_NormalPointer(type, stride, reinterpret_cast<uintptr_t>(pointer));
+}
+
 VEXA_GL_GUEST_EXPORT void glGetPointerv(GLenum pname, void** params) {
-  if(pname!=0x808E&&pname!=0x808F&&pname!=0x8090&&pname!=0x8092){fexfn_pack_VEXA_CompatError(0x0500);return;}
+  if(!VexaSelectOutsideBegin())return;
+  if(pname==0x0DF0){if(params)*params=vexa_ff::S().selection.feedback_buffer;return;}
+  if(pname==0x0DF3){if(params)*params=vexa_ff::S().selection.select_buffer;return;}
+  if(pname!=0x808E&&pname!=0x808F&&pname!=0x8090&&pname!=0x8091&&pname!=0x8092&&pname!=0x8093){fexfn_pack_VEXA_CompatError(0x0500);return;}
   if(params)*params=reinterpret_cast<void*>(fexfn_pack_VEXA_GetLegacyPointer(pname));
 }
 
@@ -1502,13 +1861,44 @@ VEXA_GL_GUEST_EXPORT GLboolean glIsTexture(GLuint texture) {
 }
 
 VEXA_GL_GUEST_EXPORT void glColor4f(GLfloat r,GLfloat g,GLfloat b,GLfloat a){GLfloat v[]{r,g,b,a};vexa_ff::material(0x1201,v);fexfn_pack_glColor4f(r,g,b,a);}
+// Desktop GL color variants normalize integer inputs before setting the current color.
+VEXA_GL_GUEST_EXPORT void glColor3b(GLbyte r, GLbyte g, GLbyte b) { glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(r) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(g) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(b) / 127.0), -1.0f), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3bv(const GLbyte* v) { if (!v) return; glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 127.0), -1.0f), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3s(GLshort r, GLshort g, GLshort b) { glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(r) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(g) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(b) / 32767.0), -1.0f), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3sv(const GLshort* v) { if (!v) return; glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 32767.0), -1.0f), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3i(GLint r, GLint g, GLint b) { glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(r) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(g) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(b) / 2147483647.0), -1.0f), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3iv(const GLint* v) { if (!v) return; glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 2147483647.0), -1.0f), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3ub(GLubyte r, GLubyte g, GLubyte b) { glColor4f(static_cast<GLfloat>(static_cast<double>(r) / 255.0), static_cast<GLfloat>(static_cast<double>(g) / 255.0), static_cast<GLfloat>(static_cast<double>(b) / 255.0), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3ubv(const GLubyte* v) { if (!v) return; glColor4f(static_cast<GLfloat>(static_cast<double>(v[0]) / 255.0), static_cast<GLfloat>(static_cast<double>(v[1]) / 255.0), static_cast<GLfloat>(static_cast<double>(v[2]) / 255.0), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3us(GLushort r, GLushort g, GLushort b) { glColor4f(static_cast<GLfloat>(static_cast<double>(r) / 65535.0), static_cast<GLfloat>(static_cast<double>(g) / 65535.0), static_cast<GLfloat>(static_cast<double>(b) / 65535.0), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3usv(const GLushort* v) { if (!v) return; glColor4f(static_cast<GLfloat>(static_cast<double>(v[0]) / 65535.0), static_cast<GLfloat>(static_cast<double>(v[1]) / 65535.0), static_cast<GLfloat>(static_cast<double>(v[2]) / 65535.0), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3ui(GLuint r, GLuint g, GLuint b) { glColor4f(static_cast<GLfloat>(static_cast<double>(r) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(g) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(b) / 4294967295.0), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3uiv(const GLuint* v) { if (!v) return; glColor4f(static_cast<GLfloat>(static_cast<double>(v[0]) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(v[1]) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(v[2]) / 4294967295.0), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3f(GLfloat r, GLfloat g, GLfloat b) { glColor4f(static_cast<GLfloat>(r), static_cast<GLfloat>(g), static_cast<GLfloat>(b), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3fv(const GLfloat* v) { if (!v) return; glColor4f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3d(GLdouble r, GLdouble g, GLdouble b) { glColor4f(static_cast<GLfloat>(r), static_cast<GLfloat>(g), static_cast<GLfloat>(b), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor3dv(const GLdouble* v) { if (!v) return; glColor4f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glColor4b(GLbyte r, GLbyte g, GLbyte b, GLbyte a) { glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(r) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(g) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(b) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(a) / 127.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glColor4bv(const GLbyte* v) { if (!v) return; glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[3]) / 127.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glColor4s(GLshort r, GLshort g, GLshort b, GLshort a) { glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(r) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(g) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(b) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(a) / 32767.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glColor4i(GLint r, GLint g, GLint b, GLint a) { glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(r) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(g) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(b) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(a) / 2147483647.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glColor4iv(const GLint* v) { if (!v) return; glColor4f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[3]) / 2147483647.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a) { glColor4f(static_cast<GLfloat>(static_cast<double>(r) / 255.0), static_cast<GLfloat>(static_cast<double>(g) / 255.0), static_cast<GLfloat>(static_cast<double>(b) / 255.0), static_cast<GLfloat>(static_cast<double>(a) / 255.0)); }
+VEXA_GL_GUEST_EXPORT void glColor4ubv(const GLubyte* v) { if (!v) return; glColor4f(static_cast<GLfloat>(static_cast<double>(v[0]) / 255.0), static_cast<GLfloat>(static_cast<double>(v[1]) / 255.0), static_cast<GLfloat>(static_cast<double>(v[2]) / 255.0), static_cast<GLfloat>(static_cast<double>(v[3]) / 255.0)); }
+VEXA_GL_GUEST_EXPORT void glColor4us(GLushort r, GLushort g, GLushort b, GLushort a) { glColor4f(static_cast<GLfloat>(static_cast<double>(r) / 65535.0), static_cast<GLfloat>(static_cast<double>(g) / 65535.0), static_cast<GLfloat>(static_cast<double>(b) / 65535.0), static_cast<GLfloat>(static_cast<double>(a) / 65535.0)); }
+VEXA_GL_GUEST_EXPORT void glColor4usv(const GLushort* v) { if (!v) return; glColor4f(static_cast<GLfloat>(static_cast<double>(v[0]) / 65535.0), static_cast<GLfloat>(static_cast<double>(v[1]) / 65535.0), static_cast<GLfloat>(static_cast<double>(v[2]) / 65535.0), static_cast<GLfloat>(static_cast<double>(v[3]) / 65535.0)); }
+VEXA_GL_GUEST_EXPORT void glColor4ui(GLuint r, GLuint g, GLuint b, GLuint a) { glColor4f(static_cast<GLfloat>(static_cast<double>(r) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(g) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(b) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(a) / 4294967295.0)); }
+VEXA_GL_GUEST_EXPORT void glColor4uiv(const GLuint* v) { if (!v) return; glColor4f(static_cast<GLfloat>(static_cast<double>(v[0]) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(v[1]) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(v[2]) / 4294967295.0), static_cast<GLfloat>(static_cast<double>(v[3]) / 4294967295.0)); }
+VEXA_GL_GUEST_EXPORT void glColor4fv(const GLfloat* v) { if (!v) return; glColor4f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), static_cast<GLfloat>(v[3])); }
+VEXA_GL_GUEST_EXPORT void glColor4d(GLdouble r, GLdouble g, GLdouble b, GLdouble a) { glColor4f(static_cast<GLfloat>(r), static_cast<GLfloat>(g), static_cast<GLfloat>(b), static_cast<GLfloat>(a)); }
+VEXA_GL_GUEST_EXPORT void glColor4dv(const GLdouble* v) { if (!v) return; glColor4f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), static_cast<GLfloat>(v[3])); }
 VEXA_GL_GUEST_EXPORT void glColor4sv(const GLshort* v){if(v)glColor4f(std::max(v[0]/32767.0f,-1.f),std::max(v[1]/32767.0f,-1.f),std::max(v[2]/32767.0f,-1.f),std::max(v[3]/32767.0f,-1.f));}
-VEXA_GL_GUEST_EXPORT void glTexCoord2f(GLfloat s,GLfloat t){fexfn_pack_glTexCoord2f(s,t);}
+VEXA_GL_GUEST_EXPORT void glTexCoord2f(GLfloat s,GLfloat t){VexaSetTexCoord4f(8,s,t,0,1);}
 VEXA_GL_GUEST_EXPORT void glPopAttrib(){fexfn_pack_glPopAttrib();if(vexa_ff::clip_enabled()){::glGetVertexAttribfv(3,GL_CURRENT_VERTEX_ATTRIB,vexa_ff::S().color);GLint mode=0;::glGetIntegerv(0x0BA0,&mode);vexa_ff::S().matrix_mode=mode;}}
 VEXA_GL_GUEST_EXPORT void glClipPlane(GLenum plane, const GLdouble* equation) {vexa_ff::sync_clip_matrices();fexfn_pack_glClipPlane(plane,equation);}
-VEXA_GL_GUEST_EXPORT void glLoadMatrixf(const GLfloat* matrix) {if(matrix){memcpy(vexa_ff::current(),matrix,16*sizeof(float));vexa_ff::sync_clip_matrices();}}
+VEXA_GL_GUEST_EXPORT void glLoadMatrixf(const GLfloat* matrix) {if(matrix){vexa_ff::matrix(matrix,false);}}
 VEXA_GL_GUEST_EXPORT void glLoadMatrixd(const GLdouble* matrix) {if(matrix){float m[16];for(int i=0;i<16;++i)m[i]=matrix[i];glLoadMatrixf(m);}}
-VEXA_GL_GUEST_EXPORT void glMultMatrixf(const GLfloat* matrix) {if(matrix){vexa_ff::multiply(vexa_ff::current(),matrix);vexa_ff::sync_clip_matrices();}}
+VEXA_GL_GUEST_EXPORT void glMultMatrixf(const GLfloat* matrix) {if(matrix){vexa_ff::matrix(matrix,true);}}
 VEXA_GL_GUEST_EXPORT void glMultMatrixd(const GLdouble* matrix) {if(matrix){float m[16];for(int i=0;i<16;++i)m[i]=matrix[i];glMultMatrixf(m);}}
 VEXA_GL_GUEST_EXPORT void glScalef(GLfloat x, GLfloat y, GLfloat z) {float m[16]{};m[0]=x;m[5]=y;m[10]=z;m[15]=1;glMultMatrixf(m);}
 VEXA_GL_GUEST_EXPORT void glScaled(GLdouble x, GLdouble y, GLdouble z) {glScalef(x,y,z);}
@@ -1520,6 +1910,72 @@ VEXA_GL_GUEST_EXPORT void glBegin(GLenum mode) { vexa_ff::begin(mode); }
 VEXA_GL_GUEST_EXPORT void glEnd(void) { vexa_ff::end(); }
 VEXA_GL_GUEST_EXPORT void glVertex3f(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::vertex(x, y, z); }
 VEXA_GL_GUEST_EXPORT void glNormal3f(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::normal(x, y, z); }
+// Coordinate type variants share the implemented float paths.
+VEXA_GL_GUEST_EXPORT void glVertex2d(GLdouble x, GLdouble y) { glVertex3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex2dv(const GLdouble* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex2f(GLfloat x, GLfloat y) { glVertex3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex2fv(const GLfloat* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex2i(GLint x, GLint y) { glVertex3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex2iv(const GLint* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex2s(GLshort x, GLshort y) { glVertex3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex2sv(const GLshort* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glVertex3d(GLdouble x, GLdouble y, GLdouble z) { glVertex3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), static_cast<GLfloat>(z)); }
+VEXA_GL_GUEST_EXPORT void glVertex3dv(const GLdouble* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2])); }
+VEXA_GL_GUEST_EXPORT void glVertex3fv(const GLfloat* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2])); }
+VEXA_GL_GUEST_EXPORT void glVertex3i(GLint x, GLint y, GLint z) { glVertex3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), static_cast<GLfloat>(z)); }
+VEXA_GL_GUEST_EXPORT void glVertex3iv(const GLint* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2])); }
+VEXA_GL_GUEST_EXPORT void glVertex3s(GLshort x, GLshort y, GLshort z) { glVertex3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), static_cast<GLfloat>(z)); }
+VEXA_GL_GUEST_EXPORT void glVertex3sv(const GLshort* v) { if (!v) return; glVertex3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2])); }
+VEXA_GL_GUEST_EXPORT void glNormal3b(GLbyte x, GLbyte y, GLbyte z) { glNormal3f(std::max(static_cast<GLfloat>(static_cast<double>(x) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(y) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(z) / 127.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glNormal3bv(const GLbyte* v) { if (!v) return; glNormal3f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 127.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 127.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glNormal3s(GLshort x, GLshort y, GLshort z) { glNormal3f(std::max(static_cast<GLfloat>(static_cast<double>(x) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(y) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(z) / 32767.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glNormal3sv(const GLshort* v) { if (!v) return; glNormal3f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 32767.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 32767.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glNormal3i(GLint x, GLint y, GLint z) { glNormal3f(std::max(static_cast<GLfloat>(static_cast<double>(x) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(y) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(z) / 2147483647.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glNormal3iv(const GLint* v) { if (!v) return; glNormal3f(std::max(static_cast<GLfloat>(static_cast<double>(v[0]) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[1]) / 2147483647.0), -1.0f), std::max(static_cast<GLfloat>(static_cast<double>(v[2]) / 2147483647.0), -1.0f)); }
+VEXA_GL_GUEST_EXPORT void glNormal3fv(const GLfloat* v) { if (!v) return; glNormal3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2])); }
+VEXA_GL_GUEST_EXPORT void glNormal3d(GLdouble x, GLdouble y, GLdouble z) { glNormal3f(static_cast<GLfloat>(x), static_cast<GLfloat>(y), static_cast<GLfloat>(z)); }
+VEXA_GL_GUEST_EXPORT void glNormal3dv(const GLdouble* v) { if (!v) return; glNormal3f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2])); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1d(GLdouble s) { glTexCoord2f(static_cast<GLfloat>(s), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1dv(const GLdouble* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1f(GLfloat s) { glTexCoord2f(static_cast<GLfloat>(s), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1fv(const GLfloat* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1i(GLint s) { glTexCoord2f(static_cast<GLfloat>(s), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1iv(const GLint* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1s(GLshort s) { glTexCoord2f(static_cast<GLfloat>(s), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord1sv(const GLshort* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), 0.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord2d(GLdouble s, GLdouble t) { glTexCoord2f(static_cast<GLfloat>(s), static_cast<GLfloat>(t)); }
+VEXA_GL_GUEST_EXPORT void glTexCoord2dv(const GLdouble* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1])); }
+VEXA_GL_GUEST_EXPORT void glTexCoord2fv(const GLfloat* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1])); }
+VEXA_GL_GUEST_EXPORT void glTexCoord2i(GLint s, GLint t) { glTexCoord2f(static_cast<GLfloat>(s), static_cast<GLfloat>(t)); }
+VEXA_GL_GUEST_EXPORT void glTexCoord2iv(const GLint* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1])); }
+VEXA_GL_GUEST_EXPORT void glTexCoord2s(GLshort s, GLshort t) { glTexCoord2f(static_cast<GLfloat>(s), static_cast<GLfloat>(t)); }
+VEXA_GL_GUEST_EXPORT void glTexCoord2sv(const GLshort* v) { if (!v) return; glTexCoord2f(static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1])); }
+// Legacy current texture coordinate uses generic attribute 8 on the host.
+VEXA_GL_GUEST_EXPORT void glTexCoord3d(GLdouble s, GLdouble t, GLdouble r) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord3dv(const GLdouble* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord3f(GLfloat s, GLfloat t, GLfloat r) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord3fv(const GLfloat* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord3i(GLint s, GLint t, GLint r) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord3iv(const GLint* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord3s(GLshort s, GLshort t, GLshort r) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord3sv(const GLshort* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), 1.0f); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4d(GLdouble s, GLdouble t, GLdouble r, GLdouble q) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), static_cast<GLfloat>(q)); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4dv(const GLdouble* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), static_cast<GLfloat>(v[3])); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4f(GLfloat s, GLfloat t, GLfloat r, GLfloat q) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), static_cast<GLfloat>(q)); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4fv(const GLfloat* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), static_cast<GLfloat>(v[3])); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4i(GLint s, GLint t, GLint r, GLint q) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), static_cast<GLfloat>(q)); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4iv(const GLint* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), static_cast<GLfloat>(v[3])); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4s(GLshort s, GLshort t, GLshort r, GLshort q) { VexaSetTexCoord4f(8, static_cast<GLfloat>(s), static_cast<GLfloat>(t), static_cast<GLfloat>(r), static_cast<GLfloat>(q)); }
+VEXA_GL_GUEST_EXPORT void glTexCoord4sv(const GLshort* v) { if (!v) return; VexaSetTexCoord4f(8, static_cast<GLfloat>(v[0]), static_cast<GLfloat>(v[1]), static_cast<GLfloat>(v[2]), static_cast<GLfloat>(v[3])); }
+// Preserve homogeneous coordinates through the fixed-function vertex path.
+VEXA_GL_GUEST_EXPORT void glVertex4d(GLdouble x, GLdouble y, GLdouble z, GLdouble w) { vexa_ff::vertex4(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z), static_cast<float>(w)); }
+VEXA_GL_GUEST_EXPORT void glVertex4dv(const GLdouble* v) { if (!v) return; vexa_ff::vertex4(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]), static_cast<float>(v[3])); }
+VEXA_GL_GUEST_EXPORT void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) { vexa_ff::vertex4(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z), static_cast<float>(w)); }
+VEXA_GL_GUEST_EXPORT void glVertex4fv(const GLfloat* v) { if (!v) return; vexa_ff::vertex4(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]), static_cast<float>(v[3])); }
+VEXA_GL_GUEST_EXPORT void glVertex4i(GLint x, GLint y, GLint z, GLint w) { vexa_ff::vertex4(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z), static_cast<float>(w)); }
+VEXA_GL_GUEST_EXPORT void glVertex4iv(const GLint* v) { if (!v) return; vexa_ff::vertex4(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]), static_cast<float>(v[3])); }
+VEXA_GL_GUEST_EXPORT void glVertex4s(GLshort x, GLshort y, GLshort z, GLshort w) { vexa_ff::vertex4(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z), static_cast<float>(w)); }
+VEXA_GL_GUEST_EXPORT void glVertex4sv(const GLshort* v) { if (!v) return; vexa_ff::vertex4(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]), static_cast<float>(v[3])); }
 VEXA_GL_GUEST_EXPORT void glMatrixMode(GLenum mode) { vexa_ff::matrix_mode(mode); vexa_ff::sync_clip_matrices(); }
 VEXA_GL_GUEST_EXPORT void glLoadIdentity(void) { vexa_ff::load_identity(); vexa_ff::sync_clip_matrices(); }
 VEXA_GL_GUEST_EXPORT void glTranslatef(GLfloat x, GLfloat y, GLfloat z) { vexa_ff::translate(x, y, z); vexa_ff::sync_clip_matrices(); }
@@ -1527,6 +1983,15 @@ VEXA_GL_GUEST_EXPORT void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat
 VEXA_GL_GUEST_EXPORT void glTranslated(GLdouble x, GLdouble y, GLdouble z) {
   vexa_ff::translate(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)); vexa_ff::sync_clip_matrices();
 }
+VEXA_GL_GUEST_EXPORT void glRotated(GLdouble angle, GLdouble x, GLdouble y, GLdouble z) { glRotatef(angle, x, y, z); }
+VEXA_GL_GUEST_EXPORT void glRectd(GLdouble x1, GLdouble y1, GLdouble x2, GLdouble y2) { glBegin(0x0007); glVertex3f(x1, y1, 0); glVertex3f(x2, y1, 0); glVertex3f(x2, y2, 0); glVertex3f(x1, y2, 0); glEnd(); }
+VEXA_GL_GUEST_EXPORT void glRectdv(const GLdouble* a, const GLdouble* b) { if (!a || !b) return; glBegin(0x0007); glVertex3f(a[0], a[1], 0); glVertex3f(b[0], a[1], 0); glVertex3f(b[0], b[1], 0); glVertex3f(a[0], b[1], 0); glEnd(); }
+VEXA_GL_GUEST_EXPORT void glRectf(GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2) { glBegin(0x0007); glVertex3f(x1, y1, 0); glVertex3f(x2, y1, 0); glVertex3f(x2, y2, 0); glVertex3f(x1, y2, 0); glEnd(); }
+VEXA_GL_GUEST_EXPORT void glRectfv(const GLfloat* a, const GLfloat* b) { if (!a || !b) return; glBegin(0x0007); glVertex3f(a[0], a[1], 0); glVertex3f(b[0], a[1], 0); glVertex3f(b[0], b[1], 0); glVertex3f(a[0], b[1], 0); glEnd(); }
+VEXA_GL_GUEST_EXPORT void glRecti(GLint x1, GLint y1, GLint x2, GLint y2) { glBegin(0x0007); glVertex3f(x1, y1, 0); glVertex3f(x2, y1, 0); glVertex3f(x2, y2, 0); glVertex3f(x1, y2, 0); glEnd(); }
+VEXA_GL_GUEST_EXPORT void glRectiv(const GLint* a, const GLint* b) { if (!a || !b) return; glBegin(0x0007); glVertex3f(a[0], a[1], 0); glVertex3f(b[0], a[1], 0); glVertex3f(b[0], b[1], 0); glVertex3f(a[0], b[1], 0); glEnd(); }
+VEXA_GL_GUEST_EXPORT void glRects(GLshort x1, GLshort y1, GLshort x2, GLshort y2) { glBegin(0x0007); glVertex3f(x1, y1, 0); glVertex3f(x2, y1, 0); glVertex3f(x2, y2, 0); glVertex3f(x1, y2, 0); glEnd(); }
+VEXA_GL_GUEST_EXPORT void glRectsv(const GLshort* a, const GLshort* b) { if (!a || !b) return; glBegin(0x0007); glVertex3f(a[0], a[1], 0); glVertex3f(b[0], a[1], 0); glVertex3f(b[0], b[1], 0); glVertex3f(a[0], b[1], 0); glEnd(); }
 VEXA_GL_GUEST_EXPORT void glPushMatrix(void) { vexa_ff::push_matrix(); vexa_ff::sync_clip_matrices(); }
 VEXA_GL_GUEST_EXPORT void glPopMatrix(void) { vexa_ff::pop_matrix(); vexa_ff::sync_clip_matrices(); }
 VEXA_GL_GUEST_EXPORT void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble znear, GLdouble zfar) {
@@ -1538,17 +2003,33 @@ VEXA_GL_GUEST_EXPORT void glNewList(GLuint list, GLenum mode) { vexa_ff::new_lis
 VEXA_GL_GUEST_EXPORT void glEndList(void) { vexa_ff::end_list(); }
 VEXA_GL_GUEST_EXPORT void glCallList(GLuint list) { vexa_ff::call_list(list); }
 VEXA_GL_GUEST_EXPORT void glDeleteLists(GLuint list, GLsizei range) { vexa_ff::delete_lists(list, range); }
-VEXA_GL_GUEST_EXPORT void glShadeModel(GLenum /*mode*/) {}
-VEXA_GL_GUEST_EXPORT void glLightfv(GLenum /*light*/, GLenum /*pname*/, const GLfloat* /*params*/) {}
-VEXA_GL_GUEST_EXPORT void glMaterialfv(GLenum /*face*/, GLenum pname, const GLfloat* params) {
-  vexa_ff::material(pname, params);
+VEXA_GL_GUEST_EXPORT GLboolean glIsList(GLuint list) { return vexa_ff::is_list(list) ? GL_TRUE : GL_FALSE; }
+VEXA_GL_GUEST_EXPORT void glListBase(GLuint base) { vexa_ff::list_base(base); }
+VEXA_GL_GUEST_EXPORT void glCallLists(GLsizei n, GLenum type, const void* lists) {
+  if (n < 0) { fexfn_pack_VEXA_CompatError(GL_INVALID_VALUE); return; }
+  if (type != GL_BYTE && type != GL_UNSIGNED_BYTE && type != GL_SHORT && type != GL_UNSIGNED_SHORT &&
+      type != GL_INT && type != GL_UNSIGNED_INT && type != GL_FLOAT && type != 0x1407 && type != 0x1408 && type != 0x1409) {
+    fexfn_pack_VEXA_CompatError(GL_INVALID_ENUM); return;
+  }
+  if (!lists) return;
+  const auto* p = static_cast<const unsigned char*>(lists);
+  for (GLsizei i = 0; i < n; ++i) {
+    uint32_t value = 0;
+    switch (type) {
+      case GL_BYTE: { int8_t v; memcpy(&v,p,1); value=static_cast<uint32_t>(v); p+=1; break; }
+      case GL_UNSIGNED_BYTE: value=*p++; break;
+      case GL_SHORT: { int16_t v; memcpy(&v,p,2); value=static_cast<uint32_t>(v); p+=2; break; }
+      case GL_UNSIGNED_SHORT: { uint16_t v; memcpy(&v,p,2); value=v; p+=2; break; }
+      case GL_INT: { int32_t v; memcpy(&v,p,4); value=static_cast<uint32_t>(v); p+=4; break; }
+      case GL_UNSIGNED_INT: memcpy(&value,p,4); p+=4; break;
+      case GL_FLOAT: { float v; memcpy(&v,p,4); value=static_cast<uint32_t>(static_cast<int64_t>(v)); p+=4; break; }
+      default: { const int bytes = static_cast<int>(type) - 0x1405; for(int j=0;j<bytes;++j) value=(value<<8)|*p++; break; }
+    }
+    vexa_ff::call_offset(value);
+  }
 }
-// Texture-env state is not part of the emulated fixed-function pipeline; games
-// (Warband) link these directly, so they must exist even as no-ops.
-VEXA_GL_GUEST_EXPORT void glTexEnvf(GLenum /*target*/, GLenum /*pname*/, GLfloat /*param*/) {}
-VEXA_GL_GUEST_EXPORT void glTexEnvi(GLenum /*target*/, GLenum /*pname*/, GLint /*param*/) {}
-VEXA_GL_GUEST_EXPORT void glTexEnvfv(GLenum /*target*/, GLenum /*pname*/, const GLfloat* /*params*/) {}
-VEXA_GL_GUEST_EXPORT void glTexEnviv(GLenum /*target*/, GLenum /*pname*/, const GLint* /*params*/) {}
+
+VEXA_GL_GUEST_EXPORT void glShadeModel(GLenum /*mode*/) {}
 
 // glMapBuffer is intentionally NOT defined here (see libvexa_glmap.c): exporting it from libGL makes
 // Unity (Megabonk, Vulkan mode) take its desktop-GL path and crash.
@@ -1689,7 +2170,6 @@ VEXA_GL_GUEST_EXPORT void glInvalidateBufferSubData(GLuint /*buffer*/, GLintptr 
 VEXA_GL_GUEST_EXPORT void glDepthBounds(GLclampd /*zmin*/, GLclampd /*zmax*/) {}
 VEXA_GL_GUEST_EXPORT void glClipControl(GLenum /*origin*/, GLenum /*depth*/) {}
 VEXA_GL_GUEST_EXPORT void glVertexAttribLFormat(GLuint /*index*/, GLint /*size*/, GLenum /*type*/, GLuint /*relativeoffset*/) {}
-VEXA_GL_GUEST_EXPORT void glSelectBuffer(GLsizei /*size*/, GLuint* /*buffer*/) {}
 
 
 VEXA_GL_GUEST_EXPORT void glFrameTerminator(void) {}

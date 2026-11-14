@@ -7,6 +7,10 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+
 #ifndef _WIN32
 #include <FEXCore/Utils/PrctlUtils.h>
 #endif
@@ -80,6 +84,21 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
 #endif
 
   auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
+
+  // Every buffer after the first means the previous one filled up and each
+  // thread drops all of its translations: a recompilation stutter. Record it
+  // with a monotonic timestamp so it can be lined up with frame-time spikes.
+  static std::atomic<uint32_t> BufferGeneration {};
+  const uint32_t Generation = BufferGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
+  const auto MonotonicMs =
+    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#ifdef __ANDROID__
+  fprintf(stderr, "[VEXA][JIT] code buffer #%u size=%zuMiB t=%lldms%s\n", Generation, Size >> 20, static_cast<long long>(MonotonicMs),
+          Generation > 1 ? " (previous buffer full, translations discarded)" : "");
+#else
+  LogMan::Msg::IFmt("[JIT] code buffer #{} size={}MiB t={}ms{}", Generation, Size >> 20, MonotonicMs,
+                    Generation > 1 ? " (previous buffer full, translations discarded)" : "");
+#endif
 
   Latest = Buffer;
 

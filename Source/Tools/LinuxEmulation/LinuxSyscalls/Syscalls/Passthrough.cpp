@@ -11,9 +11,12 @@ $end_info$
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 
+#include <cerrno>
 #include <stdint.h>
 #include <sys/epoll.h>
+#include <time.h>
 #include "LinuxSyscalls/VexaTmpPath.h"
+#include "LinuxSyscalls/VexaShmPath.h"
 
 namespace FEX::HLE {
 #ifdef ARCHITECTURE_arm64
@@ -254,6 +257,32 @@ namespace AndroidCreds {
     return -EPERM;
   }
 } // namespace AndroidCreds
+
+// Bionic serves the common clocks from the host vDSO, so a guest clock call
+// that arrives as a syscall (static binaries, raw syscalls, or no guest vDSO)
+// costs no kernel entry. The result is copied out fault-safely so an invalid
+// guest pointer still produces EFAULT like the raw syscall.
+static uint64_t VexaClockGettime(FEXCore::Core::CpuStateFrame*, uint64_t ClockId, uint64_t TimeSpec) {
+  struct timespec Local {};
+  if (::clock_gettime(static_cast<clockid_t>(ClockId), &Local) == -1) {
+    return -errno;
+  }
+  if (FaultSafeUserMemAccess::CopyToUser(reinterpret_cast<void*>(TimeSpec), &Local, sizeof(Local))) {
+    return -EFAULT;
+  }
+  return 0;
+}
+
+static uint64_t VexaClockGetres(FEXCore::Core::CpuStateFrame*, uint64_t ClockId, uint64_t TimeSpec) {
+  struct timespec Local {};
+  if (::clock_getres(static_cast<clockid_t>(ClockId), TimeSpec ? &Local : nullptr) == -1) {
+    return -errno;
+  }
+  if (TimeSpec && FaultSafeUserMemAccess::CopyToUser(reinterpret_cast<void*>(TimeSpec), &Local, sizeof(Local))) {
+    return -EFAULT;
+  }
+  return 0;
+}
 #endif
 
 void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
@@ -426,7 +455,11 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   });
   REGISTER_SYSCALL_IMPL(mknodat, SyscallPassthrough4<SYSCALL_DEF(mknodat)>);
   REGISTER_SYSCALL_IMPL(fchownat, SyscallPassthrough5<SYSCALL_DEF(fchownat)>);
-  REGISTER_SYSCALL_IMPL(unlinkat, SyscallPassthrough3<SYSCALL_DEF(unlinkat)>);
+  REGISTER_SYSCALL_IMPL(unlinkat, [](FEXCore::Core::CpuStateFrame*, int dirfd, const char* pathname, int flags) -> uint64_t {
+    const auto path = VexaPrivateShmPath(pathname);
+    uint64_t Result = ::syscall(SYSCALL_DEF(unlinkat), dirfd, path.empty() ? pathname : path.c_str(), flags);
+    SYSCALL_ERRNO();
+  });
   REGISTER_SYSCALL_IMPL(renameat, SyscallPassthrough4<SYSCALL_DEF(renameat)>);
   REGISTER_SYSCALL_IMPL(linkat, SyscallPassthrough5<SYSCALL_DEF(linkat)>);
   REGISTER_SYSCALL_IMPL(symlinkat, SyscallPassthrough3<SYSCALL_DEF(symlinkat)>);
@@ -465,9 +498,17 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(membarrier, SyscallPassthrough2<SYSCALL_DEF(membarrier)>);
   REGISTER_SYSCALL_IMPL(mlock2, SyscallPassthrough3<SYSCALL_DEF(mlock2)>);
   REGISTER_SYSCALL_IMPL(copy_file_range, SyscallPassthrough6<SYSCALL_DEF(copy_file_range)>);
+#if defined(__ANDROID__)
+  // Android app seccomp kills the process for these optional Linux calls.
+  // Advertise their absence so allocators/Chromium use ordinary mprotect.
+  REGISTER_SYSCALL_IMPL(pkey_mprotect, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+  REGISTER_SYSCALL_IMPL(pkey_alloc, [](FEXCore::Core::CpuStateFrame*, uint64_t, uint64_t) -> uint64_t { return -ENOSYS; });
+  REGISTER_SYSCALL_IMPL(pkey_free, [](FEXCore::Core::CpuStateFrame*, uint64_t) -> uint64_t { return -ENOSYS; });
+#else
   REGISTER_SYSCALL_IMPL(pkey_mprotect, SyscallPassthrough4<SYSCALL_DEF(pkey_mprotect)>);
   REGISTER_SYSCALL_IMPL(pkey_alloc, SyscallPassthrough2<SYSCALL_DEF(pkey_alloc)>);
   REGISTER_SYSCALL_IMPL(pkey_free, SyscallPassthrough1<SYSCALL_DEF(pkey_free)>);
+#endif
   // io_uring can't be emulated as it can pass `epoll_event` objects around.
   // These are 12-byte packed structs on x86/x86-64, but on other architectures are 16-byte.
   // This means the `data` member is at offset 4 on x86, but offset 8 on other architectures, corrupting the data.
@@ -596,8 +637,13 @@ namespace x64 {
     REGISTER_SYSCALL_IMPL_X64(timer_settime, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
     REGISTER_SYSCALL_IMPL_X64(timer_gettime, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
     REGISTER_SYSCALL_IMPL_X64(clock_settime, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
+#if defined(__ANDROID__)
+    REGISTER_SYSCALL_IMPL_X64(clock_gettime, VexaClockGettime);
+    REGISTER_SYSCALL_IMPL_X64(clock_getres, VexaClockGetres);
+#else
     REGISTER_SYSCALL_IMPL_X64(clock_gettime, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
     REGISTER_SYSCALL_IMPL_X64(clock_getres, SyscallPassthrough2<SYSCALL_DEF(clock_getres)>);
+#endif
     REGISTER_SYSCALL_IMPL_X64(clock_nanosleep, SyscallPassthrough4<SYSCALL_DEF(clock_nanosleep)>);
     REGISTER_SYSCALL_IMPL_X64(mq_open, SyscallPassthrough4<SYSCALL_DEF(mq_open)>);
     REGISTER_SYSCALL_IMPL_X64(mq_timedsend, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
@@ -702,10 +748,19 @@ namespace x32 {
     REGISTER_SYSCALL_IMPL_X32(getresuid32, SyscallPassthrough3<SYSCALL_DEF(getresuid)>);
     REGISTER_SYSCALL_IMPL_X32(getresgid32, SyscallPassthrough3<SYSCALL_DEF(getresgid)>);
     REGISTER_SYSCALL_IMPL_X32(sendfile64, SyscallPassthrough4<SYSCALL_DEF(sendfile)>);
+#if defined(__ANDROID__)
+    // struct __kernel_timespec matches the host timespec layout.
+    REGISTER_SYSCALL_IMPL_X32(clock_gettime64, VexaClockGettime);
+#else
     REGISTER_SYSCALL_IMPL_X32(clock_gettime64, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
+#endif
     REGISTER_SYSCALL_IMPL_X32(clock_settime64, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
     REGISTER_SYSCALL_IMPL_X32(clock_adjtime64, SyscallPassthrough2<SYSCALL_DEF(clock_adjtime)>);
+#if defined(__ANDROID__)
+    REGISTER_SYSCALL_IMPL_X32(clock_getres_time64, VexaClockGetres);
+#else
     REGISTER_SYSCALL_IMPL_X32(clock_getres_time64, SyscallPassthrough2<SYSCALL_DEF(clock_getres)>);
+#endif
     REGISTER_SYSCALL_IMPL_X32(clock_nanosleep_time64, SyscallPassthrough4<SYSCALL_DEF(clock_nanosleep)>);
     REGISTER_SYSCALL_IMPL_X32(timer_gettime64, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
     REGISTER_SYSCALL_IMPL_X32(timer_settime64, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);

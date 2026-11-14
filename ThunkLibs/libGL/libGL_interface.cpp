@@ -17,15 +17,23 @@ extern "C" using __GLXextFuncPtr = void (*)(void);
 extern "C" __GLXextFuncPtr glXGetProcAddress(const GLubyte* procname);
 extern "C" uintptr_t VEXA_CreateGlxContext(uintptr_t share);
 extern "C" void VEXA_DestroyGlxContext(uintptr_t context);
-extern "C" int VEXA_BindGlxSurface(uintptr_t context);
+extern "C" int VEXA_BindGlxSurface(uintptr_t context, uint32_t drawable);
 extern "C" int VEXA_ReleaseGlxSurface(void);
-extern "C" void VEXA_SwapGlxBuffers(void);
+extern "C" void VEXA_NormalPointer(unsigned type, int stride, uintptr_t pointer);
+extern "C" void VEXA_InterleavedArrays(unsigned format, int stride, uintptr_t pointer);
+extern "C" void VEXA_SwapGlxBuffers(uint32_t drawable);
 extern "C" int VEXA_SetSwapInterval(int interval);
 // One host transition uploads or draws a baked fixed-function mesh.
-extern "C" unsigned VEXA_FFUpload(const float* vertices, int float_count);
+extern "C" unsigned VEXA_FFUpload(const float* vertices, int float_count, unsigned mode);
 extern "C" void VEXA_FFDrawList(const unsigned* buffers, const int* counts, const float* colors, int item_count, const float* mvp);
-extern "C" void VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color);
+extern "C" void VEXA_FFDrawImmediate(const float* vertices, int float_count, const float* mvp, const float* color, unsigned mode);
 extern "C" void VEXA_FFDelete(unsigned buffer);
+extern "C" void VEXA_FFSetLighting(const void* packet, unsigned bytes);
+extern "C" int VEXA_DrawPixels(const float* pixels, int width, int height, const float* raster, const float* bitmapColor);
+extern "C" void VEXA_FFSetStipple(const float* mask, int enabled);
+extern "C" int VEXA_ReadElementIndices(unsigned type,int count,uintptr_t pointer,unsigned* output);
+extern "C" unsigned VEXA_ReadArrayElement(int element, float* values);
+extern "C" void VEXA_AuxArrayPointer(unsigned array, unsigned type, int stride, uintptr_t pointer);
 // One host transition per multi-call. 64-bit values travel as (lo, hi) GLuint
 // pairs so the layout is identical for 32- and 64-bit guests.
 extern "C" void VEXA_MultiDrawIndirect(unsigned mode, unsigned type, uintptr_t indirect, int drawcount, int stride);
@@ -69,6 +77,10 @@ struct fex_gen_config<VEXA_BindGlxSurface> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_ReleaseGlxSurface> : fexgen::custom_host_impl {};
 template<>
+struct fex_gen_config<VEXA_NormalPointer> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<VEXA_InterleavedArrays> : fexgen::custom_host_impl {};
+template<>
 struct fex_gen_config<VEXA_SwapGlxBuffers> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_SetSwapInterval> : fexgen::custom_host_impl {};
@@ -78,6 +90,12 @@ template<>
 struct fex_gen_config<VEXA_FFDrawList> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_FFDrawImmediate> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_FFSetLighting> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_DrawPixels> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_FFSetStipple> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_ReadElementIndices> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_ReadArrayElement> : fexgen::custom_host_impl {};
+template<> struct fex_gen_config<VEXA_AuxArrayPointer> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<VEXA_FFDelete> : fexgen::custom_host_impl {};
 template<>
@@ -199,9 +217,9 @@ struct fex_gen_config<glUseProgram> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glBindFramebuffer> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<glDrawArrays> : fexgen::custom_host_impl {};
+struct fex_gen_config<glDrawArrays> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
 template<>
-struct fex_gen_config<glDrawElements> : fexgen::custom_host_impl {};
+struct fex_gen_config<glDrawElements> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
 template<>
 struct fex_gen_config<glDrawArraysInstanced> : fexgen::custom_host_impl {};
 template<>
@@ -249,9 +267,15 @@ struct fex_gen_config<glGetQueryObjectui64v> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glGetQueryObjectuiv> : fexgen::custom_host_impl {};
 template<>
-struct fex_gen_config<glEnable> : fexgen::custom_host_impl {};
+struct fex_gen_config<glEnable> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
 template<>
-struct fex_gen_config<glDisable> : fexgen::custom_host_impl {};
+struct fex_gen_config<glDisable> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
+template<>
+struct fex_gen_config<glIsEnabled> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};
+template<> struct fex_gen_config<glGetFloatv> : fexgen::custom_guest_entrypoint {};
+template<> struct fex_gen_config<glGetIntegerv> : fexgen::custom_guest_entrypoint {};
+template<> struct fex_gen_config<glGetBooleanv> : fexgen::custom_guest_entrypoint {};
+template<> struct fex_gen_config<glPixelStorei> : fexgen::custom_guest_entrypoint {};
 template<>
 struct fex_gen_config<glAlphaFunc> : fexgen::custom_host_impl {};
 #define VEXA_LEGACY_CONFIG(name, result, params) template<> struct fex_gen_config<name> : fexgen::custom_host_impl {};

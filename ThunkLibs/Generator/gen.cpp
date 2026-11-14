@@ -823,6 +823,15 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     file << "  { nullptr, nullptr }\n";
     file << "};\n";
 
+    // Allow custom resolvers to bind the same imports used by direct guest
+    // entrypoints. In particular an i386 function pointer cannot carry a
+    // native AArch64 address returned by a graphics proc-address resolver.
+    file << "#define FOREACH_FEX_HOST_IMPORT(EXPAND) \\\n";
+    for (const auto& import : thunked_api) {
+      fmt::print(file, "  EXPAND({}, fexldr_ptr_{}_{}) \\\n", import.function_name, libname, import.function_name);
+    }
+    file << "\n";
+
     // Symbol lookup from native host library
     file << "static void* fexldr_ptr_" << libname << "_so;\n";
     file << "extern \"C\" bool fexldr_init_" << libname << "() {\n";

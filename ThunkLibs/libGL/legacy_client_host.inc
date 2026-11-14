@@ -34,6 +34,34 @@ static void fexfn_impl_libGL_glVertexPointer(GLint size,GLenum type,GLsizei stri
   if(type!=GL_SHORT&&type!=GL_INT&&type!=GL_FLOAT&&type!=GL_DOUBLE){VexaAssemblyError(GL_INVALID_ENUM);return;}
   VexaLegacyPointer(0,size,type,stride,pointer,false);
 }
+static void fexfn_impl_libGL_VEXA_NormalPointer(unsigned type, int stride, uintptr_t pointer) {
+  if(type!=GL_BYTE && type!=GL_SHORT && type!=GL_INT && type!=GL_FLOAT && type!=GL_DOUBLE) {
+    VexaAssemblyError(GL_INVALID_ENUM); return;
+  }
+  VexaLegacyPointer(2, 3, type, stride, reinterpret_cast<const void*>(pointer), type!=GL_FLOAT && type!=GL_DOUBLE);
+}
+// Desktop GL 1.1 interleaved layouts. Sizes/offsets are in bytes and include
+// the alignment specified by glInterleavedArrays, independent of guest ABI.
+static void fexfn_impl_libGL_VEXA_InterleavedArrays(unsigned format, int stride, uintptr_t pointer) {
+  using namespace VexaInterleaved;
+  if (format < 0x2A20 || format > 0x2A2D) { VexaAssemblyError(GL_INVALID_ENUM); return; }
+  if (stride < 0) { VexaAssemblyError(GL_INVALID_VALUE); return; }
+  const auto& l = layouts[format - 0x2A20];
+  const auto actualStride = stride ? stride : static_cast<int>(l.stride);
+  const unsigned ti = 8 + VexaProgramContext().LegacyClient.Unit;
+  const auto setup = [&](unsigned index, unsigned offset, int size, GLenum type, bool normalized) {
+    if (offset == absent) {
+      VexaLegacyArrays()[index].Enabled = false; ::glDisableVertexAttribArray(index);
+      return;
+    }
+    VexaLegacyPointer(index, size, type, actualStride, reinterpret_cast<const void*>(pointer + offset), normalized);
+    VexaLegacyArrays()[index].Enabled = true; ::glEnableVertexAttribArray(index);
+  };
+  setup(ti,l.tex,l.texSize,GL_FLOAT,false);
+  setup(3,l.color,l.colorSize,l.byteColor ? GL_UNSIGNED_BYTE : GL_FLOAT,l.byteColor);
+  setup(2,l.normal,3,GL_FLOAT,false);
+  setup(0,l.vertex,l.vertexSize,GL_FLOAT,false);
+}
 static void fexfn_impl_libGL_glTexCoordPointer(GLint size,GLenum type,GLsizei stride,const void* pointer) {
   if(type!=GL_SHORT&&type!=GL_INT&&type!=GL_FLOAT&&type!=GL_DOUBLE){VexaAssemblyError(GL_INVALID_ENUM);return;}
   VexaLegacyPointer(8+VexaProgramContext().LegacyClient.Unit,size,type,stride,pointer,false);
@@ -60,8 +88,44 @@ static void fexfn_impl_libGL_glColor4sv(const GLshort* v) {
 }
 static void fexfn_impl_libGL_glTexCoord2f(GLfloat s,GLfloat t){::glVertexAttrib4f(8,s,t,0,1);}
 static uintptr_t fexfn_impl_libGL_VEXA_GetLegacyPointer(GLenum pname) {
-  const int index=pname==0x808E?0:pname==0x808F?2:pname==0x8090?3:pname==0x8092?8+VexaProgramContext().LegacyClient.Unit:-1;
+  const int index=pname==0x808E?0:pname==0x808F?2:pname==0x8090?3:pname==0x8091?1:pname==0x8093?4:pname==0x8092?8+VexaProgramContext().LegacyClient.Unit:-1;
   if(index<0){VexaAssemblyError(GL_INVALID_ENUM);return 0;}return VexaLegacyArrays()[index].Pointer;
+}
+
+#include "legacy_array_decode.h"
+static int fexfn_impl_libGL_VEXA_ReadElementIndices(unsigned type,int count,uintptr_t pointer,unsigned* output) {
+  const size_t size=type==GL_UNSIGNED_BYTE?1:type==GL_UNSIGNED_SHORT?2:type==GL_UNSIGNED_INT?4:0;
+  if(!size||count<0||!output){VexaAssemblyError(GL_INVALID_VALUE);return 0;}
+  GLint buffer=0;::glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING,&buffer);
+  const uint8_t* data=reinterpret_cast<const uint8_t*>(pointer);std::vector<uint8_t> bytes;
+  if(buffer){if(!VexaLegacyArrayScope::ReadBuffer(GL_COPY_READ_BUFFER,buffer,pointer,size*count,bytes)){VexaAssemblyError(GL_INVALID_OPERATION);return 0;}data=bytes.data();}
+  if(!data){VexaAssemblyError(GL_INVALID_OPERATION);return 0;}
+  for(int i=0;i<count;++i){unsigned value=0;std::memcpy(&value,data+size*i,size);output[i]=value;}return 1;
+}
+static void fexfn_impl_libGL_VEXA_AuxArrayPointer(unsigned array,unsigned type,int stride,uintptr_t pointer) {
+  if(stride<0){VexaAssemblyError(GL_INVALID_VALUE);return;}
+  const int index=array==0x8077?1:4;
+  if(index==1 && type!=GL_SHORT && type!=GL_INT && type!=GL_FLOAT && type!=GL_DOUBLE){VexaAssemblyError(GL_INVALID_ENUM);return;}
+  auto& state=VexaLegacyArrays()[index];GLint buffer=0;::glGetIntegerv(GL_ARRAY_BUFFER_BINDING,&buffer);
+  state.Defined=true;state.Size=1;state.Type=type;state.Stride=stride;state.Pointer=pointer;state.Buffer=buffer;
+  state.Normalize=false;state.BGRA=false;VexaProgramContext().LegacyClient.Used=true;
+}
+static unsigned fexfn_impl_libGL_VEXA_ReadArrayElement(int element,float* values) {
+  if(element<0||!values){VexaAssemblyError(GL_INVALID_VALUE);return 0;}
+  unsigned mask=0;
+  for(unsigned index=0;index<16;++index) {
+    const auto& a=VexaLegacyArrays()[index];if(!a.Enabled||!a.Defined)continue;
+    const uint64_t width=VexaLegacyTypeSize(a.Type)*a.Size,stride=a.Stride?a.Stride:width;
+    if(!width||uint64_t(element)>UINT64_MAX/stride){VexaAssemblyError(GL_INVALID_OPERATION);return 0;}
+    const uint64_t delta=uint64_t(element)*stride;
+    if(delta>UINTPTR_MAX-a.Pointer){VexaAssemblyError(GL_INVALID_OPERATION);return 0;}
+    const auto address=a.Pointer+delta;const uint8_t* data=reinterpret_cast<const uint8_t*>(address);
+    std::vector<uint8_t> storage;
+    if(a.Buffer){if(!VexaLegacyArrayScope::ReadBuffer(GL_COPY_READ_BUFFER,a.Buffer,address,width,storage)){VexaAssemblyError(GL_INVALID_OPERATION);return 0;}data=storage.data();}
+    if(!vexa_array::decode(data,a.Type,a.Size,a.Normalize,a.BGRA,values+index*4)){VexaAssemblyError(GL_INVALID_OPERATION);return 0;}
+    mask|=1U<<index;
+  }
+  return mask;
 }
 
 using VexaLegacyRestore=std::vector<std::function<void()>>;

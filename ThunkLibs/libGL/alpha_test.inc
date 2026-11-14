@@ -27,7 +27,7 @@ static bool VexaAlphaQuery(GLenum pname, GLfloat* value) {
   }
 }
 
-static GLboolean fexfn_impl_libGL_glIsEnabled(GLenum cap) {
+static GLboolean VexaCompatIsEnabled(GLenum cap) {
   GLfloat legacy;if(VexaLegacyQuery(cap,&legacy))return legacy!=0;
   if(VexaClipAvailable()&&cap>=0x3000&&cap<0x3006)return VexaProgramContext().Clip.Enabled[cap-0x3000]?GL_TRUE:GL_FALSE;
   if (const int stage=VexaAssemblyTarget(cap);stage>=0) return VexaProgramContext().Assembly.Enabled[stage]?GL_TRUE:GL_FALSE;

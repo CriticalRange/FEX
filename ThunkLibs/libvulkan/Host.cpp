@@ -30,6 +30,12 @@ $end_info$
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/dma-heap.h>
 
 #ifdef IS_32BIT_THUNK
 // Union type embedded in VkDescriptorGetInfoEXT
@@ -39,7 +45,82 @@ struct guest_layout<VkDescriptorDataEXT> {
 };
 #endif
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+// Android ICD dispatchable handles are native pointers above 4 GB. Keep them
+// opaque in i386, including handles nested in command/submit structures.
+template<typename Handle>
+struct VexaVulkan32Handles {
+  static inline std::mutex mutex;
+  static inline std::unordered_map<uint32_t, Handle> native;
+  static inline std::unordered_map<Handle, uint32_t> guest;
+  static inline uint32_t next = 1;
+  static uint32_t Encode(Handle value) {
+    if (!value) return 0;
+    std::lock_guard lock(mutex);
+    if (auto found = guest.find(value); found != guest.end()) return found->second;
+    const uint32_t id = next++;
+    if (!id) std::abort();
+    native.emplace(id, value);
+    guest.emplace(value, id);
+    return id;
+  }
+  static Handle Decode(uint32_t value) {
+    if (!value) return nullptr;
+    std::lock_guard lock(mutex);
+    const auto found = native.find(value);
+    if (found == native.end()) std::abort();
+    return found->second;
+  }
+};
+#define VEXA_VULKAN32_HANDLE(Handle) \
+template<> struct host_layout<Handle> { \
+  Handle data; \
+  host_layout() = default; \
+  explicit host_layout(const guest_layout<Handle>& value) : data(VexaVulkan32Handles<Handle>::Decode(value.data)) {} \
+}; \
+inline guest_layout<Handle> to_guest(const host_layout<Handle>& value) { \
+  return {VexaVulkan32Handles<Handle>::Encode(value.data)}; \
+}
+VEXA_VULKAN32_HANDLE(VkInstance)
+VEXA_VULKAN32_HANDLE(VkPhysicalDevice)
+VEXA_VULKAN32_HANDLE(VkDevice)
+VEXA_VULKAN32_HANDLE(VkQueue)
+VEXA_VULKAN32_HANDLE(VkCommandBuffer)
+VEXA_VULKAN32_HANDLE(VkExternalComputeQueueNV)
+#undef VEXA_VULKAN32_HANDLE
+#endif
+
 #include "thunkgen_host_libvulkan.inl"
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+static uint32_t (*vexaReserveVulkanAddress)(uint32_t);
+static void (*vexaReleaseVulkanAddress)(uint32_t, uint32_t);
+static void fexfn_impl_libvulkan_Vulkan_SetGuestMemoryCallbacks(uintptr_t reserve, uintptr_t reserve_unpack,
+                                                              uintptr_t release, uintptr_t release_unpack) {
+  MakeHostTrampolineForGuestFunctionAt(reserve, reserve_unpack, &vexaReserveVulkanAddress);
+  MakeHostTrampolineForGuestFunctionAt(release, release_unpack, &vexaReleaseVulkanAddress);
+}
+struct VexaVulkan32Memory {
+  VkDeviceSize size {};
+  uint32_t alias {}, aliasSize {};
+  bool exportable {};
+  int fd {-1};
+};
+static std::mutex vexaVulkan32MemoryMutex;
+static std::unordered_map<VkDeviceMemory, VexaVulkan32Memory> vexaVulkan32Memory;
+static std::unordered_map<VkDevice, VkPhysicalDeviceMemoryProperties> vexaVulkan32DeviceMemory;
+static void VexaUnmapVulkan32Alias(VkDeviceMemory memory) {
+  uint32_t alias = 0, size = 0;
+  {
+    std::lock_guard lock(vexaVulkan32MemoryMutex);
+    if (auto found = vexaVulkan32Memory.find(memory); found != vexaVulkan32Memory.end()) {
+      alias = std::exchange(found->second.alias, 0);
+      size = std::exchange(found->second.aliasSize, 0);
+    }
+  }
+  if (alias) vexaReleaseVulkanAddress(alias, size);
+}
+#endif
 
 #if defined(BUILD_ANDROID)
 // VEXA_FIXES: runtime ANativeWindow bridge (same contract as libEGL_Host.cpp)
@@ -49,6 +130,21 @@ struct guest_layout<VkDescriptorDataEXT> {
 #include <common/X11Manager.h>
 #endif
 
+#if defined(BUILD_ANDROID)
+static void VexaShaderLayerPaths() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const char *path = getenv("VEXA_SHADER_LAYER_PATH");
+    if (!path) return;
+    void *lib = dlopen("libgraphicsenv.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return;
+    auto get = reinterpret_cast<void*(*)()>(dlsym(lib, "_ZN7android11GraphicsEnv11getInstanceEv"));
+    auto set = reinterpret_cast<void(*)(void*, void*, const std::string&)>(dlsym(lib, "_ZN7android11GraphicsEnv13setLayerPathsEPNS_21NativeLoaderNamespaceERKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEE"));
+    if (get && set) set(get(), nullptr, std::string(path));
+    else fprintf(stderr, "[VEXA][SHADER] Android layer-path API unavailable\n");
+  });
+}
+#endif
 static bool SetupInstance {};
 static std::mutex SetupMutex {};
 
@@ -134,6 +230,16 @@ static bool VexaVkStableSwapchain(VkSwapchainKHR swapchain) {
 }
 #endif
 
+
+static bool VexaVkProfileEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("VEXA_VK_PROFILE");
+    const bool active = value && std::strcmp(value, "1") == 0;
+    if (active) fprintf(stderr, "[VEXA][VK-PERF] profile enabled\n");
+    return active;
+  }();
+  return enabled;
+}
 
 #if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
 #include <dirent.h>
@@ -249,15 +355,6 @@ static bool VexaRotProfileEnabled() {
   static const bool enabled = access("/data/data/com.critical.vexaemulator/files/vk_rotation_profile.flag", F_OK) == 0;
   return enabled;
 }
-static bool VexaVkProfileEnabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("VEXA_VK_PROFILE");
-    const bool active = value && std::strcmp(value, "1") == 0;
-    if (active) fprintf(stderr, "[VEXA][VK-PERF] profile enabled\n");
-    return active;
-  }();
-  return enabled;
-}
 static VkResult FEXFN_IMPL(vkAcquireNextImageKHR)(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
                                                 VkSemaphore semaphore, VkFence fence, uint32_t* image) {
   if(auto f=reinterpret_cast<PFN_vkAcquireNextImageKHR>(VexaX11Proc("vkAcquireNextImageKHR")))return f(device,swapchain,timeout,semaphore,fence,image);
@@ -362,6 +459,14 @@ static void fexfn_impl_libvulkan_Vulkan_SetGuestXDisplayString(uintptr_t, uintpt
 // struct to TypeCompatibility::Repackable even on 64-bit, so the unpacker still
 // calls these. The Android host impls ignore the foreign-WSI members.
 // Returning true from exit tells repack_wrapper nothing else needs doing.
+#ifdef IS_32BIT_THUNK
+void fex_custom_repack_entry(host_layout<VkAndroidSurfaceCreateInfoKHR>& host, const guest_layout<VkAndroidSurfaceCreateInfoKHR>&) {
+  host.data.window = nullptr;
+}
+bool fex_custom_repack_exit(guest_layout<VkAndroidSurfaceCreateInfoKHR>&, const host_layout<VkAndroidSurfaceCreateInfoKHR>&) {
+  return true;
+}
+#endif
 void fex_custom_repack_entry(host_layout<VkXcbSurfaceCreateInfoKHR>&, const guest_layout<VkXcbSurfaceCreateInfoKHR>&) {}
 bool fex_custom_repack_exit(guest_layout<VkXcbSurfaceCreateInfoKHR>&, const host_layout<VkXcbSurfaceCreateInfoKHR>&) {
   return true;
@@ -456,12 +561,25 @@ static VkResult fexfn_impl_libvulkan_vkCreateWaylandSurfaceKHR(VkInstance a_0, c
   return VexaCreateRuntimeVulkanSurface(a_0, nullptr, a_3);
 }
 
-static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice, uint32_t, guest_layout<xcb_connection_t*>,
-                                                                                  xcb_visualid_t) {
-  return VK_TRUE;
+static VkBool32 VexaX11PresentationSupport(VkPhysicalDevice physical, uint32_t family) {
+  if (!VexaRealX11()) return VK_TRUE;
+  auto get = LDR_PTR(vkGetPhysicalDeviceQueueFamilyProperties);
+  if (!get) return VK_FALSE;
+  uint32_t count = 0;
+  get(physical, &count, nullptr);
+  if (family >= count) return VK_FALSE;
+  std::vector<VkQueueFamilyProperties> properties(count);
+  get(physical, &count, properties.data());
+  return family < count && properties[family].queueCount &&
+         (properties[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) ? VK_TRUE : VK_FALSE;
 }
-static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice, uint32_t, guest_layout<Display*>, VisualID) {
-  return VK_TRUE;
+
+static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physical, uint32_t family, guest_layout<xcb_connection_t*>,
+                                                                                  xcb_visualid_t) {
+  return VexaX11PresentationSupport(physical, family);
+}
+static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physical, uint32_t family, guest_layout<Display*>, VisualID) {
+  return VexaX11PresentationSupport(physical, family);
 }
 static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice, uint32_t, wl_display*) {
   return VK_TRUE;
@@ -484,15 +602,24 @@ static VkResult fexfn_impl_libvulkan_vkCreateDisplayPlaneSurfaceKHR(VkInstance, 
 // vkCreateAndroidSurfaceKHR on the same window returns NATIVE_WINDOW_IN_USE.
 // Wayland stays advertised; wl_display_connect fails closed, so no second surface.
 // xlib and wayland create entry points remain for a guest that uses only one of them.
+// VEXA_REAL_X11=1 uses one synthetic surface, so xlib is advertised only then.
+// vkCreateInstance still strips it: Android has no xlib ICD.
 static const VkExtensionProperties kVexaSpoofedInstanceExts[] = {
   {VK_KHR_XCB_SURFACE_EXTENSION_NAME, VK_KHR_XCB_SURFACE_SPEC_VERSION},
   {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
 };
 static constexpr uint32_t kVexaSpoofedInstanceExtCount = sizeof(kVexaSpoofedInstanceExts) / sizeof(kVexaSpoofedInstanceExts[0]);
+static uint32_t VexaSpoofedInstanceExtCount() {
+  return kVexaSpoofedInstanceExtCount + (VexaRealX11() ? 1u : 0u);
+}
+static VkExtensionProperties VexaSpoofedInstanceExt(uint32_t index) {
+  if (index < kVexaSpoofedInstanceExtCount) return kVexaSpoofedInstanceExts[index];
+  return {VK_KHR_XLIB_SURFACE_EXTENSION_NAME, VK_KHR_XLIB_SURFACE_SPEC_VERSION};
+}
 
 static VkResult FEXFN_IMPL(vkEnumerateInstanceExtensionProperties)(const char* a_0, uint32_t* a_1, VkExtensionProperties* a_2) {
   const bool spoof = a_0 == nullptr || a_0[0] == '\0';
-  const uint32_t extra = spoof ? kVexaSpoofedInstanceExtCount : 0;
+  const uint32_t extra = spoof ? VexaSpoofedInstanceExtCount() : 0;
   if (!a_2) {
     uint32_t host_count = 0;
     VkResult ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &host_count, nullptr);
@@ -520,8 +647,8 @@ static VkResult FEXFN_IMPL(vkEnumerateInstanceExtensionProperties)(const char* a
   }
   uint32_t written = host_write;
   if (spoof) {
-    for (uint32_t i = 0; i < kVexaSpoofedInstanceExtCount && written < capacity; ++i) {
-      a_2[written] = kVexaSpoofedInstanceExts[i];
+    for (uint32_t i = 0; i < extra && written < capacity; ++i) {
+      a_2[written] = VexaSpoofedInstanceExt(i);
       ++written;
     }
   }
@@ -617,6 +744,9 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
 // The device create info does not carry the physical device, and swapchain
 // extent checks need it for vkGetPhysicalDeviceSurfaceCapabilitiesKHR.
 static VkPhysicalDevice g_vexa_physical_device = VK_NULL_HANDLE;
+#ifdef IS_32BIT_THUNK
+#include "vulkan_inline_shaders.inc"
+#endif
 #ifndef IS_32BIT_THUNK
 static void VexaDestroyPassProfiles(VkDevice device);
 #include "vulkan_prerotate.inc"
@@ -625,6 +755,7 @@ static void VexaDestroyPassProfiles(VkDevice device);
 #include "vulkan_shader_opt.inc"
 #endif
 #include "vulkan_spirv_fixes.inc"
+
 
 static VkResult fexfn_impl_libvulkan_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice a_0, VkSurfaceKHR a_1, VkSurfaceCapabilitiesKHR* a_2) {
   if(auto f=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(VexaX11Proc("vkGetPhysicalDeviceSurfaceCapabilitiesKHR")))return f(a_0,a_1,a_2);
@@ -769,6 +900,19 @@ static VkResult fexfn_impl_libvulkan_vkCreateSwapchainKHR(VkDevice a_0, const Vk
 #endif
 
 #if defined(BUILD_ANDROID)
+#ifdef IS_32BIT_THUNK
+static VkResult FEXFN_IMPL(vkAcquireNextImageKHR)(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                                VkSemaphore semaphore, VkFence fence, uint32_t* image) {
+  if (auto fn = reinterpret_cast<PFN_vkAcquireNextImageKHR>(VexaX11Proc("vkAcquireNextImageKHR")))
+    return fn(device, swapchain, timeout, semaphore, fence, image);
+  if (VexaVkSurfaceLost(swapchain)) return VK_ERROR_SURFACE_LOST_KHR;
+  return LDR_PTR(vkAcquireNextImageKHR)(device, swapchain, timeout, semaphore, fence, image);
+}
+static VkResult FEXFN_IMPL(vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* info) {
+  if (auto fn = reinterpret_cast<PFN_vkQueuePresentKHR>(VexaX11Proc("vkQueuePresentKHR"))) return fn(queue, info);
+  return LDR_PTR(vkQueuePresentKHR)(queue, info);
+}
+#endif
 #define VEXA_WSI_RETURN(name,params,args) static VkResult FEXFN_IMPL(name) params {auto bridge=reinterpret_cast<PFN_##name>(VexaX11Proc(#name));return bridge?bridge args:LDR_PTR(name) args;}
 #define VEXA_WSI_VOID(name,params,args) static void FEXFN_IMPL(name) params {auto bridge=reinterpret_cast<PFN_##name>(VexaX11Proc(#name));if(bridge)bridge args;else LDR_PTR(name) args;}
 VEXA_WSI_RETURN(vkAcquireNextImage2KHR,(VkDevice a,const VkAcquireNextImageInfoKHR *b,uint32_t *c),(a,b,c))
@@ -802,7 +946,9 @@ VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceSupportKHR,(VkPhysicalDevice a,uint32_
 VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfaceFormatsKHR,(VkPhysicalDevice a,VkSurfaceKHR b,uint32_t *c,VkSurfaceFormatKHR *d),(a,b,c,d))
 VEXA_WSI_RETURN(vkGetPhysicalDeviceSurfacePresentModesKHR,(VkPhysicalDevice a,VkSurfaceKHR b,uint32_t *c,VkPresentModeKHR *d),(a,b,c,d))
 VEXA_WSI_RETURN(vkCreateRenderPass,(VkDevice a,const VkRenderPassCreateInfo *b,const VkAllocationCallbacks *c,VkRenderPass *d),(a,b,c,d))
+#ifndef IS_32BIT_THUNK
 VEXA_WSI_VOID(vkCmdPipelineBarrier,(VkCommandBuffer a,VkPipelineStageFlags b,VkPipelineStageFlags c,VkDependencyFlags d,uint32_t e,const VkMemoryBarrier *f,uint32_t g,const VkBufferMemoryBarrier *h,uint32_t i,const VkImageMemoryBarrier *j),(a,b,c,d,e,f,g,h,i,j))
+#endif
 #endif
 
 // Functions with callbacks are overridden to ignore the guest-side callbacks
@@ -862,6 +1008,9 @@ DummyVkDebugReportCallback(VkDebugReportFlagsEXT, VkDebugReportObjectTypeEXT, ui
 }
 
 static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, const VkAllocationCallbacks* a_1, guest_layout<VkInstance*> a_2) {
+#if defined(BUILD_ANDROID)
+  VexaShaderLayerPaths();
+#endif
   const VkInstanceCreateInfo* vk_struct_base = a_0;
   for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;
        vk_struct = vk_struct->pNext) {
@@ -902,6 +1051,22 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   if(VexaRealX11()){for(const char *name:{"VK_KHR_external_memory_capabilities","VK_KHR_get_physical_device_properties2"})if(std::none_of(filtered_exts.begin(),filtered_exts.end(),[&](const char *e){return strcmp(e,name)==0;}))filtered_exts.push_back(name);}
   patched.enabledExtensionCount = static_cast<uint32_t>(filtered_exts.size());
   patched.ppEnabledExtensionNames = filtered_exts.data();
+  std::vector<const char*> cacheLayers;
+  if (patched.enabledLayerCount) cacheLayers.assign(patched.ppEnabledLayerNames, patched.ppEnabledLayerNames + patched.enabledLayerCount);
+  if (std::getenv("VEXA_SHADER_CACHE_DIR")) {
+    uint32_t count = 0;
+    if (LDR_PTR(vkEnumerateInstanceLayerProperties)(&count, nullptr) == VK_SUCCESS) {
+      std::vector<VkLayerProperties> available(count);
+      if (LDR_PTR(vkEnumerateInstanceLayerProperties)(&count, available.data()) == VK_SUCCESS &&
+          std::any_of(available.begin(), available.end(), [](const auto &l) { return !strcmp(l.layerName, "VK_LAYER_fossilize"); })) {
+        cacheLayers.push_back("VK_LAYER_fossilize");
+        const auto status = std::string(getenv("VEXA_SHADER_CACHE_DIR")) + "/layer-enabled.txt";
+        if (FILE *file = fopen(status.c_str(), "w")) { fputs("VK_LAYER_fossilize\n", file); fclose(file); }
+        patched.enabledLayerCount = cacheLayers.size(); patched.ppEnabledLayerNames = cacheLayers.data();
+        fprintf(stderr, "[VEXA][SHADER] Fossilize capture and persistent pipeline cache enabled\n");
+      } else fprintf(stderr, "[VEXA][SHADER] Fossilize layer unavailable\n");
+    }
+  }
   patched.flags &= ~static_cast<VkInstanceCreateFlags>(VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR);
   vk_struct_base = &patched;
 #endif
@@ -917,10 +1082,15 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
 #if defined(BUILD_ANDROID)
   g_vexa_physical_device = a_0;
 #endif
-  VkDevice out;
+  VkDevice out {};
   const VkDeviceCreateInfo *effective=a_1;
 #if defined(BUILD_ANDROID)
   VkDeviceCreateInfo patched=*a_1;std::vector<const char*> extensions;if(a_1->enabledExtensionCount)extensions.assign(a_1->ppEnabledExtensionNames,a_1->ppEnabledExtensionNames+a_1->enabledExtensionCount);
+#ifdef IS_32BIT_THUNK
+  for (const char* name : {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf"})
+    if (std::none_of(extensions.begin(), extensions.end(), [&](const char* e) { return !strcmp(e, name); })) extensions.push_back(name);
+  patched.enabledExtensionCount = extensions.size(); patched.ppEnabledExtensionNames = extensions.data(); effective = &patched;
+#endif
   if(VexaRealX11()){for(const char *name:{"VK_ANDROID_external_memory_android_hardware_buffer","VK_EXT_queue_family_foreign","VK_KHR_external_memory","VK_KHR_dedicated_allocation","VK_KHR_get_memory_requirements2"}){if(std::none_of(extensions.begin(),extensions.end(),[&](const char *e){return strcmp(e,name)==0;}))extensions.push_back(name);}patched.enabledExtensionCount=extensions.size();patched.ppEnabledExtensionNames=extensions.data();effective=&patched;}
 #endif
 #if defined(BUILD_ANDROID) && !defined(IS_32BIT_THUNK)
@@ -957,15 +1127,41 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
     }
   }
 #endif
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  fprintf(stderr, "[VEXA][VK32] create-device begin queues=%u extensions=%u\n", effective->queueCreateInfoCount, effective->enabledExtensionCount);
+#endif
   auto ret = LDR_PTR(vkCreateDevice)(a_0, effective, nullptr, &out);
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  fprintf(stderr, "[VEXA][VK32] create-device native result=%d device=%p\n", ret, out);
+#endif
+  if (ret != VK_SUCCESS) {
+    *a_3.get_pointer() = to_guest(to_host_layout(out));
+    fprintf(stderr, "[VEXA][VK] vkCreateDevice failed: %d\n", ret);
+    return ret;
+  }
 #if defined(BUILD_ANDROID)
   if(ret==VK_SUCCESS){using Register=void(*)(VkPhysicalDevice,VkDevice,const VkDeviceCreateInfo*);if(auto f=reinterpret_cast<Register>(VexaX11Proc("VexaRegisterX11Device")))f(a_0,out,effective);}
+#ifdef IS_32BIT_THUNK
+  fprintf(stderr, "[VEXA][VK32] create-device WSI registered\n");
+#endif
 #ifndef IS_32BIT_THUNK
   if (ret == VK_SUCCESS) VexaRotRecordDevice(out, effective, rotationTimeline);
 #endif
 #endif
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  if (ret == VK_SUCCESS) {
+    VkPhysicalDeviceMemoryProperties properties {};
+    LDR_PTR(vkGetPhysicalDeviceMemoryProperties)(a_0, &properties);
+    std::lock_guard lock(vexaVulkan32MemoryMutex);
+    vexaVulkan32DeviceMemory[out] = properties;
+    fprintf(stderr, "[VEXA][VK32] create-device memory properties cached\n");
+  }
+#endif
   *a_3.get_pointer() = to_guest(to_host_layout(out));
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  fprintf(stderr, "[VEXA][VK32] create-device guest handle encoded\n");
+#endif
   // Reload device-specific function pointers used in custom implementations.
   // This is only done in advance for functions that don't take a VkDevice
   // argument. Since this breaks multi-device scenarios, other functions reload
@@ -991,15 +1187,38 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
     VEXA_X11_QUEUE_GATE(vkQueueSubmit);
     VEXA_X11_QUEUE_GATE(vkQueueSubmit2);
     VEXA_X11_QUEUE_GATE(vkQueueSubmit2KHR);
+#ifndef IS_32BIT_THUNK
     VEXA_X11_QUEUE_GATE(vkQueueBindSparse);
+#endif
+#ifndef IS_32BIT_THUNK
+    // Semaphore object identity for the present-hang trace. The wrapper
+    // calls the ICD through its own dlsym, so this does not recurse.
+    VEXA_X11_QUEUE_GATE(vkCreateSemaphore);
+    VEXA_X11_QUEUE_GATE(vkDestroySemaphore);
+#endif
     VEXA_X11_QUEUE_GATE(vkQueueWaitIdle);
     VEXA_X11_QUEUE_GATE(vkDeviceWaitIdle);
     VEXA_X11_QUEUE_GATE(vkDestroyDevice);
 #undef VEXA_X11_QUEUE_GATE
   }
 #endif
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  fprintf(stderr, "[VEXA][VK32] create-device complete\n");
+#endif
   return ret;
 }
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+static VkResult FEXFN_IMPL(vkCreateBuffer)(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks*, VkBuffer* buffer) {
+  auto fn = reinterpret_cast<PFN_vkCreateBuffer>(LDR_PTR(vkGetDeviceProcAddr)(device, "vkCreateBuffer"));
+  for (auto node = static_cast<const VkBaseInStructure*>(info->pNext); node; node = node->pNext)
+    if (node->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO) return fn(device, info, nullptr, buffer);
+  VkExternalMemoryBufferCreateInfo external {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, info->pNext, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+  VkBufferCreateInfo patched = *info; patched.pNext = &external;
+  return fn(device, &patched, nullptr, buffer);
+}
+
+#endif
 
 static VkResult FEXFN_IMPL(vkAllocateMemory)(VkDevice a_0, const VkMemoryAllocateInfo* a_1, const VkAllocationCallbacks* a_2, VkDeviceMemory* a_3) {
   (void*&)LDR_PTR(vkAllocateMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkAllocateMemory");
@@ -1014,7 +1233,71 @@ static VkResult FEXFN_IMPL(vkAllocateMemory)(VkDevice a_0, const VkMemoryAllocat
     }
   }
 #endif
-  return LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);
+  const VkMemoryAllocateInfo* effective = a_1;
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  bool hostVisible = false, hostCached = false, exportable = false, hasExport = false, hasImport = false, dedicatedImage = false;
+  int importedDmaFd = -1;
+  { std::lock_guard lock(vexaVulkan32MemoryMutex);
+    const auto found = vexaVulkan32DeviceMemory.find(a_0);
+    hostVisible = found != vexaVulkan32DeviceMemory.end() && a_1->memoryTypeIndex < found->second.memoryTypeCount &&
+      (found->second.memoryTypes[a_1->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    hostCached = found != vexaVulkan32DeviceMemory.end() && a_1->memoryTypeIndex < found->second.memoryTypeCount &&
+      (found->second.memoryTypes[a_1->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+  }
+  for (auto next = static_cast<const VkBaseInStructure*>(a_1->pNext); next; next = next->pNext) {
+    if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+      dedicatedImage = reinterpret_cast<const VkMemoryDedicatedAllocateInfo*>(next)->image != VK_NULL_HANDLE;
+    if (next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) {
+      hasImport = true;
+      const auto imported = reinterpret_cast<const VkImportMemoryFdInfoKHR*>(next);
+      if (imported->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+        importedDmaFd = imported->fd;
+    } else if (next->sType == VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID ||
+               next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT) {
+      hasImport = true;
+    }
+    if (next->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO) {
+      hasExport = true;
+      exportable = (reinterpret_cast<const VkExportMemoryAllocateInfo*>(next)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0;
+    }
+  }
+  int backingFd = importedDmaFd >= 0 ? fcntl(importedDmaFd, F_DUPFD_CLOEXEC, 0) : -1, importFd = -1;
+  if (hostVisible && !hasExport && !hasImport && !dedicatedImage) {
+    int heap = open(hostCached ? "/dev/dma_heap/system" : "/dev/dma_heap/system-uncached", O_RDONLY | O_CLOEXEC);
+    if (heap >= 0) {
+      dma_heap_allocation_data allocation {};
+      allocation.len = a_1->allocationSize;
+      allocation.fd_flags = O_RDWR | O_CLOEXEC;
+      if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &allocation) == 0) backingFd = allocation.fd;
+      close(heap);
+    }
+    if (backingFd >= 0) importFd = fcntl(backingFd, F_DUPFD_CLOEXEC, 0);
+  }
+  VkImportMemoryFdInfoKHR importInfo {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, a_1->pNext, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, importFd};
+  VkMemoryAllocateInfo patched = *a_1;
+  if (importFd >= 0) { patched.pNext = &importInfo; effective = &patched; }
+  else if (hostVisible && !hasExport && !hasImport && !dedicatedImage) {
+    fprintf(stderr, "[VEXA][VK32] dma-heap allocation failed bytes=%llu errno=%d\n", (unsigned long long)a_1->allocationSize, errno);
+    if (backingFd >= 0) close(backingFd);
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  }
+#endif
+  const VkResult result = LDR_PTR(vkAllocateMemory)(a_0, effective, nullptr, a_3);
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  if (result == VK_SUCCESS) {
+    std::lock_guard lock(vexaVulkan32MemoryMutex);
+    vexaVulkan32Memory[*a_3].size = a_1->allocationSize;
+    vexaVulkan32Memory[*a_3].exportable = exportable;
+    vexaVulkan32Memory[*a_3].fd = backingFd;
+    static std::atomic<uint32_t> allocationLogs {0};
+    if (allocationLogs.fetch_add(1) < 16)
+    fprintf(stderr, "[VEXA][VK32] allocation type=%u bytes=%llu hostVisible=%d exportable=%d\n", a_1->memoryTypeIndex, (unsigned long long)a_1->allocationSize, hostVisible, exportable);
+  } else {
+    if (importFd >= 0) close(importFd);
+    if (backingFd >= 0) close(backingFd);
+  }
+#endif
+  return result;
 }
 
 #if defined(BUILD_ANDROID)
@@ -1109,7 +1392,6 @@ static void FEXFN_IMPL(vkGetDeviceImageMemoryRequirementsKHR)(VkDevice a_0, cons
   }
 }
 
-#ifndef IS_32BIT_THUNK
 static void FEXFN_IMPL(vkGetBufferMemoryRequirements2)(VkDevice a_0, const VkBufferMemoryRequirementsInfo2* a_1,
                                                         VkMemoryRequirements2* a_2) {
   (void*&)LDR_PTR(vkGetBufferMemoryRequirements2) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkGetBufferMemoryRequirements2");
@@ -1139,9 +1421,17 @@ static void FEXFN_IMPL(vkGetDeviceImageMemoryRequirements)(VkDevice a_0, const V
   }
 }
 #endif
-#endif
 
 static void FEXFN_IMPL(vkFreeMemory)(VkDevice a_0, VkDeviceMemory a_1, const VkAllocationCallbacks* a_2) {
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  VexaUnmapVulkan32Alias(a_1);
+  { std::lock_guard lock(vexaVulkan32MemoryMutex);
+    if (auto found = vexaVulkan32Memory.find(a_1); found != vexaVulkan32Memory.end()) {
+      if (found->second.fd >= 0) close(found->second.fd);
+      vexaVulkan32Memory.erase(found);
+    }
+  }
+#endif
   (void*&)LDR_PTR(vkFreeMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkFreeMemory");
   LDR_PTR(vkFreeMemory)(a_0, a_1, nullptr);
 }
@@ -1194,6 +1484,15 @@ void fexfn_impl_libvulkan_vkGetDeviceQueue(VkDevice device, uint32_t family_inde
   *queue.get_pointer() = to_guest(to_host_layout(out));
 }
 
+#if defined(BUILD_ANDROID)
+static void FEXFN_IMPL(vkGetDeviceQueue2)(VkDevice device, const VkDeviceQueueInfo2* info, guest_layout<VkQueue*> queue) {
+  VkQueue out {};
+  auto fn = reinterpret_cast<PFN_vkGetDeviceQueue2>(LDR_PTR(vkGetDeviceProcAddr)(device, "vkGetDeviceQueue2"));
+  if (fn) fn(device, info, &out);
+  *queue.get_pointer() = to_guest(to_host_layout(out));
+}
+#endif
+
 VkResult fexfn_impl_libvulkan_vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* info,
                                                        guest_layout<VkCommandBuffer*> buffers) {
   std::vector<VkCommandBuffer> out(info->commandBufferCount);
@@ -1214,11 +1513,59 @@ VkResult fexfn_impl_libvulkan_vkMapMemory(VkDevice device, VkDeviceMemory memory
   (void*&)fexldr_ptr_libvulkan_vkMapMemory = (void*)LDR_PTR(vkGetDeviceProcAddr)(device, "vkMapMemory");
   auto ret = fexldr_ptr_libvulkan_vkMapMemory(device, memory, offset, size, flags, &mapped);
   if (ret == VK_SUCCESS) {
+#if defined(BUILD_ANDROID)
+    if (reinterpret_cast<uintptr_t>(mapped) > UINT32_MAX) {
+      VkDeviceSize allocationSize = 0;
+      bool exportable = false;
+      int backingFd = -1;
+      { std::lock_guard lock(vexaVulkan32MemoryMutex); allocationSize = vexaVulkan32Memory[memory].size; exportable = vexaVulkan32Memory[memory].exportable; backingFd = vexaVulkan32Memory[memory].fd; }
+      const size_t page = sysconf(_SC_PAGESIZE);
+      const VkDeviceSize fileOffset = offset & ~(VkDeviceSize(page) - 1);
+      const size_t delta = offset - fileOffset;
+      const VkDeviceSize bytes = size == VK_WHOLE_SIZE ? allocationSize - offset : size;
+      const uint64_t length = (bytes + delta + page - 1) & ~(uint64_t(page) - 1);
+      uint32_t address = 0;
+      if (length && length <= UINT32_MAX && vexaReserveVulkanAddress && vexaReleaseVulkanAddress)
+        {
+        address = vexaReserveVulkanAddress(static_cast<uint32_t>(length));
+      }
+      void* alias = MAP_FAILED;
+      if (address && address != UINT32_MAX && backingFd >= 0) {
+        alias = mmap(reinterpret_cast<void*>(uintptr_t(address)), length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, backingFd, fileOffset);
+      } else if (address && address != UINT32_MAX && exportable) {
+        auto getFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(LDR_PTR(vkGetDeviceProcAddr)(device, "vkGetMemoryFdKHR"));
+        VkMemoryGetFdInfoKHR fdInfo {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, nullptr, memory, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        int fd = -1;
+        const VkResult fdResult = getFd ? getFd(device, &fdInfo, &fd) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        fprintf(stderr, "[VEXA][VK32] fd-map result=%d fd=%d address=%x exportable=%d\n", fdResult, fd, address, exportable);
+        if (fdResult == VK_SUCCESS && fd >= 0) {
+          alias = mmap(reinterpret_cast<void*>(uintptr_t(address)), length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, fileOffset);
+          close(fd);
+        }
+      }
+      if (alias == MAP_FAILED) {
+        fprintf(stderr, "[VEXA][VK32] shared low-address mapping failed: native=%p bytes=%llu address=%x exportable=%d errno=%d\n", mapped, (unsigned long long)length, address, exportable, errno);
+        if (address && address != UINT32_MAX) vexaReleaseVulkanAddress(address, static_cast<uint32_t>(length));
+        auto unmap = reinterpret_cast<PFN_vkUnmapMemory>(LDR_PTR(vkGetDeviceProcAddr)(device, "vkUnmapMemory"));
+        unmap(device, memory);
+        return VK_ERROR_MEMORY_MAP_FAILED;
+      }
+      { std::lock_guard lock(vexaVulkan32MemoryMutex); auto& entry = vexaVulkan32Memory[memory]; entry.alias = address; entry.aliasSize = length; }
+      mapped = reinterpret_cast<void*>(uintptr_t(address) + delta);
+    }
+#endif
     host_data.data = mapped;
     *data.get_pointer() = to_guest(host_data);
   }
   return ret;
 }
+
+#if defined(BUILD_ANDROID)
+static void FEXFN_IMPL(vkUnmapMemory)(VkDevice device, VkDeviceMemory memory) {
+  VexaUnmapVulkan32Alias(memory);
+  LDR_PTR(vkUnmapMemory)(device, memory);
+}
+#endif
 
 // Allocates storage on the heap that must be de-allocated using delete[] or DeleteRepackedStructArray
 template<bool NeedsRepack = true, typename T>
@@ -1242,10 +1589,155 @@ std::span<std::remove_cv_t<T>> RepackStructArray(uint32_t Count, const guest_lay
 template<typename T>
 void DeleteRepackedStructArray(uint32_t Count, T* HostData, guest_layout<T*>& GuestData) {
   for (uint32_t i = 0; i < Count; ++i) {
-    fex_apply_custom_repacking_exit(GuestData.get_pointer()[i], to_host_layout(HostData[i]));
+    if constexpr (std::is_const_v<T>) {
+      auto scratch = GuestData.get_pointer()[i];
+      fex_apply_custom_repacking_exit(scratch, to_host_layout(HostData[i]));
+    } else {
+      fex_apply_custom_repacking_exit(GuestData.get_pointer()[i], to_host_layout(HostData[i]));
+    }
   }
   delete[] HostData;
 }
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+static void FEXFN_IMPL(vkCmdExecuteCommands)(VkCommandBuffer command, uint32_t count, guest_layout<const VkCommandBuffer*> secondary) {
+  auto native = RepackStructArray<false>(count, secondary);
+  LDR_PTR(vkCmdExecuteCommands)(command, count, native.data());
+  delete[] native.data();
+}
+static VkResult FEXFN_IMPL(vkCreateGraphicsPipelines)(VkDevice device, VkPipelineCache cache, uint32_t count,
+    guest_layout<const VkGraphicsPipelineCreateInfo*> infos, const VkAllocationCallbacks*, VkPipeline* output) {
+  auto native = RepackStructArray(count, infos);
+  std::vector<VkShaderModule> modules;
+  VkResult result = VK_SUCCESS;
+  for (auto& pipeline : native) {
+    for (uint32_t j = 0; j < pipeline.stageCount; ++j) {
+      auto& stage = const_cast<VkPipelineShaderStageCreateInfo&>(pipeline.pStages[j]);
+      result = VexaMaterializeStage(device, stage, modules);
+      if (result != VK_SUCCESS) break;
+    }
+    if (result != VK_SUCCESS) break;
+  }
+  if (result == VK_SUCCESS)
+    result = LDR_PTR(vkCreateGraphicsPipelines)(device, cache, count, native.data(), nullptr, output);
+  VexaDestroyStageModules(device, modules);
+  DeleteRepackedStructArray(count, static_cast<const typename decltype(native)::element_type*>(native.data()), infos);
+  return result;
+}
+static VkResult FEXFN_IMPL(vkCreateComputePipelines)(VkDevice device, VkPipelineCache cache, uint32_t count,
+    guest_layout<const VkComputePipelineCreateInfo*> infos, const VkAllocationCallbacks*, VkPipeline* output) {
+  auto native = RepackStructArray(count, infos);
+  for (uint32_t i = 0; i < count; ++i) {
+    auto stage = to_host_layout(native[i].stage);
+    fex_apply_custom_repacking_entry(stage, infos.get_pointer()[i].data.stage);
+    native[i].stage = stage.data;
+  }
+  std::vector<VkShaderModule> modules;
+  VkResult result = VK_SUCCESS;
+  for (auto& pipeline : native) {
+    result = VexaMaterializeStage(device, pipeline.stage, modules);
+    if (result != VK_SUCCESS) break;
+  }
+  if (result == VK_SUCCESS)
+    result = LDR_PTR(vkCreateComputePipelines)(device, cache, count, native.data(), nullptr, output);
+  VexaDestroyStageModules(device, modules);
+  for (uint32_t i = 0; i < count; ++i)
+    fex_apply_custom_repacking_exit(infos.get_pointer()[i].data.stage, to_host_layout(native[i].stage));
+  DeleteRepackedStructArray(count, static_cast<const typename decltype(native)::element_type*>(native.data()), infos);
+  return result;
+}
+#endif
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+// Descriptor templates describe guest payload offsets, not native structures.
+// Keep their source layout and give the ICD a template for a native payload.
+struct VexaDescriptorTemplate32 {
+  std::vector<VkDescriptorUpdateTemplateEntry> guest, native;
+  size_t size {};
+};
+static std::mutex vexaDescriptorTemplateMutex;
+static std::unordered_map<VkDescriptorUpdateTemplate, VexaDescriptorTemplate32> vexaDescriptorTemplates;
+static size_t VexaDescriptorElementSize(VkDescriptorType type) {
+  switch (type) {
+    case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: return sizeof(VkDescriptorImageInfo);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return sizeof(VkDescriptorBufferInfo);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV: return sizeof(uint64_t);
+    case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: return 1;
+    default: return 0;
+  }
+}
+static VkResult FEXFN_IMPL(vkCreateDescriptorUpdateTemplate)(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo* info,
+    const VkAllocationCallbacks*, VkDescriptorUpdateTemplate* output) {
+  VexaDescriptorTemplate32 layout;
+  layout.guest.assign(info->pDescriptorUpdateEntries, info->pDescriptorUpdateEntries + info->descriptorUpdateEntryCount);
+  layout.native = layout.guest;
+  for (auto& entry : layout.native) {
+    const size_t stride = VexaDescriptorElementSize(entry.descriptorType);
+    if (!stride) return VK_ERROR_FEATURE_NOT_PRESENT;
+    layout.size = (layout.size + 7) & ~size_t(7);
+    entry.offset = layout.size;
+    entry.stride = stride;
+    if (entry.descriptorCount > (SIZE_MAX - layout.size) / stride) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    layout.size += entry.descriptorCount * stride;
+  }
+  auto patched = *info;
+  patched.pDescriptorUpdateEntries = layout.native.data();
+  const auto result = LDR_PTR(vkCreateDescriptorUpdateTemplate)(device, &patched, nullptr, output);
+  if (result == VK_SUCCESS) {
+    std::lock_guard lock(vexaDescriptorTemplateMutex);
+    vexaDescriptorTemplates.emplace(*output, std::move(layout));
+  }
+  return result;
+}
+static void FEXFN_IMPL(vkDestroyDescriptorUpdateTemplate)(VkDevice device, VkDescriptorUpdateTemplate descriptorTemplate, const VkAllocationCallbacks*) {
+  { std::lock_guard lock(vexaDescriptorTemplateMutex); vexaDescriptorTemplates.erase(descriptorTemplate); }
+  LDR_PTR(vkDestroyDescriptorUpdateTemplate)(device, descriptorTemplate, nullptr);
+}
+static std::vector<uint64_t> VexaRepackDescriptorTemplate32(VkDescriptorUpdateTemplate descriptorTemplate, const void* input) {
+  std::lock_guard lock(vexaDescriptorTemplateMutex);
+  const auto& layout = vexaDescriptorTemplates.at(descriptorTemplate);
+  std::vector<uint64_t> storage((layout.size + 7) / 8);
+  auto destination = reinterpret_cast<uint8_t*>(storage.data());
+  const auto source = static_cast<const uint8_t*>(input);
+  for (size_t i = 0; i < layout.guest.size(); ++i) {
+    const auto& guest = layout.guest[i];
+    const auto& native = layout.native[i];
+    for (uint32_t j = 0; j < guest.descriptorCount; ++j) {
+      const bool inlineData = guest.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+      const auto from = source + guest.offset + (inlineData ? j : j * guest.stride);
+      auto into = destination + native.offset + j * native.stride;
+      if (native.stride == sizeof(VkDescriptorImageInfo) &&
+          (guest.descriptorType <= VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || guest.descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)) {
+        VkDescriptorImageInfo image {};
+        memcpy(&image.sampler, from, 8);
+        memcpy(&image.imageView, from + 8, 8);
+        memcpy(&image.imageLayout, from + 16, 4);
+        memcpy(into, &image, sizeof(image));
+      } else memcpy(into, from, native.stride);
+    }
+  }
+  return storage;
+}
+static void FEXFN_IMPL(vkUpdateDescriptorSetWithTemplate)(VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate descriptorTemplate, const void* input) {
+  auto native = VexaRepackDescriptorTemplate32(descriptorTemplate, input);
+  LDR_PTR(vkUpdateDescriptorSetWithTemplate)(device, set, descriptorTemplate, native.data());
+}
+static VkResult FEXFN_IMPL(vkCreateDescriptorUpdateTemplateKHR)(VkDevice d, const VkDescriptorUpdateTemplateCreateInfo* i, const VkAllocationCallbacks* a, VkDescriptorUpdateTemplate* o) { return FEXFN_IMPL(vkCreateDescriptorUpdateTemplate)(d,i,a,o); }
+static void FEXFN_IMPL(vkDestroyDescriptorUpdateTemplateKHR)(VkDevice d, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks* a) { FEXFN_IMPL(vkDestroyDescriptorUpdateTemplate)(d,t,a); }
+static void FEXFN_IMPL(vkUpdateDescriptorSetWithTemplateKHR)(VkDevice d, VkDescriptorSet s, VkDescriptorUpdateTemplate t, const void* p) { FEXFN_IMPL(vkUpdateDescriptorSetWithTemplate)(d,s,t,p); }
+static void FEXFN_IMPL(vkCmdPushDescriptorSetWithTemplateKHR)(VkCommandBuffer b, VkDescriptorUpdateTemplate t, VkPipelineLayout l, uint32_t s, const void* p) {
+  auto native = VexaRepackDescriptorTemplate32(t,p);
+  LDR_PTR(vkCmdPushDescriptorSetWithTemplateKHR)(b,t,l,s,native.data());
+}
+static void FEXFN_IMPL(vkCmdPushDescriptorSetWithTemplate)(VkCommandBuffer b, VkDescriptorUpdateTemplate t, VkPipelineLayout l, uint32_t s, const void* p) {
+  auto native = VexaRepackDescriptorTemplate32(t,p);
+  LDR_PTR(vkCmdPushDescriptorSetWithTemplate)(b,t,l,s,native.data());
+}
+#endif
 
 void fexfn_impl_libvulkan_vkCmdSetVertexInputEXT(
   VkCommandBuffer Buffer, uint32_t BindingDescCount, guest_layout<const VkVertexInputBindingDescription2EXT*> GuestBindingDescs,
@@ -1263,6 +1755,23 @@ void fexfn_impl_libvulkan_vkCmdSetVertexInputEXT(
   delete[] BindingDescs.data();
 }
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+static void FEXFN_IMPL(vkCmdPipelineBarrier)(VkCommandBuffer command, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+    VkDependencyFlags dependency, uint32_t memoryCount, guest_layout<const VkMemoryBarrier*> memory,
+    uint32_t bufferCount, guest_layout<const VkBufferMemoryBarrier*> buffers,
+    uint32_t imageCount, guest_layout<const VkImageMemoryBarrier*> images) {
+  auto nativeMemory = RepackStructArray(memoryCount, memory);
+  auto nativeBuffers = RepackStructArray(bufferCount, buffers);
+  auto nativeImages = RepackStructArray(imageCount, images);
+  auto bridge = reinterpret_cast<PFN_vkCmdPipelineBarrier>(VexaX11Proc("vkCmdPipelineBarrier"));
+  auto call = bridge ? bridge : LDR_PTR(vkCmdPipelineBarrier);
+  call(command, src, dst, dependency, memoryCount, nativeMemory.data(), bufferCount, nativeBuffers.data(), imageCount, nativeImages.data());
+  DeleteRepackedStructArray<const VkMemoryBarrier>(memoryCount, nativeMemory.data(), memory);
+  DeleteRepackedStructArray<const VkBufferMemoryBarrier>(bufferCount, nativeBuffers.data(), buffers);
+  DeleteRepackedStructArray<const VkImageMemoryBarrier>(imageCount, nativeImages.data(), images);
+}
+#endif
+
 void fexfn_impl_libvulkan_vkUpdateDescriptorSets(VkDevice device, unsigned int descriptorWriteCount,
                                                  guest_layout<const VkWriteDescriptorSet*> pDescriptorWrites, unsigned int descriptorCopyCount,
                                                  guest_layout<const VkCopyDescriptorSet*> pDescriptorCopies) {
@@ -1274,8 +1783,8 @@ void fexfn_impl_libvulkan_vkUpdateDescriptorSets(VkDevice device, unsigned int d
   fexldr_ptr_libvulkan_vkUpdateDescriptorSets(device, descriptorWriteCount, HostDescriptorWrites.data(), descriptorCopyCount,
                                               HostDescriptorCopies.data());
 
-  delete[] HostDescriptorCopies.data();
-  delete[] HostDescriptorWrites.data();
+  DeleteRepackedStructArray<const VkCopyDescriptorSet>(descriptorCopyCount, HostDescriptorCopies.data(), pDescriptorCopies);
+  DeleteRepackedStructArray<const VkWriteDescriptorSet>(descriptorWriteCount, HostDescriptorWrites.data(), pDescriptorWrites);
 }
 
 VkResult fexfn_impl_libvulkan_vkQueueSubmit(VkQueue queue, uint32_t submit_count, guest_layout<const VkSubmitInfo*> submit_infos, VkFence fence) {
@@ -1302,6 +1811,53 @@ VkResult fexfn_impl_libvulkan_vkGetPipelineCacheData(VkDevice device, VkPipeline
   *guest_data_size.get_pointer() = data_size;
   return ret;
 }
+
+#if defined(BUILD_ANDROID)
+static void FEXFN_IMPL(vkGetPhysicalDeviceQueueFamilyProperties2)(VkPhysicalDevice device, uint32_t* count, guest_layout<VkQueueFamilyProperties2*> properties) {
+  if (!properties.get_pointer()) { LDR_PTR(vkGetPhysicalDeviceQueueFamilyProperties2)(device, count, nullptr); return; }
+  const uint32_t capacity = *count;
+  auto host = RepackStructArray(capacity, properties);
+  LDR_PTR(vkGetPhysicalDeviceQueueFamilyProperties2)(device, count, host.data());
+  for (uint32_t i = 0; i < capacity; ++i) {
+    // Repack all initialized elements to release their extension chains; only
+    // the returned count is semantically meaningful to the caller.
+    fex_apply_custom_repacking_exit(properties.get_pointer()[i], to_host_layout(host[i]));
+  }
+  delete[] host.data();
+}
+static VkResult FEXFN_IMPL(vkFlushMappedMemoryRanges)(VkDevice device, uint32_t count, guest_layout<const VkMappedMemoryRange*> ranges) {
+  auto host = RepackStructArray(count, ranges);
+  VkResult result = LDR_PTR(vkFlushMappedMemoryRanges)(device, count, host.data());
+  for (uint32_t i = 0; i < count; ++i) { auto original = ranges.get_pointer()[i]; fex_apply_custom_repacking_exit(original, to_host_layout(host[i])); }
+  delete[] host.data();
+  return result;
+}
+static VkResult FEXFN_IMPL(vkInvalidateMappedMemoryRanges)(VkDevice device, uint32_t count, guest_layout<const VkMappedMemoryRange*> ranges) {
+  auto host = RepackStructArray(count, ranges);
+  VkResult result = LDR_PTR(vkInvalidateMappedMemoryRanges)(device, count, host.data());
+  for (uint32_t i = 0; i < count; ++i) { auto original = ranges.get_pointer()[i]; fex_apply_custom_repacking_exit(original, to_host_layout(host[i])); }
+  delete[] host.data();
+  return result;
+}
+static VkResult VexaQueueSubmit2(VkQueue queue, uint32_t count, guest_layout<const VkSubmitInfo2*> infos, VkFence fence, bool alias) {
+  auto host = RepackStructArray(count, infos);
+  auto fn = reinterpret_cast<PFN_vkQueueSubmit2>(VexaX11Proc(alias ? "vkQueueSubmit2KHR" : "vkQueueSubmit2"));
+  if (!fn) fn = alias ? LDR_PTR(vkQueueSubmit2KHR) : LDR_PTR(vkQueueSubmit2);
+  const VkResult result = fn ? fn(queue, count, host.data(), fence) : VK_ERROR_EXTENSION_NOT_PRESENT;
+  for (uint32_t i = 0; i < host.size(); ++i) {
+    auto guest = infos.get_pointer()[i];
+    fex_apply_custom_repacking_exit(guest, to_host_layout(host[i]));
+  }
+  delete[] host.data();
+  return result;
+}
+static VkResult FEXFN_IMPL(vkQueueSubmit2)(VkQueue queue, uint32_t count, guest_layout<const VkSubmitInfo2*> infos, VkFence fence) {
+  return VexaQueueSubmit2(queue, count, infos, fence, false);
+}
+static VkResult FEXFN_IMPL(vkQueueSubmit2KHR)(VkQueue queue, uint32_t count, guest_layout<const VkSubmitInfo2*> infos, VkFence fence) {
+  return VexaQueueSubmit2(queue, count, infos, fence, true);
+}
+#endif
 
 #endif
 
@@ -1383,10 +1939,18 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdDispatch;
   } else if (a_1 == "vkCreateGraphicsPipelines"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateGraphicsPipelines;
+  } else if (a_1 == "vkCreateComputePipelines"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateComputePipelines;
   } else if (a_1 == "vkGetDeviceQueue"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceQueue;
   } else if (a_1 == "vkQueueSubmit"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkQueueSubmit;
+  } else if (a_1 == "vkQueueSubmit2"sv || a_1 == "vkQueueSubmit2KHR"sv ||
+             a_1 == "vkCreateSemaphore"sv || a_1 == "vkDestroySemaphore"sv) {
+    // Dispatch-table calls must hit the bridge. Gating LDR_PTR alone does not,
+    // because GetDeviceProcAddr would otherwise return the ICD pointer.
+    // A null bridge (real X11 off) falls through to the ICD.
+    return (PFN_vkVoidFunction)VexaX11Proc(a_1);
   } else if (a_1 == "vkDestroyDevice"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDevice;
   } else if (a_1 == "vkAcquireNextImageKHR"sv) {
@@ -1404,6 +1968,40 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
 #endif
 #endif
 #ifdef IS_32BIT_THUNK
+  } else if (a_1 == "vkCmdExecuteCommands"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdExecuteCommands;
+  } else if (a_1 == "vkCreateDescriptorUpdateTemplate"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDescriptorUpdateTemplate;
+  } else if (a_1 == "vkDestroyDescriptorUpdateTemplate"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDescriptorUpdateTemplate;
+  } else if (a_1 == "vkUpdateDescriptorSetWithTemplate"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkUpdateDescriptorSetWithTemplate;
+  } else if (a_1 == "vkCreateDescriptorUpdateTemplateKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDescriptorUpdateTemplateKHR;
+  } else if (a_1 == "vkDestroyDescriptorUpdateTemplateKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDescriptorUpdateTemplateKHR;
+  } else if (a_1 == "vkUpdateDescriptorSetWithTemplateKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkUpdateDescriptorSetWithTemplateKHR;
+  } else if (a_1 == "vkCmdPushDescriptorSetWithTemplateKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdPushDescriptorSetWithTemplateKHR;
+  } else if (a_1 == "vkCmdPushDescriptorSetWithTemplate"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCmdPushDescriptorSetWithTemplate;
+  } else if (a_1 == "vkCreateGraphicsPipelines"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateGraphicsPipelines;
+  } else if (a_1 == "vkCreateComputePipelines"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateComputePipelines;
+  } else if (a_1 == "vkAcquireNextImageKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAcquireNextImageKHR;
+  } else if (a_1 == "vkQueuePresentKHR"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkQueuePresentKHR;
+  } else if (a_1 == "vkQueueSubmit2"sv || a_1 == "vkQueueSubmit2KHR"sv) {
+    return a_1 == "vkQueueSubmit2"sv ? (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkQueueSubmit2 : (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkQueueSubmit2KHR;
+  } else if (a_1 == "vkGetBufferMemoryRequirements2"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetBufferMemoryRequirements2;
+  } else if (a_1 == "vkGetDeviceBufferMemoryRequirements"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceBufferMemoryRequirements;
+  } else if (a_1 == "vkGetDeviceImageMemoryRequirements"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkGetDeviceImageMemoryRequirements;
   } else if (a_1 == "vkAllocateCommandBuffers"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAllocateCommandBuffers;
   } else if (a_1 == "vkEnumeratePhysicalDevices"sv) {
@@ -1427,6 +2025,28 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
   return nullptr;
 }
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+static bool VexaBindVulkan32Proc(const char* name, PFN_vkVoidFunction address) {
+  static const auto imports = [] {
+    std::unordered_map<std::string_view, void**> result;
+#define VEXA_VK_IMPORT(n, slot) result[#n] = reinterpret_cast<void**>(&slot);
+    FOREACH_FEX_HOST_IMPORT(VEXA_VK_IMPORT);
+#undef VEXA_VK_IMPORT
+    return result;
+  }();
+  const auto found = imports.find(name);
+  if (!address || found == imports.end()) return false;
+  // Keep queue synchronization installed when GDPA refreshes native imports.
+  if (!strcmp(name, "vkQueueSubmit") || !strcmp(name, "vkQueueSubmit2") ||
+      !strcmp(name, "vkQueueSubmit2KHR") || !strcmp(name, "vkQueueWaitIdle") ||
+      !strcmp(name, "vkDeviceWaitIdle") || !strcmp(name, "vkDestroyDevice")) {
+    if (auto bridge = VexaX11Proc(name)) address = reinterpret_cast<PFN_vkVoidFunction>(bridge);
+  }
+  *found->second = reinterpret_cast<void*>(address);
+  return true;
+}
+#endif
+
 static PFN_vkVoidFunction FEXFN_IMPL(vkGetDeviceProcAddr)(VkDevice a_0, const char* a_1) {
   // Just return the host facing function pointer
   // The guest will handle mapping if this exists
@@ -1436,10 +2056,17 @@ static PFN_vkVoidFunction FEXFN_IMPL(vkGetDeviceProcAddr)(VkDevice a_0, const ch
     return ptr;
   }
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  return VexaBindVulkan32Proc(a_1, LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1)) ? reinterpret_cast<PFN_vkVoidFunction>(1) : nullptr;
+#else
   return LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1);
+#endif
 }
 
 static PFN_vkVoidFunction FEXFN_IMPL(vkGetInstanceProcAddr)(VkInstance a_0, const char* a_1) {
+#if defined(BUILD_ANDROID)
+  VexaShaderLayerPaths();
+#endif
   // Just return the host facing function pointer
   // The guest will handle mapping if it exists
 
@@ -1471,7 +2098,11 @@ static PFN_vkVoidFunction FEXFN_IMPL(vkGetInstanceProcAddr)(VkInstance a_0, cons
     return ptr;
   }
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  return VexaBindVulkan32Proc(a_1, LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1)) ? reinterpret_cast<PFN_vkVoidFunction>(1) : nullptr;
+#else
   return LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1);
+#endif
 }
 
 #ifdef IS_32BIT_THUNK
@@ -3096,7 +3727,7 @@ VULKAN_DEFAULT_CUSTOM_REPACK(VkVideoSessionMemoryRequirementsKHR)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkVideoSessionParametersCreateInfoKHR)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkVideoSessionParametersUpdateInfoKHR)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkWaylandSurfaceCreateInfoKHR)
-VULKAN_DEFAULT_CUSTOM_REPACK(VkWriteDescriptorSet) // TODO: This should be non-default instead
+VULKAN_NONDEFAULT_CUSTOM_REPACK(VkWriteDescriptorSet)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkWriteDescriptorSetAccelerationStructureKHR)
 VULKAN_DEFAULT_CUSTOM_REPACK(VkWriteDescriptorSetAccelerationStructureNV)
 // VULKAN_DEFAULT_CUSTOM_REPACK(VkWriteDescriptorSetInlineUniformBlock)
@@ -3108,13 +3739,47 @@ VULKAN_NONDEFAULT_CUSTOM_REPACK(VkXcbSurfaceCreateInfoKHR)
 VULKAN_NONDEFAULT_CUSTOM_REPACK(VkXlibSurfaceCreateInfoKHR)
 
 
+// Descriptor payloads are count-qualified arrays. In particular, i386
+// VkDescriptorImageInfo has a 20-byte stride while native AArch64 uses 24.
+static bool VexaImageDescriptor(VkDescriptorType type) {
+  switch (type) {
+  case VK_DESCRIPTOR_TYPE_SAMPLER:
+  case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+  case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+  case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+  case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+    return true;
+  default:
+    return false;
+  }
+}
+void fex_custom_repack_entry(host_layout<VkWriteDescriptorSet>& into, const guest_layout<VkWriteDescriptorSet>& from) {
+  default_fex_custom_repack_entry(into, from);
+  if (VexaImageDescriptor(into.data.descriptorType))
+    into.data.pImageInfo = RepackStructArray<false>(into.data.descriptorCount, from.data.pImageInfo).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkWriteDescriptorSet>& into, const host_layout<VkWriteDescriptorSet>& from) {
+  if (VexaImageDescriptor(from.data.descriptorType))
+    delete[] from.data.pImageInfo;
+  // pNext nodes can themselves contain guest pointers. Release through a
+  // scratch root so const caller inputs never receive native pointer values.
+  auto scratch = into;
+  default_fex_custom_repack_reverse(*reinterpret_cast<guest_layout<VkBaseOutStructure>*>(&scratch),
+                                    reinterpret_cast<const VkBaseOutStructure*>(&from.data));
+  return false;
+}
+
 void fex_custom_repack_entry(host_layout<VkInstanceCreateInfo>& into, const guest_layout<VkInstanceCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
 
-  auto HostApplicationInfo = new host_layout<VkApplicationInfo> {*from.data.pApplicationInfo.get_pointer()};
-  fex_apply_custom_repacking_entry(*HostApplicationInfo, *from.data.pApplicationInfo.get_pointer());
-
-  into.data.pApplicationInfo = &HostApplicationInfo->data;
+  // pApplicationInfo is optional, including driver/display-mode probes.
+  // Preserve nullptr rather than dereferencing a valid omitted structure.
+  into.data.pApplicationInfo = nullptr;
+  if (auto application = from.data.pApplicationInfo.get_pointer()) {
+    auto HostApplicationInfo = new host_layout<VkApplicationInfo> {*application};
+    fex_apply_custom_repacking_entry(*HostApplicationInfo, *application);
+    into.data.pApplicationInfo = &HostApplicationInfo->data;
+  }
 
   auto extension_count = from.data.enabledExtensionCount.data;
   into.data.ppEnabledExtensionNames = RepackStructArray<false>(extension_count, from.data.ppEnabledExtensionNames).data();
@@ -3142,12 +3807,9 @@ bool fex_custom_repack_exit(guest_layout<VkMemoryToImageCopyEXT>& into, const ho
 void fex_custom_repack_entry(host_layout<VkDeviceCreateInfo>& into, const guest_layout<VkDeviceCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
 
-  auto HostQueueCreateInfo = new host_layout<VkDeviceQueueCreateInfo> {*from.data.pQueueCreateInfos.get_pointer()};
-  fex_apply_custom_repacking_entry(*HostQueueCreateInfo, *from.data.pQueueCreateInfos.get_pointer());
-  into.data.pQueueCreateInfos = &HostQueueCreateInfo->data;
+  into.data.pQueueCreateInfos = RepackStructArray(from.data.queueCreateInfoCount.data, from.data.pQueueCreateInfos).data();
 
-  auto layer_count = from.data.enabledExtensionCount.data;
-  fprintf(stderr, "  Repacking %d ppEnabledLayerNames\n", layer_count);
+  auto layer_count = from.data.enabledLayerCount.data;
   into.data.ppEnabledLayerNames = RepackStructArray<false>(layer_count, from.data.ppEnabledLayerNames).data();
 
   auto extension_count = from.data.enabledExtensionCount.data;
@@ -3156,7 +3818,7 @@ void fex_custom_repack_entry(host_layout<VkDeviceCreateInfo>& into, const guest_
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDeviceCreateInfo>& into, const host_layout<VkDeviceCreateInfo>& from) {
-  delete from.data.pQueueCreateInfos;
+  delete[] from.data.pQueueCreateInfos;
   delete[] from.data.ppEnabledExtensionNames;
   delete[] from.data.ppEnabledLayerNames;
   return false;
@@ -3361,89 +4023,67 @@ bool fex_custom_repack_exit(guest_layout<VkDescriptorUpdateTemplateCreateInfo>& 
 
 void fex_custom_repack_entry(host_layout<VkPipelineShaderStageCreateInfo>& into, const guest_layout<VkPipelineShaderStageCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
-  if (from.data.pSpecializationInfo.get_pointer()) {
-    fprintf(stderr, "ERROR: Cannot repack non-null VkPipelineShaderStageCreateInfo::pSpecializationInfo yet");
-    std::abort();
+  into.data.pSpecializationInfo = nullptr;
+  if (auto raw = from.data.pSpecializationInfo.force_get_host_pointer()) {
+    // i386 size_t and pointers are 32 bits; map entries therefore have a
+    // different stride from the native VkSpecializationMapEntry array.
+    struct Info32 { uint32_t count, entries, size, data; };
+    struct Entry32 { uint32_t id, offset, size; };
+    const auto& input = *reinterpret_cast<const Info32*>(raw);
+    const auto entries = reinterpret_cast<const Entry32*>(uintptr_t(input.entries));
+    auto output = new VkSpecializationInfo {input.count, nullptr, input.size, reinterpret_cast<const void*>(uintptr_t(input.data))};
+    auto maps = new VkSpecializationMapEntry[input.count];
+    for (uint32_t i = 0; i < input.count; ++i) maps[i] = {entries[i].id, entries[i].offset, entries[i].size};
+    output->pMapEntries = maps;
+    into.data.pSpecializationInfo = output;
   }
 }
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineShaderStageCreateInfo>& into, const host_layout<VkPipelineShaderStageCreateInfo>& from) {
-  // TODO
+  if (from.data.pSpecializationInfo) {
+    delete[] from.data.pSpecializationInfo->pMapEntries;
+    delete from.data.pSpecializationInfo;
+  }
   return false;
 }
 
 void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, const guest_layout<VkGraphicsPipelineCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
   into.data.pStages = RepackStructArray(from.data.stageCount.data, from.data.pStages).data();
-
-  if (!from.data.pVertexInputState.get_pointer()) {
-    into.data.pVertexInputState = nullptr;
-  } else {
-    into.data.pVertexInputState = &(new host_layout<VkPipelineVertexInputStateCreateInfo> {*from.data.pVertexInputState.get_pointer()})->data;
-  }
-
-  if (!from.data.pInputAssemblyState.get_pointer()) {
-    into.data.pInputAssemblyState = nullptr;
-  } else {
-    into.data.pInputAssemblyState =
-      &(new host_layout<VkPipelineInputAssemblyStateCreateInfo> {*from.data.pInputAssemblyState.get_pointer()})->data;
-  }
-
-  if (!from.data.pTessellationState.get_pointer()) {
-    into.data.pTessellationState = nullptr;
-  } else {
-    into.data.pTessellationState = &(new host_layout<VkPipelineTessellationStateCreateInfo> {*from.data.pTessellationState.get_pointer()})->data;
-  }
-
-  if (!from.data.pViewportState.get_pointer()) {
-    into.data.pViewportState = nullptr;
-  } else {
-    into.data.pViewportState = &(new host_layout<VkPipelineViewportStateCreateInfo> {*from.data.pViewportState.get_pointer()})->data;
-  }
-
-  if (!from.data.pRasterizationState.get_pointer()) {
-    into.data.pRasterizationState = nullptr;
-  } else {
-    into.data.pRasterizationState =
-      &(new host_layout<VkPipelineRasterizationStateCreateInfo> {*from.data.pRasterizationState.get_pointer()})->data;
-  }
-
-  if (!from.data.pMultisampleState.get_pointer()) {
-    into.data.pMultisampleState = nullptr;
-  } else {
-    into.data.pMultisampleState = &(new host_layout<VkPipelineMultisampleStateCreateInfo> {*from.data.pMultisampleState.get_pointer()})->data;
-  }
-
-  if (!from.data.pDepthStencilState.get_pointer()) {
-    into.data.pDepthStencilState = nullptr;
-  } else {
-    into.data.pDepthStencilState = &(new host_layout<VkPipelineDepthStencilStateCreateInfo> {*from.data.pDepthStencilState.get_pointer()})->data;
-  }
-
-  if (!from.data.pColorBlendState.get_pointer()) {
-    into.data.pColorBlendState = nullptr;
-  } else {
-    into.data.pColorBlendState = &(new host_layout<VkPipelineColorBlendStateCreateInfo> {*from.data.pColorBlendState.get_pointer()})->data;
-  }
-
-  if (!from.data.pDynamicState.get_pointer()) {
-    into.data.pDynamicState = nullptr;
-  } else {
-    into.data.pDynamicState = &(new host_layout<VkPipelineDynamicStateCreateInfo> {*from.data.pDynamicState.get_pointer()})->data;
-  }
+  into.data.pVertexInputState = RepackStructArray(1, from.data.pVertexInputState).data();
+  into.data.pInputAssemblyState = RepackStructArray(1, from.data.pInputAssemblyState).data();
+  into.data.pTessellationState = RepackStructArray(1, from.data.pTessellationState).data();
+  into.data.pViewportState = RepackStructArray(1, from.data.pViewportState).data();
+  into.data.pRasterizationState = RepackStructArray(1, from.data.pRasterizationState).data();
+  into.data.pMultisampleState = RepackStructArray(1, from.data.pMultisampleState).data();
+  into.data.pDepthStencilState = RepackStructArray(1, from.data.pDepthStencilState).data();
+  into.data.pColorBlendState = RepackStructArray(1, from.data.pColorBlendState).data();
+  into.data.pDynamicState = RepackStructArray(1, from.data.pDynamicState).data();
 }
 
 bool fex_custom_repack_exit(guest_layout<VkGraphicsPipelineCreateInfo>& into, const host_layout<VkGraphicsPipelineCreateInfo>& from) {
-  delete[] from.data.pStages;
-  delete from.data.pVertexInputState;
-  delete from.data.pInputAssemblyState;
-  delete from.data.pTessellationState;
-  delete from.data.pViewportState;
-  delete from.data.pRasterizationState;
-  delete from.data.pMultisampleState;
-  delete from.data.pDepthStencilState;
-  delete from.data.pColorBlendState;
-  delete from.data.pDynamicState;
+  DeleteRepackedStructArray(from.data.stageCount, from.data.pStages, into.data.pStages);
+  if (from.data.pVertexInputState)
+    DeleteRepackedStructArray(1, from.data.pVertexInputState, into.data.pVertexInputState);
+  if (from.data.pInputAssemblyState)
+    DeleteRepackedStructArray(1, from.data.pInputAssemblyState, into.data.pInputAssemblyState);
+  if (from.data.pTessellationState)
+    DeleteRepackedStructArray(1, from.data.pTessellationState, into.data.pTessellationState);
+  if (from.data.pViewportState)
+    DeleteRepackedStructArray(1, from.data.pViewportState, into.data.pViewportState);
+  if (from.data.pRasterizationState)
+    DeleteRepackedStructArray(1, from.data.pRasterizationState, into.data.pRasterizationState);
+  if (from.data.pMultisampleState)
+    DeleteRepackedStructArray(1, from.data.pMultisampleState, into.data.pMultisampleState);
+  if (from.data.pDepthStencilState)
+    DeleteRepackedStructArray(1, from.data.pDepthStencilState, into.data.pDepthStencilState);
+  if (from.data.pColorBlendState)
+    DeleteRepackedStructArray(1, from.data.pColorBlendState, into.data.pColorBlendState);
+  if (from.data.pDynamicState)
+    DeleteRepackedStructArray(1, from.data.pDynamicState, into.data.pDynamicState);
+  auto scratch = into;
+  default_fex_custom_repack_reverse(*reinterpret_cast<guest_layout<VkBaseOutStructure>*>(&scratch),
+                                    reinterpret_cast<const VkBaseOutStructure*>(&from.data));
   return false;
 }
 
@@ -3464,14 +4104,12 @@ void fex_custom_repack_entry(host_layout<VkCommandBufferBeginInfo>& into, const 
     into.data.pInheritanceInfo = nullptr;
     return;
   }
-  into.data.pInheritanceInfo = new VkCommandBufferInheritanceInfo;
-  auto src = host_layout<VkCommandBufferInheritanceInfo> {*from.data.pInheritanceInfo.get_pointer()}.data;
-  static_assert(sizeof(src) == sizeof(*into.data.pInheritanceInfo));
-  memcpy((void*)into.data.pInheritanceInfo, &src, sizeof(src));
+  into.data.pInheritanceInfo = RepackStructArray(1, from.data.pInheritanceInfo).data();
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCommandBufferBeginInfo>& into, const host_layout<VkCommandBufferBeginInfo>& from) {
-  delete from.data.pInheritanceInfo;
+  if (from.data.pInheritanceInfo)
+    DeleteRepackedStructArray(1, from.data.pInheritanceInfo, into.data.pInheritanceInfo);
   return false;
 }
 
@@ -3498,6 +4136,99 @@ bool fex_custom_repack_exit(guest_layout<VkRenderPassBeginInfo>& into, const hos
   // Nothing to do
   return false;
 }
+#if defined(BUILD_ANDROID)
+// Own nested input structures until the native call has finished. Never return
+// host pointers into the caller's i386 structures.
+template<typename T>
+static void VexaReleaseInputArray(uint32_t count, const T* host, guest_layout<const T*> guest) {
+  if (!host) return;
+  for (uint32_t i = 0; i < count; ++i) {
+    auto original = guest.get_pointer()[i];
+    fex_apply_custom_repacking_exit(original, to_host_layout(host[i]));
+  }
+  delete[] host;
+}
+#define VEXA_DEVICE_MEMORY_INPUT(Type, Nested) \
+void fex_custom_repack_entry(host_layout<Type>& into, const guest_layout<Type>& from) { \
+  default_fex_custom_repack_entry(into, from); \
+  into.data.pCreateInfo = RepackStructArray(1, from.data.pCreateInfo).data(); \
+} \
+bool fex_custom_repack_exit(guest_layout<Type>& into, const host_layout<Type>& from) { \
+  VexaReleaseInputArray<Nested>(1, from.data.pCreateInfo, into.data.pCreateInfo); \
+  default_fex_custom_repack_reverse(*reinterpret_cast<guest_layout<VkBaseOutStructure>*>(&into), \
+                                    reinterpret_cast<const VkBaseOutStructure*>(&from.data)); \
+  return true; \
+}
+VEXA_DEVICE_MEMORY_INPUT(VkDeviceBufferMemoryRequirements, VkBufferCreateInfo)
+VEXA_DEVICE_MEMORY_INPUT(VkDeviceImageMemoryRequirements, VkImageCreateInfo)
+#undef VEXA_DEVICE_MEMORY_INPUT
+void fex_custom_repack_entry(host_layout<VkSubmitInfo2>& into, const guest_layout<VkSubmitInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pWaitSemaphoreInfos = RepackStructArray(from.data.waitSemaphoreInfoCount.data, from.data.pWaitSemaphoreInfos).data();
+  into.data.pCommandBufferInfos = RepackStructArray(from.data.commandBufferInfoCount.data, from.data.pCommandBufferInfos).data();
+  into.data.pSignalSemaphoreInfos = RepackStructArray(from.data.signalSemaphoreInfoCount.data, from.data.pSignalSemaphoreInfos).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkSubmitInfo2>& into, const host_layout<VkSubmitInfo2>& from) {
+  VexaReleaseInputArray(into.data.waitSemaphoreInfoCount.data, from.data.pWaitSemaphoreInfos, into.data.pWaitSemaphoreInfos);
+  VexaReleaseInputArray(into.data.commandBufferInfoCount.data, from.data.pCommandBufferInfos, into.data.pCommandBufferInfos);
+  VexaReleaseInputArray(into.data.signalSemaphoreInfoCount.data, from.data.pSignalSemaphoreInfos, into.data.pSignalSemaphoreInfos);
+  default_fex_custom_repack_reverse(*reinterpret_cast<guest_layout<VkBaseOutStructure>*>(&into),
+                                    reinterpret_cast<const VkBaseOutStructure*>(&from.data));
+  return true;
+}
+#endif
+
+
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+void fex_custom_repack_entry(host_layout<VkCopyBufferInfo2>& into, const guest_layout<VkCopyBufferInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkCopyBufferInfo2>& into, const host_layout<VkCopyBufferInfo2>& from) {
+  DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
+  return false;
+}
+void fex_custom_repack_entry(host_layout<VkCopyImageInfo2>& into, const guest_layout<VkCopyImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkCopyImageInfo2>& into, const host_layout<VkCopyImageInfo2>& from) {
+  DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
+  return false;
+}
+void fex_custom_repack_entry(host_layout<VkCopyBufferToImageInfo2>& into, const guest_layout<VkCopyBufferToImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkCopyBufferToImageInfo2>& into, const host_layout<VkCopyBufferToImageInfo2>& from) {
+  DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
+  return false;
+}
+void fex_custom_repack_entry(host_layout<VkCopyImageToBufferInfo2>& into, const guest_layout<VkCopyImageToBufferInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkCopyImageToBufferInfo2>& into, const host_layout<VkCopyImageToBufferInfo2>& from) {
+  DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
+  return false;
+}
+void fex_custom_repack_entry(host_layout<VkBlitImageInfo2>& into, const guest_layout<VkBlitImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkBlitImageInfo2>& into, const host_layout<VkBlitImageInfo2>& from) {
+  DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
+  return false;
+}
+void fex_custom_repack_entry(host_layout<VkResolveImageInfo2>& into, const guest_layout<VkResolveImageInfo2>& from) {
+  default_fex_custom_repack_entry(into, from);
+  into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
+}
+bool fex_custom_repack_exit(guest_layout<VkResolveImageInfo2>& into, const host_layout<VkResolveImageInfo2>& from) {
+  DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
+  return false;
+}
+#endif
 #endif
 
 EXPORTS(libvulkan)

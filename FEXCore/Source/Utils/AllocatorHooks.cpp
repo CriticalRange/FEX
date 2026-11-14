@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #if defined(__ANDROID__) && defined(ENABLE_FEX_ALLOCATOR)
+#include <atomic>
 #include <mutex>
 #endif
 
@@ -69,8 +70,16 @@ static rpmalloc_config_t global_config {
 // FEX containers may allocate before VEXA selects a guest architecture.
 // Initialize once with a stable Android mapping interface so old spans are
 // never freed through an allocator that did not create them.
-static void EnsureAndroidAllocator();
-#define VEXA_ENSURE_ALLOCATOR() EnsureAndroidAllocator()
+// Every FEX allocation passes through here, so the steady-state check is a
+// single acquire load; std::call_once only runs until initialization finishes.
+static void InitializeAndroidAllocatorOnce();
+static std::atomic<bool> AndroidAllocatorReady {false};
+#define VEXA_ENSURE_ALLOCATOR()                                         \
+  do {                                                                  \
+    if (!AndroidAllocatorReady.load(std::memory_order_acquire)) {       \
+      [[unlikely]] InitializeAndroidAllocatorOnce();                    \
+    }                                                                   \
+  } while (0)
 #else
 #define VEXA_ENSURE_ALLOCATOR() ((void)0)
 #endif
@@ -219,7 +228,7 @@ static rpmalloc_interface_t global_interface {
 };
 
 #ifdef __ANDROID__
-static void EnsureAndroidAllocator() {
+static void InitializeAndroidAllocatorOnce() {
   static std::once_flag initialized;
   std::call_once(initialized, [] {
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -230,7 +239,14 @@ static void EnsureAndroidAllocator() {
     rp_mmap_hook = FEX_rp_mmap;
     rp_munmap_hook = FEX_rp_memory_unmap;
     rp_name_hook = LocalVirtualName;
+    AndroidAllocatorReady.store(true, std::memory_order_release);
   });
+}
+
+// Initialize while the library loads, ahead of default-priority constructors
+// that may already allocate through FEXCore::Allocator.
+__attribute__((constructor(101))) static void InitializeAndroidAllocatorAtLoad() {
+  InitializeAndroidAllocatorOnce();
 }
 #endif
 

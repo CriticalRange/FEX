@@ -289,7 +289,6 @@
 #define FEX_ANDROID_GL_PROC_LIST_FOR_THUNKGEN(OP) \
   OP(glIsEnabledi) \
   OP(glGetBooleani_v) \
-  OP(glIsEnabled) \
   OP(glGetString) \
   OP(glGetStringi) \
   OP(glClearStencil) \
@@ -416,9 +415,6 @@
   OP(glReadBuffer) \
   OP(glFlush) \
   OP(glGetError) \
-  OP(glGetBooleanv) \
-  OP(glGetIntegerv) \
-  OP(glGetFloatv) \
   OP(glIsBuffer) \
   OP(glIsFramebuffer) \
   OP(glIsProgram) \
@@ -458,7 +454,6 @@
   OP(glUniform3fv) \
   OP(glUniform3i) \
   OP(glUniform4i) \
-  OP(glPixelStorei) \
   OP(glBlendColor) \
   OP(glGetBufferParameteriv) \
   OP(glIsQuery) \

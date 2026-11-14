@@ -403,7 +403,9 @@ struct repack_wrapper {
         //       might have unrelated side effects (such as deallocation of
         //       memory reserved on entry)
         if (!fex_apply_custom_repacking_exit(*orig_arg.get_pointer(), *data)) {
-          if constexpr (!std::is_const_v<std::remove_pointer_t<T>>) { // Skip exit-repacking for const pointees
+          // The generated host storage removes pointee constness to allow
+          // repacking. Only GuestT retains the actual API parameter qualifier.
+          if constexpr (!std::is_const_v<std::remove_pointer_t<GuestT>>) { // Skip exit-repacking for const pointees
             if constexpr (!(has_compatible_data_layout<T> && std::is_same_v<T, GuestT>)) {
               *orig_arg.get_pointer() = to_guest(*data); // TODO: Only if annotated as out-parameter
             }

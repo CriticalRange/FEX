@@ -23,6 +23,7 @@ $end_info$
 #include <functional>
 #include <string_view>
 #include <unordered_map>
+#include <sys/mman.h>
 
 #include "thunkgen_guest_libvulkan.inl"
 
@@ -52,6 +53,19 @@ static void FatalError(void* raw_args) {
 }
 
 static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  // Return i386 entrypoints, never truncated native AArch64 addresses. The
+  // host resolver has already bound the corresponding generated import.
+  static const auto entries = [] {
+    std::unordered_map<std::string_view, uintptr_t> result;
+#define VEXA_GUEST_VK_ENTRY(n, unused) result[#n] = reinterpret_cast<uintptr_t>(fexfn_pack_##n);
+    FOREACH_internal_SYMBOL(VEXA_GUEST_VK_ENTRY);
+#undef VEXA_GUEST_VK_ENTRY
+    return result;
+  }();
+  const auto entry = entries.find(name);
+  return entry == entries.end() ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(entry->second);
+#else
   auto It = HostPtrInvokers.find(name);
   if (It == HostPtrInvokers.end()) {
     fprintf(stderr, "%s: Unknown Vulkan function at address %p: %s\n", origin, func, name);
@@ -65,6 +79,7 @@ static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFuncti
   fprintf(stderr, "Linking address %p to host invoker %#zx\n", func, It->second);
   LinkAddressToFunction((uintptr_t)func, It->second);
   return func;
+#endif
 }
 
 PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
@@ -100,7 +115,22 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 }
 }
 
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+static uint32_t VexaReserveVulkanAddress(uint32_t size) {
+  return reinterpret_cast<uintptr_t>(mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+}
+static void VexaReleaseVulkanAddress(uint32_t address, uint32_t size) {
+  munmap(reinterpret_cast<void*>(address), size);
+}
+#endif
+
 void OnInit() {
+#if defined(BUILD_ANDROID) && defined(IS_32BIT_THUNK)
+  fexfn_pack_Vulkan_SetGuestMemoryCallbacks(reinterpret_cast<uintptr_t>(VexaReserveVulkanAddress),
+    reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(VexaReserveVulkanAddress)>::Unpack),
+    reinterpret_cast<uintptr_t>(VexaReleaseVulkanAddress),
+    reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(VexaReleaseVulkanAddress)>::Unpack));
+#endif
 #if !defined(BUILD_ANDROID)
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);

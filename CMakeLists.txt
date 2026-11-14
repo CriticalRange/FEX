@@ -8,10 +8,10 @@ option(ENABLE_DESKTOP_GL_THUNKS "Build desktop GLX/EGL thunk libs" ON) # VEXA_FI
 option(ENABLE_EGL_THUNKS "Build EGL thunk libs" ON) # VEXA_FIXES Disable EGL thunks for Android bring-up; EGL will be replaced by custom runtime path
 option(ENABLE_VULKAN_THUNKS "Build Vulkan thunk libs" ON) # VEXA_FIXES Hytale bring-up is OpenGL-first; Vulkan thunks pull in Linux desktop headers (eg xcb) not present in Android NDK
 option(ENABLE_WAYLAND_THUNKS "Build Wayland thunk libs" ON) # VEXA_FIXES Disable Wayland thunks for Android cross-builds without wayland headers
-option(ENABLE_VDSO_THUNKS "Build VDSO thunk libs" ON) # VEXA_FIXES Temporarily disable VDSO thunk generation in Android bring-up
+option(ENABLE_VDSO_THUNKS "Build VDSO thunk libs" ON)
 option(BUILD_FEX_LINUX_TESTS "Build FEXLinuxTests (requires x86 compiler)" FALSE)
 option(BUILD_THUNKS "Build thunks" FALSE)
-option(VEXA_BUILD_32BIT_THUNKS "Build Android i386 GL thunk pair" OFF)
+option(VEXA_BUILD_32BIT_THUNKS "Build Android i386 thunk pairs" OFF)
 option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
 option(ENABLE_CLANG_THUNKS "Build thunks with clang" TRUE)
 option(ENABLE_IWYU "Enable the Include What You Use sanitizer" FALSE)
@@ -49,8 +49,9 @@ if (ANDROID)
   add_compile_definitions(BUILD_ANDROID=1)
   # VEXA_FIXES: Android build environments don't provide Linux desktop Wayland headers/libs.
   set(ENABLE_WAYLAND_THUNKS OFF CACHE BOOL "Build Wayland thunk libs" FORCE)
-  # VEXA_FIXES: VDSO thunk generation currently conflicts on Android NDK gettimeofday prototype.
-  set(ENABLE_VDSO_THUNKS OFF CACHE BOOL "Build VDSO thunk libs" FORCE)
+  # libVDSO is a guest-only x86 library built against the guest sysroot, so it is
+  # independent of the NDK. Without it every guest clock_gettime/gettimeofday/time
+  # call is a full emulated syscall instead of a thunk to the host vDSO.
 endif()
 
 set(X86_32_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_32.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting i686")
@@ -226,6 +227,12 @@ cmake_policy(SET CMP0083 NEW) # Follow new PIE policy
 include(CheckPIESupported)
 check_pie_supported()
 
+# Older CMake Clang modules select gold for IPO, but the Android NDK
+# ships lld (including on Windows). Keep ThinLTO enabled with that linker.
+if (ANDROID)
+  set(CMAKE_C_LINK_OPTIONS_IPO "-fuse-ld=lld")
+  set(CMAKE_CXX_LINK_OPTIONS_IPO "-fuse-ld=lld")
+endif()
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ${ENABLE_LTO})
 
 include(CheckCXXSourceCompiles)
@@ -754,7 +761,7 @@ if (BUILD_THUNKS)
   "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
         "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
         "-DENABLE_EGL_THUNKS=$<IF:$<BOOL:${ANDROID}>,OFF,${ENABLE_EGL_THUNKS}>"
-        "-DENABLE_VULKAN_THUNKS=$<IF:$<BOOL:${ANDROID}>,OFF,${ENABLE_VULKAN_THUNKS}>"
+        "-DENABLE_VULKAN_THUNKS=${ENABLE_VULKAN_THUNKS}"
         "-DENABLE_VDSO_THUNKS=${ENABLE_VDSO_THUNKS}"
         # VEXA_FIXES: Keep 32-bit guest thunk sub-build aligned with 64-bit
         # for Android media dependency include prefixes.

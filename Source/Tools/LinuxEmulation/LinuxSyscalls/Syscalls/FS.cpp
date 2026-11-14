@@ -7,6 +7,7 @@ $end_info$
 
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/VexaTmpPath.h"
+#include "LinuxSyscalls/VexaShmPath.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 
@@ -44,7 +45,8 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(unlink, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname) -> uint64_t {
-    uint64_t Result = ::unlink(pathname);
+    const auto path = VexaPrivateShmPath(pathname);
+    uint64_t Result = ::unlink(path.empty() ? pathname : path.c_str());
     SYSCALL_ERRNO();
   });
 

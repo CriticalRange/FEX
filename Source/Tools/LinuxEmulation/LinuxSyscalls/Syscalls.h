@@ -237,6 +237,13 @@ public:
   uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);
   uint64_t GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState*, int shmid, const void* shmaddr, int shmflg);
   uint64_t GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadState*, const void* shmaddr);
+  uint64_t GuestMadvise(FEXCore::Core::InternalThreadState*, void* addr, size_t length, int advice);
+
+  // A host reservation that only exists to keep a VA range free for the guest
+  // (for example VEXA's low-VA preload reservation). On Android the guest shares
+  // its address space with ART and bionic, so guest MAP_FIXED, munmap, mprotect,
+  // mremap and destructive madvise only act on guest-tracked memory and these ranges.
+  void AddGuestClaimableRange(uint64_t Base, uint64_t Length);
 
   ///// Memory Manager tracking /////
   struct LateApplyExtendedVolatileMetadata {
@@ -372,6 +379,15 @@ private:
 
   fextl::unique_ptr<FEX::HLE::MemAllocator> Alloc32Handler {};
   std::atomic<uint64_t> AnonSharedId {1};
+
+  // [Base, End) host reservations a guest MAP_FIXED may replace. Guarded by VMATracking.Mutex.
+  fextl::vector<std::pair<uint64_t, uint64_t>> GuestClaimableRanges {};
+  // Checks that a guest MAP_FIXED/MREMAP_FIXED over [Base, Base + Length) only replaces guest
+  // memory, claimable reservations or free space, and reserves the free parts so nothing else
+  // can take them before the real mapping. Returns 0 or a negative errno.
+  // VMATracking.Mutex must be held.
+  int PrepareFixedGuestRange(uint64_t Base, uint64_t Length, fextl::vector<std::pair<uint64_t, uint64_t>>& Probes);
+  static void ReleaseFixedRangeProbes(const fextl::vector<std::pair<uint64_t, uint64_t>>& Probes);
 
   static inline uint64_t GetArg(bool Is64Bit, FEXCore::Core::CpuStateFrame* Frame, size_t Arg) {
     constexpr size_t SyscallArgs = 7;

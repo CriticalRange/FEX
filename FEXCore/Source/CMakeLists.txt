@@ -10,7 +10,8 @@ set(FEXCORE_BASE_SRCS
   Utils/SpinWaitLock.cpp
   Utils/WildcardMatcher.cpp)
 
-if (NOT MINGW OR NOT ANDROID) # VEXA_FIXES Android added for FEXCore_Base dependency to work with it.
+# The 64-bit allocator is POSIX-only; Android already takes this branch.
+if (NOT MINGW)
   list(APPEND FEXCORE_BASE_SRCS
     Utils/Allocator/64BitAllocator.cpp)
 endif()

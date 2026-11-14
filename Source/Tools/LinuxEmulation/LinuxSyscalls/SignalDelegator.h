@@ -63,6 +63,13 @@ public:
   void RegisterTLSState(FEX::HLE::ThreadStateObject* Thread);
   void UninstallTLSState(FEX::HLE::ThreadStateObject* Thread);
 
+  // Process-directed signals that the kernel delivers to a non-FEX thread are
+  // forwarded to a registered guest thread. A parked exited leader must not be
+  // chosen, since it no longer runs guest code.
+  void SetAcceptsForwardedSignals(FEX::HLE::ThreadStateObject* Thread, bool Accepts);
+  // Called in a fork child: only the forking thread survives, with a new TID.
+  static void ResetAltStackRegistryAfterFork(FEX::HLE::ThreadStateObject* LiveThread);
+
   /**
    * @brief Registers a signal handler for the host to handle a signal
    *
@@ -297,8 +304,12 @@ private:
 fextl::unique_ptr<FEX::HLE::SignalDelegator>
 CreateSignalDelegator(FEXCore::Context::Context* CTX, const std::string_view ApplicationName, bool SupportsAVX, bool SupportsSVE256);
 
-// Runs at the start of the host signal thunk, before the alt-stack thread
-// pointer is read. The hook must be async-signal-safe. Null disables it.
+// Runs only when FEX cannot service a host signal: a fault on a thread FEX does
+// not own whose previous disposition is the default, or a FEX thread whose alt
+// stack or thread object is unusable. The signal's default action follows
+// immediately. Signals FEX handles (unaligned-atomic fixups, guest signal
+// returns, SMC and deferred-signal faults) never reach it. The hook must be
+// async-signal-safe. Null disables it.
 using EarlyHostSignalHook = void (*)(int Signal, void* Info, void* UContext);
 __attribute__((visibility("default"))) void SetEarlyHostSignalHook(EarlyHostSignalHook Hook);
 } // namespace FEX::HLE

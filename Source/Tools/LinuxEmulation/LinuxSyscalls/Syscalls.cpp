@@ -236,10 +236,27 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
 
   fextl::string ShebangInterpreter {};
 
+  // O_PATH descriptors are valid for execveat but cannot be read by the ELF
+  // loader. Reopen only for inspection/translation, preserving the original
+  // descriptor and its CLOEXEC semantics for native kernel execution.
+  struct ExecInspectionFD {
+    int FD = -1;
+    ~ExecInspectionFD() { if (FD != -1) close(FD); }
+  } Inspection;
+  int ReadableExecFD = Args.dirfd;
   if (IsFDExec) {
-    Type = ELFLoader::ELFContainer::GetELFType(Args.dirfd);
+    const int StatusFlags = fcntl(Args.dirfd, F_GETFL);
+    if (StatusFlags == -1) return -errno;
+    if (StatusFlags & O_PATH) {
+      char FDPath[64];
+      snprintf(FDPath, sizeof(FDPath), "/proc/self/fd/%d", Args.dirfd);
+      Inspection.FD = open(FDPath, O_RDONLY | O_CLOEXEC);
+      if (Inspection.FD == -1) return -errno;
+      ReadableExecFD = Inspection.FD;
+    }
+    Type = ELFLoader::ELFContainer::GetELFType(ReadableExecFD);
 
-    ShebangInterpreter = GetShebangInterpFD(Args.dirfd);
+    ShebangInterpreter = GetShebangInterpFD(ReadableExecFD);
   } else {
     // For absolute paths, check the rootfs first (if available)
     if (pathname[0] == '/') {
@@ -336,6 +353,14 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
     if (!IsFDExec) {
       return false;
     }
+    // Native ELF execveat must retain AT_EMPTY_PATH and its original FD; the
+    // kernel, rather than the VEXA loader, handles CLOEXEC for that path.
+    if (Type == ELFLoader::ELFContainer::ELFType::TYPE_OTHER_ELF) return false;
+    if (Inspection.FD != -1) return true;
+
+    // The VEXA loader owns/closes its ELF descriptor. Preserve the guest's
+    // original non-CLOEXEC descriptor across exec by passing a separate copy.
+    if (const char* Loader = getenv("VEXA_REEXEC"); Loader && *Loader) return true;
 
     if (SyscallHandler->IsHostKernelVersionAtLeast(999, 0, 0)) {
       // Older kernel versions have a bug with the combination of binfmt_misc and anonymous file FDs that set CLOEXEC.
@@ -357,9 +382,8 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
                                   (Type == ELFLoader::ELFContainer::ELFType::TYPE_X86_32 || Type == ELFLoader::ELFContainer::ELFType::TYPE_X86_64);
   // Without a visible binfmt interpreter, the next FEX process resolves guest paths through RootFS.
   // Keep the already resolved host ELF open so a binary outside that RootFS can still be executed.
-  // The VEXA trampoline currently consumes a pathname, not FEX_EXECVEFD.
-  // Keep upstream's FD-backed path for FEXInterpreter and keep VEXA's argv
-  // contract until the Android loader implements the FD handoff explicitly.
+  // Path-backed VEXA launches retain the existing argv contract; anonymous
+  // ELF launches use FEX_EXECVEFD with the preserve-argv0 layout below.
   const char* VexaReexec = getenv("VEXA_REEXEC");
   const bool UsesVexaReexec = VexaReexec && *VexaReexec;
   const bool NeedsLoaderFD = !UsesVexaReexec && !IsVexaPE && !IsFDExec && !SyscallHandler->IsInterpreterInstalled() &&
@@ -369,10 +393,6 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
   // We can't know if we can support this without architecture specific checks and binfmt_misc parsing
   // Just execve it and let the kernel handle the process
   const bool IsOtherELF = Type == ELFLoader::ELFContainer::ELFType::TYPE_OTHER_ELF;
-  if (UsesVexaReexec && IsFDExec && !IsOtherELF && !IsBinfmtCompatible) {
-    CloseSeccompFD();
-    return -ENOTSUP;
-  }
 
   // Need to copy over envp variables if we are appending data.
   // Only situation in which an envp copy needs to occur is if we are doing an FD execveat and binfmt_misc can't handle it.
@@ -400,7 +420,12 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
       if (NeedsFDCopy) {
         // FEX needs the FD to live past execve when binfmt_misc isn't used,
         // so duplicate the FD if FD_CLOEXEC is set, which removes the FD_CLOEXEC flag.
-        Args.dirfd = dup(Args.dirfd);
+        Args.dirfd = fcntl(ReadableExecFD, F_DUPFD, 3);
+        if (Args.dirfd == -1) {
+          const int Error = errno;
+          CloseSeccompFD();
+          return -Error;
+        }
         FDExecCopy = true;
       } else if (NeedsLoaderFD) {
         Args.dirfd = open(Filename.c_str(), O_RDONLY);
@@ -489,7 +514,7 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
     if (*OldArgv) {
       // The direct fallback uses the executable path as argv[0]. An FD-backed load uses the
       // binfmt preserve-argv0 layout, so the caller-supplied argv[0] has to stay in the vector.
-      if (!NeedsLoaderFD) {
+      if (!NeedsLoaderFD && !(UsesVexaReexec && IsFDExec)) {
         ++OldArgv;
       }
       while (*OldArgv) {
@@ -550,7 +575,8 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
     // variables or overwrite explicitly supplied (even empty) control values.
     for (const char* Key : {"VEXA_REEXEC", "VEXA_ROOTFS", "VEXA_THUNK_HOST", "VEXA_THUNK_GUEST", "VEXA_WORKDIR", "VEXA_ARTIFACTS",
                             "VEXA_COMPAT_SESSION", "VEXA_PROTON_PATH", "VEXA_STEAM_CLIENT_PATH", "VEXA_COMPAT_DATA_ROOT",
-                            "VEXA_PROTON_PYTHON", "VEXA_PROTON_SESSION_SCRIPT", "VEXA_PROTON_DISPLAY_BACKEND", "VEXA_PROTON_ROOTFS"}) {
+                            "VEXA_PROTON_PYTHON", "VEXA_PROTON_SESSION_SCRIPT", "VEXA_PROTON_DISPLAY_BACKEND", "VEXA_PROTON_ROOTFS",
+                            "VEXA_REAL_X11", "VEXA_X11_SOCKET", "DISPLAY", "VEXA_X11_CPU_PRESENT", "VEXA_X11_SYNC_TRACE"}) {
       const auto Prefix = fextl::string(Key) + "=";
       const bool Present = std::any_of(VexaNativeEnv.begin(), VexaNativeEnv.end(), [&](const auto& Entry) {
         return std::string_view(Entry.data(), Entry.size()).starts_with(std::string_view(Prefix.data(), Prefix.size()));
@@ -1005,7 +1031,10 @@ void SyscallHandler::HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame, uint
   SetResult(Frame, Result);
 }
 
+extern "C" bool Vexa_TryWineDirectSyscall(FEXCore::Core::CpuStateFrame*) __attribute__((weak));
+
 void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
+  if (Is64BitMode() && !SeccompEmulator.HasFilter(Frame) && Vexa_TryWineDirectSyscall && Vexa_TryWineDirectSyscall(Frame)) return;
   // Grab the return address which will be inside the JIT.
   const uint64_t JITPC = reinterpret_cast<uint64_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
   const auto Is64Bit = Is64BitMode();

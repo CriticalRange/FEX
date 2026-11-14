@@ -25,6 +25,7 @@ $end_info$
 
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <atomic>
 #include <grp.h>
 #include <limits.h>
 #include <linux/futex.h>
@@ -51,6 +52,103 @@ extern "C" bool Vexa_IsStandaloneLoader() __attribute__((weak));
 extern "C" void Vexa_ReportGuestExit(int status) __attribute__((weak));
 
 namespace FEX::HLE {
+
+// Emulates the kernel's exit_robust_list()/handle_futex_death() for robust
+// lists that never reached the host kernel: 32-bit guests (the kernel can't
+// parse a 32-bit list from a 64-bit process) and 64-bit guests on Android,
+// where set_robust_list is stored instead of passed through. Without this a
+// thread dying while holding a robust mutex leaves its waiters blocked forever
+// instead of getting EOWNERDEAD.
+static void ReleaseGuestRobustList(FEX::HLE::ThreadStateObject* ThreadObject) {
+  const uint64_t Head = ThreadObject->ThreadInfo.robust_list_head;
+  if (!Head) {
+    return;
+  }
+  ThreadObject->ThreadInfo.robust_list_head = 0;
+
+  const bool Is64Bit = FEX::HLE::_SyscallHandler->Is64BitMode();
+  const uint64_t PointerSize = Is64Bit ? 8 : 4;
+  const uint32_t TID = ThreadObject->ThreadInfo.TID;
+
+  auto ReadWord = [&](uint64_t Address, uint64_t& Value) -> bool {
+    if (Is64Bit) {
+      uint64_t Word {};
+      if (FaultSafeUserMemAccess::CopyFromUser(&Word, reinterpret_cast<const void*>(Address), sizeof(Word))) {
+        return false;
+      }
+      Value = Word;
+    } else {
+      uint32_t Word {};
+      if (FaultSafeUserMemAccess::CopyFromUser(&Word, reinterpret_cast<const void*>(Address), sizeof(Word))) {
+        return false;
+      }
+      Value = Word;
+    }
+    return true;
+  };
+
+  constexpr uint32_t FutexWaiters = 0x8000'0000U;
+  constexpr uint32_t FutexOwnerDied = 0x4000'0000U;
+  constexpr uint32_t FutexTIDMask = 0x3FFF'FFFFU;
+
+  auto HandleFutexDeath = [&](uint64_t Address, bool PI, bool PendingOp) {
+    if (Address & 3) {
+      return;
+    }
+    for (;;) {
+      uint32_t Value {};
+      if (FaultSafeUserMemAccess::CopyFromUser(&Value, reinterpret_cast<const void*>(Address), sizeof(Value))) {
+        return;
+      }
+      const uint32_t Owner = Value & FutexTIDMask;
+      if (PendingOp && !PI && !Owner) {
+        // Unlocked but a waiter may already have been woken for us: pass the wakeup on.
+        ::syscall(SYSCALL_DEF(futex), Address, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+        return;
+      }
+      if (Owner != TID) {
+        return;
+      }
+      const uint32_t NewValue = (Value & FutexWaiters) | FutexOwnerDied;
+      if (!std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(Address)).compare_exchange_strong(Value, NewValue)) {
+        continue;
+      }
+      // PI waiters are woken by the kernel's PI state cleanup when the host thread exits.
+      if (!PI && (Value & FutexWaiters)) {
+        ::syscall(SYSCALL_DEF(futex), Address, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+      }
+      return;
+    }
+  };
+
+  uint64_t Entry {};
+  uint64_t FutexOffsetWord {};
+  uint64_t Pending {};
+  if (!ReadWord(Head, Entry) || !ReadWord(Head + PointerSize, FutexOffsetWord) || !ReadWord(Head + 2 * PointerSize, Pending)) {
+    return;
+  }
+  const int64_t FutexOffset = Is64Bit ? static_cast<int64_t>(FutexOffsetWord) : static_cast<int32_t>(FutexOffsetWord);
+  const bool PendingPI = Pending & 1;
+  Pending &= ~uint64_t {1};
+
+  // Bit 0 of each link marks a PI futex. ROBUST_LIST_LIMIT bounds circular lists.
+  for (unsigned Limit = 2048; (Entry & ~uint64_t {1}) != Head && Limit; --Limit) {
+    const bool PI = Entry & 1;
+    const uint64_t Node = Entry & ~uint64_t {1};
+    uint64_t Next {};
+    const bool ReadNext = ReadWord(Node, Next);
+    if (Node != Pending) {
+      HandleFutexDeath(Node + FutexOffset, PI, false);
+    }
+    if (!ReadNext) {
+      return;
+    }
+    Entry = Next;
+  }
+  if (Pending) {
+    HandleFutexDeath(Pending + FutexOffset, PendingPI, true);
+  }
+}
 
 struct ExecutionThreadHandler {
   FEXCore::Context::Context* CTX;
@@ -459,14 +557,37 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable();
     auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
 
+    // Like the kernel, release robust futexes before clearing the TID word.
+    ReleaseGuestRobustList(ThreadObject);
+
     if (ThreadObject->ThreadInfo.clear_child_tid) {
       auto Addr = std::atomic_ref<int32_t>(*ThreadObject->ThreadInfo.clear_child_tid);
       Addr.store(0);
       syscall(SYSCALL_DEF(futex), ThreadObject->ThreadInfo.clear_child_tid, FUTEX_WAKE, ~0ULL, 0, 0, 0);
+      // A retried exit must not touch the TID word again.
+      ThreadObject->ThreadInfo.clear_child_tid = nullptr;
     }
 
     ThreadObject->StatusCode = status;
     ThreadObject->VexaGuestExit = true;
+
+#if defined(__ANDROID__)
+    if (!ThreadObject->ExecutionThread) {
+      // This is the initial thread; its status is the process status unless exit_group intervenes.
+      FEX::HLE::_SyscallHandler->TM.RecordLeaderExit(status);
+      if (!(Vexa_IsStandaloneLoader && Vexa_IsStandaloneLoader())) {
+        // In the embedded worker this host thread is VEXA's JNI-attached runtime
+        // thread. Raw-exiting it would leave ART holding a dead attached thread and
+        // make VEXA report the guest as finished while its other threads still run.
+        // Park it like a zombie group leader until the last guest thread is gone,
+        // then unwind out of ExecuteThread so VEXA tears the runtime down normally.
+        FEX::HLE::_SyscallHandler->TM.ParkExitedLeader(ThreadObject);
+        FEX::HLE::_SyscallHandler->TM.StopThread(ThreadObject);
+        // The stop signal unwinds this thread; if it is deferred it fires on the way back into the JIT.
+        return 0;
+      }
+    }
+#endif
 
     FEX::HLE::_SyscallHandler->UninstallTLSState(ThreadObject);
 
@@ -573,6 +694,9 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
 
   REGISTER_SYSCALL_IMPL(exit_group, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
 #if defined(__ANDROID__)
+    // The group status wins over any later per-thread exit bookkeeping.
+    FEX::HLE::_SyscallHandler->TM.MarkGroupExit();
+    ReleaseGuestRobustList(FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame));
     if (Vexa_ReportGuestExit) {
       Vexa_ReportGuestExit(status);
     }

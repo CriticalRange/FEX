@@ -23,6 +23,7 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -110,6 +111,9 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   int StatusCode {};
   // VEXA: distinguish a guest exit syscall from launcher error-path cleanup.
   bool VexaGuestExit {};
+  // VEXA: the initial thread called exit() and now waits, like a zombie group
+  // leader, for the remaining guest threads instead of killing its host thread.
+  bool ParkedExitedLeader {};
 
   struct CallRetStackInfo {
     uint64_t AllocationBase;
@@ -197,6 +201,7 @@ public:
   void TrackThread(FEX::HLE::ThreadStateObject* Thread) {
     std::lock_guard lk(ThreadCreationMutex);
     Threads.emplace_back(Thread);
+    UnparkedThreads.fetch_add(1, std::memory_order_acq_rel);
   }
 
   void DestroyThread(FEX::HLE::ThreadStateObject* Thread, bool NeedsTLSUninstall = false);
@@ -207,6 +212,27 @@ public:
   void Run();
   void Step();
   void Stop(bool IgnoreCurrentThread = false);
+
+  // Exit status bookkeeping that matches Linux: after exit_group the group
+  // status wins; otherwise the process reports the initial thread's status.
+  void RecordLeaderExit(int Status) {
+    LeaderExitStatus.store(Status, std::memory_order_relaxed);
+    HasLeaderExitStatus.store(true, std::memory_order_release);
+  }
+  void MarkGroupExit() {
+    GroupExitRequested.store(true, std::memory_order_release);
+  }
+  bool IsGroupExitRequested() const {
+    return GroupExitRequested.load(std::memory_order_acquire);
+  }
+
+  // Blocks the exited initial thread until no other guest thread is left. Only
+  // FEX's stop/pause signal stays unblocked, so exit_group or a stop request can
+  // still unwind it. Holds no locks while waiting.
+  void ParkExitedLeader(FEX::HLE::ThreadStateObject* Thread);
+
+  // Waits until every guest thread other than Self has been destroyed.
+  bool WaitForOtherThreadsToExit(FEX::HLE::ThreadStateObject* Self, std::chrono::milliseconds Timeout);
 
   void WaitForIdle();
   void WaitForIdleWithTimeout();
@@ -268,6 +294,17 @@ private:
   std::mutex IdleWaitMutex;
   std::condition_variable IdleWaitCV;
   std::atomic<uint32_t> IdleWaitRefCount {};
+  std::atomic<uint32_t> DeletingThreads {};
+
+  // Tracked guest threads that are still running guest code (a parked exited
+  // leader no longer counts). ParkGeneration is the futex word a parked leader
+  // sleeps on; it changes whenever UnparkedThreads drops to zero.
+  std::atomic<uint32_t> UnparkedThreads {};
+  std::atomic<uint32_t> ParkGeneration {};
+  std::atomic<bool> GroupExitRequested {};
+  std::atomic<bool> HasLeaderExitStatus {};
+  std::atomic<int> LeaderExitStatus {};
+  void ReleaseUnparkedThread();
 
   void HandleThreadDeletion(FEX::HLE::ThreadStateObject* Thread, bool NeedsTLSUninstall = false);
   void NotifyPause();

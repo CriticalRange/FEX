@@ -54,6 +54,8 @@ static uint32_t VexaPrepareBGRAVertexInputs(const std::array<VexaLegacyArray,16>
 static GLuint VexaLegacyVAO(){GLint vao=0;::glGetIntegerv(GL_VERTEX_ARRAY_BINDING,&vao);return vao;}
 static std::array<VexaLegacyArray,16>& VexaLegacyArrays(){return VexaProgramContext().LegacyClient.Arrays[VexaLegacyVAO()];}
 static int VexaLegacyArrayIndex(GLenum array) {
+  if(array==0x8077)return 1; // INDEX_ARRAY
+  if(array==0x8079)return 4; // EDGE_FLAG_ARRAY
   if(array==0x8074)return 0; // VERTEX_ARRAY
   if(array==0x8075)return 2; // NORMAL_ARRAY
   if(array==0x8076)return 3; // COLOR_ARRAY
@@ -73,6 +75,9 @@ static int VexaLegacyQuery(GLenum pname,GLfloat* value) {
   if(pname>=0x807A&&pname<=0x807C){index=0;field=pname-0x807A;}
   if(pname>=0x8081&&pname<=0x8083){index=3;field=pname-0x8081;}
   if(pname>=0x8088&&pname<=0x808A){index=8+client.Unit;field=pname-0x8088;}
+  if(pname==0x8085){index=1;field=1;}if(pname==0x8086){index=1;field=2;}
+  if(pname==0x808C){index=4;field=2;}
+  if(pname==0x8899){index=1;field=3;}if(pname==0x889B){index=4;field=3;}
   if(pname==0x8896){index=0;field=3;}if(pname==0x8898){index=3;field=3;}if(pname==0x889A){index=8+client.Unit;field=3;}
   if(index<0)return 0;
   const auto& a=VexaLegacyArrays()[index];*value=field==0?a.Size:field==1?a.Type:field==2?a.Stride:a.Buffer;return 1;
@@ -92,6 +97,7 @@ class VexaLegacyArrayScope {
   bool ChangedElement=false;
   std::vector<VexaSavedLegacyAttrib> Saved;
   static constexpr uint64_t MaxBytes=256ULL*1024*1024;
+public:
   static bool ReadBuffer(GLenum target,GLuint buffer,uint64_t offset,uint64_t size,std::vector<uint8_t>& data) {
     if(size>MaxBytes||offset>INT64_MAX||size>INT64_MAX-offset)return false;
     GLint old=0;::glGetIntegerv(target==GL_COPY_READ_BUFFER?GL_COPY_READ_BUFFER_BINDING:GL_ELEMENT_ARRAY_BUFFER_BINDING,&old);

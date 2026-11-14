@@ -209,8 +209,10 @@ constexpr static uint64_t ESR1_WNR = 1 << 6;
 constexpr static uint64_t ESR1_DataAbort_DFSC = 0b111111;
 constexpr static uint64_t ESR1_DataAbort_TranslationFault_EL0 = 0b000111;
 constexpr static uint64_t ESR1_DataAbort_PermissionFault_EL0 = 0b001111;
-constexpr static uint64_t ESR1_EC_InstructionAbort = 0b100000U << 26; // VEXA_FIXES: Treat instruction-abort EC as execute fault.
-constexpr static uint64_t ESR1_EC_InstructionAbortNoEL = 0b1000001U << 26; // VEXA_FIXES: Handle no-EL variant seen on some kernels.
+// VEXA_FIXES: Treat instruction aborts as execute faults. EC is the 6-bit field at [31:26]:
+// 0b100000 is an instruction abort from a lower EL, 0b100001 one taken without a change in EL.
+constexpr static uint64_t ESR1_EC_InstructionAbort = uint64_t {0b100000} << 26;
+constexpr static uint64_t ESR1_EC_InstructionAbortNoEL = uint64_t {0b100001} << 26;
 constexpr static uint64_t ESR1_DataAbort_Level = 0b11;
 constexpr static uint64_t ESR1_DataAbort_Level_EL3 = 0b00;
 constexpr static uint64_t ESR1_DataAbort_Level_EL2 = 0b01;

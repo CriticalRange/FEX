@@ -15,6 +15,7 @@ $end_info$
 #if defined(__ANDROID__)
 #include "LinuxSyscalls/AndroidRootFSOpen.h"
 #endif
+#include "LinuxSyscalls/VexaShmPath.h"
 #include "LinuxSyscalls/EmulatedFiles/EmulatedFiles.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
@@ -56,40 +57,80 @@ $end_info$
 // VEXA_FIXES: Android compatibility helper for close_range().
 // VEXA_FIXES: On Android we must preserve FEX-owned FDs while still honoring guest intent
 // VEXA_FIXES: to close broad FD ranges. This closes non-tracked FDs and skips tracked ones.
+static void CloseGuestDescriptor(FEX::HLE::FileManager* FM, int fd) {
+  if (FM->CheckIfFDInTrackedSet(fd)) {
+    return;
+  }
+#if defined(__ANDROID__)
+  // Embedded guests inherit ART/native descriptors. Their close_fds sweep
+  // must not invalidate host-owned FILE/Java/unique_fd objects or abort in
+  // bionic fdsan. Guest-opened descriptors have no bionic ownership tag.
+  if (android_fdsan_get_owner_tag(fd) != 0) {
+    return;
+  }
+#endif
+  ::close(fd);
+}
+
 static uint64_t CloseRangeSkipTracked(FEX::HLE::FileManager* FM, unsigned int first, unsigned int last) {
-  if (last != std::numeric_limits<unsigned int>::max() && first > last) {
+  if (first > last) {
     errno = EINVAL;
     return -1;
   }
 
-  // Python also uses INT_MAX, not only UINT_MAX, for an unbounded sweep.
-  // Bound every range: walking billions of nonexistent descriptors stalls
-  // subprocess creation before exec. Use the hard limit so a lowered soft
-  // limit does not omit descriptors opened before that limit was lowered.
+  // Visit only descriptors that are actually open. Probing every number up to
+  // RLIMIT_NOFILE (tens of thousands, each with a lock) stalled every
+  // closefrom()/close_fds sweep before a guest exec.
+  const int ProcFDDir = ::open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (ProcFDDir >= 0) {
+    fextl::vector<int> Open;
+    alignas(8) char Buffer[4096];
+    for (;;) {
+      const auto Bytes = ::syscall(SYS_getdents64, ProcFDDir, Buffer, sizeof(Buffer));
+      if (Bytes <= 0) {
+        break;
+      }
+      for (long Offset = 0; Offset < Bytes;) {
+        uint16_t RecordLength {};
+        memcpy(&RecordLength, Buffer + Offset + 16, sizeof(RecordLength));
+        if (RecordLength == 0) {
+          break;
+        }
+        const char* Name = Buffer + Offset + 19;
+        Offset += RecordLength;
+        uint64_t Value = 0;
+        bool Numeric = *Name != '\0';
+        for (const char* Digit = Name; *Digit && Numeric; ++Digit) {
+          Numeric = *Digit >= '0' && *Digit <= '9';
+          Value = Value * 10 + static_cast<uint64_t>(*Digit - '0');
+          Numeric = Numeric && Value <= std::numeric_limits<int>::max();
+        }
+        if (Numeric && Value >= first && Value <= last && static_cast<int>(Value) != ProcFDDir) {
+          Open.push_back(static_cast<int>(Value));
+        }
+      }
+    }
+    ::close(ProcFDDir);
+    for (const int fd : Open) {
+      CloseGuestDescriptor(FM, fd);
+    }
+    return 0;
+  }
+
+  // /proc unavailable: bound the sweep by the hard descriptor limit.
   unsigned int end = last;
   struct rlimit rl {};
   if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max != RLIM_INFINITY && rl.rlim_max > 0) {
     end = std::min<uint64_t>(end, rl.rlim_max - 1);
   } else if (last == std::numeric_limits<unsigned int>::max()) {
-    // Best-effort fallback if RLIMIT lookup fails.
     end = 65535;
   }
-
   for (unsigned int fd = first; fd <= end; ++fd) {
-    if (!FM->CheckIfFDInTrackedSet(static_cast<int>(fd))) {
-#if defined(__ANDROID__)
-      // Embedded guests inherit ART/native descriptors. Their close_fds sweep
-      // must not invalidate host-owned FILE/Java/unique_fd objects or abort in
-      // bionic fdsan. Guest-opened descriptors have no bionic ownership tag.
-      if (android_fdsan_get_owner_tag(static_cast<int>(fd)) != 0) continue;
-#endif
-      ::close(static_cast<int>(fd));
-    }
+    CloseGuestDescriptor(FM, static_cast<int>(fd));
     if (fd == std::numeric_limits<unsigned int>::max()) {
       break;
     }
   }
-
   return 0;
 }
 
@@ -97,7 +138,7 @@ namespace FEX::HLE {
 // VEXA_FIXES: Android compatibility shim for openat2.
 // VEXA_FIXES: Some Android policies trap openat2 (SIGSYS). For Android we emulate
 // VEXA_FIXES: supported openat2 behavior with openat and preserve key validations.
-static int OpenAt2Compat(int dirfd, const char* path, const open_how* how, size_t usize) {
+int FileManager::OpenInRootFS(int dirfd, const char* path, const open_how* how, size_t usize) {
 #if defined(__ANDROID__)
   (void)usize;
 
@@ -116,12 +157,28 @@ static int OpenAt2Compat(int dirfd, const char* path, const open_how* how, size_
 
   const mode_t mode = static_cast<mode_t>(how->mode & 07777);
   if (how->resolve & RESOLVE_IN_ROOT) {
-    return AndroidOpenInRoot(dirfd, path, static_cast<int>(how->flags), mode);
+    if (RootFSResolver && dirfd == RootFSFD) {
+      return RootFSResolver->Open(dirfd, path, static_cast<int>(how->flags), mode);
+    }
+    return AndroidRootFSResolver::OpenUncached(dirfd, path, static_cast<int>(how->flags), mode);
   }
   return static_cast<int>(::syscall(SYSCALL_DEF(openat), dirfd, path, static_cast<int>(how->flags), mode));
 #else
   return static_cast<int>(::syscall(SYSCALL_DEF(openat2), dirfd, path, how, usize));
 #endif
+}
+
+bool FileManager::MayMatchThunkOverlay(const char* Pathname) const {
+  if (ThunkOverlayBasenames.empty()) {
+    return false;
+  }
+  std::string_view Path {Pathname};
+  while (!Path.empty() && Path.back() == '/') {
+    Path.remove_suffix(1);
+  }
+  const auto Slash = Path.rfind('/');
+  const auto Basename = Slash == std::string_view::npos ? Path : Path.substr(Slash + 1);
+  return !Basename.empty() && ThunkOverlayBasenames.contains(fextl::string(Basename));
 }
 
 
@@ -320,6 +377,19 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
     }
   }
 
+#if defined(__ANDROID__)
+  RootFSResolver = fextl::make_unique<AndroidRootFSResolver>(
+    [](void* Context, int FD, bool Track) {
+      auto* Manager = static_cast<FileManager*>(Context);
+      if (Track) {
+        Manager->TrackFEXFD(FD);
+      } else {
+        Manager->RemoveFEXFD(FD);
+      }
+    },
+    this);
+#endif
+
   fextl::unordered_map<fextl::string, ThunkDBObject> ThunkDB;
   LoadThunkDatabase(ThunkDB, true);
   LoadThunkDatabase(ThunkDB, false);
@@ -419,9 +489,22 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
     }
   }
 
+  for (const auto& [Overlay, ThunkPath] : ThunkOverlays) {
+    std::string_view Name {Overlay};
+    const auto Slash = Name.rfind('/');
+    if (Slash != std::string_view::npos) {
+      Name.remove_prefix(Slash + 1);
+    }
+    if (!Name.empty()) {
+      ThunkOverlayBasenames.emplace(Name);
+    }
+  }
+
   // Keep an fd open for /proc, to bypass chroot-style sandboxes
   ProcFD = open("/proc", O_RDONLY | O_CLOEXEC);
   if (ProcFD != -1) {
+    // Guest close-all sweeps must not take FEX's /proc descriptor with them.
+    TrackFEXFD(ProcFD);
     // Track the st_dev of /proc, to check for inode equality
     struct stat Buffer;
     auto Result = fstat(ProcFD, &Buffer);
@@ -436,6 +519,9 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
 }
 
 FileManager::~FileManager() {
+#if defined(__ANDROID__)
+  RootFSResolver.reset();
+#endif
   close(RootFSFD);
 }
 
@@ -580,11 +666,16 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
     dirfd = AT_FDCWD;
   }
 
+  // Relative paths only need cwd/dirfd resolution when the final component can
+  // name an overlay. Every relative stat/open/access goes through here, so skip
+  // the getcwd()/readlink() work for ordinary asset paths.
+  const bool RelativeMayBeOverlay = pathname[0] != '/' && MayMatchThunkOverlay(pathname);
+
   // LD_LIBRARY_PATH=. opens bundled libraries relative to the process cwd.
   // Match those against the same thunk overlays as absolute library opens.
   // Otherwise a bundled OpenAL can call the ALSA bridge, which loads that
   // same OpenAL again and recursively opens ALSA until the guest stack ends.
-  if (pathname[0] != '/' && dirfd == AT_FDCWD) {
+  if (RelativeMayBeOverlay && dirfd == AT_FDCWD) {
     const std::filesystem::path Relative {pathname};
     // Do not collapse '..' across a symlink; leave those paths to the kernel.
     const bool HasParent = std::any_of(Relative.begin(), Relative.end(),
@@ -604,7 +695,7 @@ FileManager::GetEmulatedFDPath(int dirfd, const char* pathname, bool FollowSymli
   // VEXA_FIXES: Some guests probe library names through openat with a non-AT_FDCWD
   // dirfd (eg /proc) and a relative filename (eg "SDL3.so").
   // Resolve "dirfd + relative" and match overlays before the generic early-return.
-  if (pathname[0] != '/' && dirfd != AT_FDCWD) {
+  if (RelativeMayBeOverlay && dirfd != AT_FDCWD) {
     char DirPath[PATH_MAX + 1] {};
     const auto DirLen = FEX::get_fdpath(dirfd, DirPath);
     if (DirLen > 0) {
@@ -715,9 +806,8 @@ static const char* SkipDuplicateLeadingSlashes(const char* Pathname) {
   return Pathname;
 }
 
-static int GetActualPID() {
-  return static_cast<int>(::syscall(SYSCALL_DEF(getpid)));
-}
+// CurrentPID is refreshed with the raw getpid syscall on every fork and clone
+// (UpdatePID), so path checks need no syscall of their own.
 
 ///< Returns true if the pathname is self and symlink flags are set NOFOLLOW.
 bool FileManager::IsSelfNoFollow(const char* Pathname, int flags) const {
@@ -734,7 +824,7 @@ bool FileManager::IsSelfNoFollow(const char* Pathname, int flags) const {
   Pathname = SkipDuplicateLeadingSlashes(Pathname);
 
   char PidSelfPath[50];
-  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", GetActualPID());
+  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", static_cast<int>(CurrentPID));
 
   return strcmp(Pathname, "/proc/self/exe") == 0 || strcmp(Pathname, "/proc/thread-self/exe") == 0 || strcmp(Pathname, PidSelfPath) == 0;
 }
@@ -747,7 +837,7 @@ std::optional<std::string_view> FileManager::GetSelf(const char* Pathname) const
   const char* Normalized = SkipDuplicateLeadingSlashes(Pathname);
 
   char PidSelfPath[50];
-  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", GetActualPID());
+  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", static_cast<int>(CurrentPID));
 
   if (strcmp(Normalized, "/proc/self/exe") == 0 || strcmp(Normalized, "/proc/thread-self/exe") == 0 || strcmp(Normalized, PidSelfPath) == 0) {
     return Filename();
@@ -802,6 +892,8 @@ bool FileManager::ReplaceEmuFd(int fd, int flags, uint32_t mode) {
 }
 
 uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
+  const auto shmPath = VexaPrivateShmPath(pathname);
+  if (!shmPath.empty()) return ::open(shmPath.c_str(), flags, mode);
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
   int fd = -1;
@@ -815,7 +907,7 @@ uint64_t FileManager::Open(const char* pathname, int flags, uint32_t mode) {
         .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,    // AT_FDCWD means it's a thunk and not via RootFS
       };
-      fd = OpenAt2Compat(Path.FD, Path.Path, &how, sizeof(how)); // VEXA_FIXES: Android-safe openat2 shim.
+      fd = OpenInRootFS(Path.FD, Path.Path, &how, sizeof(how)); // VEXA_FIXES: Android-safe openat2 shim.
 
       if (fd == -1 && errno == EXDEV) {
         // This means a magic symlink (/proc/foo) was involved. In this case we
@@ -1046,7 +1138,7 @@ uint64_t FileManager::Readlinkat(int dirfd, const char* pathname, char* buf, siz
   }
 
   char PidSelfPath[50];
-  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", GetActualPID());
+  snprintf(PidSelfPath, sizeof(PidSelfPath), "/proc/%i/exe", static_cast<int>(CurrentPID));
 
   if (Path == "/proc/self/exe" || Path == "/proc/thread-self/exe" || Path == PidSelfPath) {
     const auto& App = Filename();
@@ -1077,6 +1169,8 @@ uint64_t FileManager::Readlinkat(int dirfd, const char* pathname, char* buf, siz
 }
 
 uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, int flags, uint32_t mode) {
+  const auto shmPath = VexaPrivateShmPath(pathname);
+  if (!shmPath.empty()) return ::open(shmPath.c_str(), flags, mode);
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
@@ -1091,7 +1185,7 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
         .mode = (flags & (O_CREAT | O_TMPFILE)) ? mode & 07777 : 0, // openat2() is stricter about this,
         .resolve = (Path.FD == AT_FDCWD) ? 0u : RESOLVE_IN_ROOT,    // AT_FDCWD means it's a thunk and not via RootFS
       };
-      fd = OpenAt2Compat(Path.FD, Path.Path, &how, sizeof(how)); // VEXA_FIXES: Android-safe openat2 shim.
+      fd = OpenInRootFS(Path.FD, Path.Path, &how, sizeof(how)); // VEXA_FIXES: Android-safe openat2 shim.
       if (fd == -1 && errno == EXDEV) {
         // This means a magic symlink (/proc/foo) was involved. In this case we
         // just punt and do the access without RESOLVE_IN_ROOT.
@@ -1113,6 +1207,9 @@ uint64_t FileManager::Openat([[maybe_unused]] int dirfs, const char* pathname, i
 }
 
 uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_how* how, size_t usize) {
+  // Explicit dirfd-relative resolution must retain its original semantics.
+  const auto shmPath = how->resolve == 0 ? VexaPrivateShmPath(pathname) : std::string{};
+  if (!shmPath.empty()) return OpenInRootFS(AT_FDCWD, shmPath.c_str(), how, usize);
   auto NewPath = GetSelf(pathname);
   const char* SelfPath = NewPath ? NewPath->data() : nullptr;
 
@@ -1127,23 +1224,23 @@ uint64_t FileManager::Openat2(int dirfs, const char* pathname, FEX::HLE::open_ho
       if (Path.FD != AT_FDCWD) {
         LocalHow.resolve |= RESOLVE_IN_ROOT;
       }
-      fd = OpenAt2Compat(Path.FD, Path.Path, &LocalHow, usize);
+      fd = OpenInRootFS(Path.FD, Path.Path, &LocalHow, usize);
       if (fd == -1 && errno == EXDEV) {
         // This means a magic symlink (/proc/foo) was involved. In this case we
         // just punt and do the access without RESOLVE_IN_ROOT.
         auto FallbackHow = *how;
-        fd = OpenAt2Compat(Path.FD, Path.Path, &FallbackHow, usize);
+        fd = OpenInRootFS(Path.FD, Path.Path, &FallbackHow, usize);
       }
     }
 
     // Open through RootFS failed (probably nonexistent), so open directly.
     if (fd == -1) {
-      fd = OpenAt2Compat(dirfs, SelfPath, how, usize);
+      fd = OpenInRootFS(dirfs, SelfPath, how, usize);
     }
 
     ReplaceEmuFd(fd, how->flags, how->mode);
   } else {
-    fd = OpenAt2Compat(dirfs, SelfPath, how, usize);
+    fd = OpenInRootFS(dirfs, SelfPath, how, usize);
   }
 
   return fd;

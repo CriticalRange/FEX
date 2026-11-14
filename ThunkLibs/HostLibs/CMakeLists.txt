@@ -273,7 +273,7 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
   # VEXA_FIXES: Disable Vulkan thunk build when not needed (Hytale is OpenGL-first).
   # Vulkan thunk path pulls Linux desktop headers from Vulkan-Headers (eg xcb),
   # which are not available in Android NDK cross-build environments.
-  if (ENABLE_VULKAN_THUNKS AND (NOT ANDROID OR GUEST_BITNESS EQUAL 64))
+  if (ENABLE_VULKAN_THUNKS)
     generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp ${GUEST_BITNESS})
     target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
     # VEXA_FIXES: Minimal X11/xcb stub headers so vulkan.h platform sections

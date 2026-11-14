@@ -1,12 +1,12 @@
 // Desktop GL_UNPACK_SWAP_BYTES / LSB_FIRST and the compressed-block pixel
 // stores are not in GLES. Remember the byte swap; drop the rest so Mali does
 // not raise INVALID_ENUM and abort the upload that follows.
-static int g_vexa_unpack_swap_bytes = 0;
+// Upload state belongs to the current context, just like GLES pixel stores.
 
 static bool VexaIgnorePixelStore(GLenum pname, GLint param) {
   switch (pname) {
     case 0x0CF0:  // GL_UNPACK_SWAP_BYTES
-      g_vexa_unpack_swap_bytes = param;
+      VexaProgramContext().UnpackSwapBytes = param != 0;
       return true;
     case 0x0CF1:  // GL_UNPACK_LSB_FIRST
     case 0x0D00:  // GL_PACK_SWAP_BYTES
@@ -83,7 +83,7 @@ static void VexaRepackPixel(GLenum format, GLenum type, const uint8_t* src, uint
     // Desktop packed 8-bit components occupy a full 32-bit word. Falling
     // through the 16-bit path drops blue/alpha (transparent yellow glyphs).
     uint32_t value=0;std::memcpy(&value,src,4);
-    if(g_vexa_unpack_swap_bytes)value=__builtin_bswap32(value);
+    if(VexaProgramContext().UnpackSwapBytes)value=__builtin_bswap32(value);
     for(unsigned c=0;c<4;++c)dst[c]=static_cast<uint8_t>(value>>(type==0x8367?c*8:(3-c)*8));
     if(format==0x80E1||format==0x80E0)std::swap(dst[0],dst[2]);
     return;
@@ -103,7 +103,7 @@ static void VexaRepackPixel(GLenum format, GLenum type, const uint8_t* src, uint
   }
   uint16_t value = 0;
   std::memcpy(&value, src, 2);
-  if (g_vexa_unpack_swap_bytes) value = VexaSwap16(value);
+  if (VexaProgramContext().UnpackSwapBytes) value = VexaSwap16(value);
   uint16_t out = value;
   if (type == 0x8363) {  // GL_UNSIGNED_SHORT_5_6_5, GL_BGR -> GL_RGB
     const uint16_t b = (value >> 11) & 0x1F;

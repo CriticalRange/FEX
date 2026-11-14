@@ -14,7 +14,10 @@
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
+#include <climits>
+#include <linux/futex.h>
 #include <git_version.h>
 
 #ifdef __ANDROID__ // VEXA_FIXES For memfd_create workaround on shm_open and shm_unlink to work
@@ -300,23 +303,40 @@ ThreadManager::CreateThread(const FEXCore::Core::CPUState* NewThreadState, uint6
   return ThreadStateObject;
 }
 
+void ThreadManager::ReleaseUnparkedThread() {
+  if (UnparkedThreads.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    // The last running guest thread is gone: wake a parked exited leader.
+    ParkGeneration.fetch_add(1, std::memory_order_release);
+    ::syscall(SYS_futex, reinterpret_cast<uint32_t*>(&ParkGeneration), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+  }
+}
+
 void ThreadManager::DestroyThread(FEX::HLE::ThreadStateObject* Thread, bool NeedsTLSUninstall) {
   {
     std::lock_guard lk(ThreadCreationMutex);
     auto It = std::find(Threads.begin(), Threads.end(), Thread);
     LOGMAN_THROW_A_FMT(It != Threads.end(), "Thread wasn't in Threads");
+    ++DeletingThreads;
     Threads.erase(It);
+    if (!Thread->ParkedExitedLeader) {
+      ReleaseUnparkedThread();
+    }
     if (Threads.empty()) {
 #if defined(__ANDROID__)
       // Guest exit (rather than exit_group) may leave native helper threads.
       // Decide under ThreadCreationMutex so concurrent guest thread exits cannot
-      // both miss the final thread. Embedded Android workers retain old behavior.
-      if (Thread->VexaGuestExit && Vexa_ReportGuestExit) {
-        Vexa_ReportGuestExit(Thread->StatusCode);
-      }
-      if (Thread->VexaGuestExit && Vexa_IsStandaloneLoader && Vexa_IsStandaloneLoader()) {
-        ::syscall(SYS_exit_group, Thread->StatusCode);
-        std::terminate();
+      // both miss the final thread. After exit_group its status already stands;
+      // otherwise Linux reports the initial thread's exit status.
+      if (Thread->VexaGuestExit && !IsGroupExitRequested()) {
+        const int Status =
+          HasLeaderExitStatus.load(std::memory_order_acquire) ? LeaderExitStatus.load(std::memory_order_relaxed) : Thread->StatusCode;
+        if (Vexa_ReportGuestExit) {
+          Vexa_ReportGuestExit(Status);
+        }
+        if (Vexa_IsStandaloneLoader && Vexa_IsStandaloneLoader()) {
+          ::syscall(SYS_exit_group, Status);
+          std::terminate();
+        }
       }
 #endif
       Thread->Thread->CTX->FlushAndCloseCodeMap();
@@ -326,6 +346,44 @@ void ThreadManager::DestroyThread(FEX::HLE::ThreadStateObject* Thread, bool Need
   Stat.DeallocateSlot(Thread->Thread->ThreadStats);
 
   HandleThreadDeletion(Thread, NeedsTLSUninstall);
+  {
+    // Pair the completion notification with the wait mutex. Removal from
+    // Threads precedes destruction, which still accesses CTX and seccomp.
+    std::lock_guard lk(IdleWaitMutex);
+    --DeletingThreads;
+  }
+  IdleWaitCV.notify_all();
+}
+
+void ThreadManager::ParkExitedLeader(FEX::HLE::ThreadStateObject* Thread) {
+  // Like an exited Linux group leader, take no more process-directed signals;
+  // only FEX's stop/pause signal can still reach this thread.
+  uint64_t Mask = ~0ULL & ~(1ULL << (SignalDelegator::SIGNAL_FOR_PAUSE - 1));
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, nullptr, sizeof(Mask));
+  SignalDelegation->SetAcceptsForwardedSignals(Thread, false);
+
+  if (!Thread->ParkedExitedLeader) {
+    Thread->ParkedExitedLeader = true;
+    ReleaseUnparkedThread();
+  }
+
+  // Lock-free wait: a stop signal may unwind this thread at any point.
+  while (UnparkedThreads.load(std::memory_order_acquire) != 0) {
+    const uint32_t Generation = ParkGeneration.load(std::memory_order_acquire);
+    if (UnparkedThreads.load(std::memory_order_acquire) == 0) {
+      break;
+    }
+    ::syscall(SYS_futex, reinterpret_cast<uint32_t*>(&ParkGeneration), FUTEX_WAIT_PRIVATE, Generation, nullptr, nullptr, 0);
+  }
+}
+
+bool ThreadManager::WaitForOtherThreadsToExit(FEX::HLE::ThreadStateObject* Self, std::chrono::milliseconds Timeout) {
+  std::unique_lock lk(IdleWaitMutex);
+  return IdleWaitCV.wait_for(lk, Timeout, [this, Self] {
+    std::lock_guard tlk(ThreadCreationMutex);
+    return DeletingThreads.load() == 0 &&
+           (Threads.empty() || (Threads.size() == 1 && Threads.front() == Self));
+  });
 }
 
 void ThreadManager::StopThread(FEX::HLE::ThreadStateObject* Thread) {
@@ -461,7 +519,9 @@ void ThreadManager::Stop(bool IgnoreCurrentThread) {
     for (auto& Thread : Threads) {
       if (IgnoreCurrentThread && Thread->ThreadInfo.TID == tid) {
         // If we are callign stop from the current thread then we can ignore sending signals to this thread
-        // This means that this thread is already gone
+        // This means that this thread is already gone. Without skipping it here the
+        // caller would signal itself and unwind into a dispatcher it already left.
+        continue;
       } else if (Thread->ThreadInfo.TID == tid) {
         // We need to save the current thread for last to ensure all threads receive their stop signals
         CurrentThread = Thread;
@@ -557,6 +617,14 @@ void ThreadManager::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThre
 
   // We now only have one thread.
   IdleWaitRefCount = 1;
+  DeletingThreads = 0;
+  // The child is a new process: one running thread and no exit recorded yet.
+  ThreadObject->ParkedExitedLeader = false;
+  UnparkedThreads.store(1, std::memory_order_release);
+  GroupExitRequested.store(false, std::memory_order_release);
+  HasLeaderExitStatus.store(false, std::memory_order_release);
+  // Forwarded process-directed signals must target the child's own thread.
+  SignalDelegator::ResetAltStackRegistryAfterFork(ThreadObject);
   ThreadCreationMutex.StealAndDropActiveLocks();
 }
 

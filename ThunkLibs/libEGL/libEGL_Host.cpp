@@ -5,6 +5,8 @@ $end_info$
 */
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 
 #include <EGL/egl.h>
@@ -21,6 +23,8 @@ static auto fexfn_impl_libEGL_eglMakeCurrent(EGLDisplay display, EGLSurface draw
   if (ok != EGL_TRUE || draw == EGL_NO_SURFACE || context == EGL_NO_CONTEXT) {
     return ok;
   }
+  const char* real_x11 = std::getenv("VEXA_REAL_X11");
+  if (real_x11 && !std::strcmp(real_x11, "1")) return ok;
   using ViewportFn = void (*)(EGLint, EGLint, EGLint, EGLint);
   auto viewport = reinterpret_cast<ViewportFn>(eglGetProcAddress("glViewport"));
   ANativeWindow* window = VexaAcquireRuntimeWindow(0);
@@ -136,6 +140,8 @@ static auto fexfn_impl_libEGL_eglCreateContext(EGLDisplay display, EGLConfig con
 }
 
 static auto fexfn_impl_libEGL_eglCreateWindowSurface(EGLDisplay display, EGLConfig config, EGLNativeWindowType, const EGLint* attribs) -> EGLSurface {
+  const char* real_x11 = std::getenv("VEXA_REAL_X11");
+  if (real_x11 && !std::strcmp(real_x11, "1")) return EGL_NO_SURFACE;
   ANativeWindow* window = VexaAcquireRuntimeWindow(2000);
   if (!window) {
     return EGL_NO_SURFACE;
